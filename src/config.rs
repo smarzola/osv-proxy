@@ -1,0 +1,481 @@
+use crate::artifact::{normalize_pypi_name, Ecosystem};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
+use std::time::Duration;
+use thiserror::Error;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub server: ServerConfig,
+    pub upstreams: UpstreamsConfig,
+    pub policy: PolicyConfig,
+    pub allowlist: Vec<AllowlistEntry>,
+    pub blocklist: Vec<BlocklistEntry>,
+    pub metadata_cache: MetadataCacheConfig,
+    pub artifacts: ArtifactsConfig,
+    pub malicious_store: Option<serde_yaml::Value>,
+}
+
+impl Config {
+    pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let raw = fs::read_to_string(path)?;
+        let config = serde_yaml::from_str::<Config>(&raw)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.policy.malicious.mode != MaliciousMode::Naive {
+            return Err(ConfigError::Unsupported(
+                "phase one supports only policy.malicious.mode: naive".to_string(),
+            ));
+        }
+        if self.metadata_cache.enabled {
+            return Err(ConfigError::Unsupported(
+                "phase one supports only metadata_cache.enabled: false".to_string(),
+            ));
+        }
+        if self.metadata_cache.backend.is_some() {
+            return Err(ConfigError::Unsupported(
+                "phase one does not support metadata_cache backend configuration".to_string(),
+            ));
+        }
+        if self.artifacts.behavior != ArtifactBehavior::Redirect {
+            return Err(ConfigError::Unsupported(
+                "phase one supports only artifacts.behavior: redirect".to_string(),
+            ));
+        }
+        if self.artifacts.s3.is_some() {
+            return Err(ConfigError::Unsupported(
+                "phase one does not support S3 artifact cache configuration".to_string(),
+            ));
+        }
+        if self.malicious_store.is_some() {
+            return Err(ConfigError::Unsupported(
+                "phase one does not support local malicious store configuration".to_string(),
+            ));
+        }
+        for entry in &self.allowlist {
+            if entry.version == "*" {
+                return Err(ConfigError::Unsupported(
+                    "allowlist entries must use exact versions in phase one".to_string(),
+                ));
+            }
+            if entry.bypass_malicious && entry.reason.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "allowlist entries with bypass_malicious=true require a reason".to_string(),
+                ));
+            }
+        }
+        for entry in &self.blocklist {
+            if entry.versions.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "blocklist entries must include at least one version".to_string(),
+                ));
+            }
+            for version in &entry.versions {
+                if version != "*" && looks_like_range(version) {
+                    return Err(ConfigError::Unsupported(
+                        "phase one blocklist supports only exact versions and *".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server: ServerConfig::default(),
+            upstreams: UpstreamsConfig::default(),
+            policy: PolicyConfig::default(),
+            allowlist: Vec::new(),
+            blocklist: Vec::new(),
+            metadata_cache: MetadataCacheConfig::default(),
+            artifacts: ArtifactsConfig::default(),
+            malicious_store: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    pub listen: String,
+    pub public_base_url: String,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            listen: "127.0.0.1:8080".to_string(),
+            public_base_url: "http://127.0.0.1:8080".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpstreamsConfig {
+    pub npm: NpmUpstreamConfig,
+    pub pypi: PypiUpstreamConfig,
+}
+
+impl Default for UpstreamsConfig {
+    fn default() -> Self {
+        Self {
+            npm: NpmUpstreamConfig::default(),
+            pypi: PypiUpstreamConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NpmUpstreamConfig {
+    pub registry_url: String,
+}
+
+impl Default for NpmUpstreamConfig {
+    fn default() -> Self {
+        Self {
+            registry_url: "https://registry.npmjs.org".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PypiUpstreamConfig {
+    pub simple_url: String,
+    pub files_url: String,
+}
+
+impl Default for PypiUpstreamConfig {
+    fn default() -> Self {
+        Self {
+            simple_url: "https://pypi.org/simple".to_string(),
+            files_url: "https://files.pythonhosted.org".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PolicyConfig {
+    #[serde(with = "duration_format")]
+    pub minimum_age: Duration,
+    pub missing_publish_time: MissingPublishTime,
+    pub malicious: MaliciousConfig,
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self {
+            minimum_age: Duration::from_secs(72 * 60 * 60),
+            missing_publish_time: MissingPublishTime::Block,
+            malicious: MaliciousConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingPublishTime {
+    Block,
+    Allow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MaliciousConfig {
+    pub mode: MaliciousMode,
+    pub only_mal_ids: bool,
+    pub osv_api_url: String,
+    pub on_osv_error: OsvErrorBehavior,
+}
+
+impl Default for MaliciousConfig {
+    fn default() -> Self {
+        Self {
+            mode: MaliciousMode::Naive,
+            only_mal_ids: true,
+            osv_api_url: "https://api.osv.dev".to_string(),
+            on_osv_error: OsvErrorBehavior::Block,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaliciousMode {
+    Naive,
+    Local,
+}
+
+impl Default for MaliciousMode {
+    fn default() -> Self {
+        Self::Naive
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OsvErrorBehavior {
+    Block,
+    Allow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AllowlistEntry {
+    pub ecosystem: Ecosystem,
+    pub name: String,
+    pub version: String,
+    #[serde(default)]
+    pub bypass_age_gate: bool,
+    #[serde(default)]
+    pub bypass_malicious: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl AllowlistEntry {
+    pub fn normalized_name(&self) -> String {
+        match self.ecosystem {
+            Ecosystem::Npm => self.name.clone(),
+            Ecosystem::Pypi => normalize_pypi_name(&self.name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlocklistEntry {
+    pub ecosystem: Ecosystem,
+    pub name: String,
+    pub versions: Vec<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl BlocklistEntry {
+    pub fn normalized_name(&self) -> String {
+        match self.ecosystem {
+            Ecosystem::Npm => self.name.clone(),
+            Ecosystem::Pypi => normalize_pypi_name(&self.name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MetadataCacheConfig {
+    pub enabled: bool,
+    pub backend: Option<String>,
+}
+
+impl Default for MetadataCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArtifactsConfig {
+    pub behavior: ArtifactBehavior,
+    pub s3: Option<serde_yaml::Value>,
+}
+
+impl Default for ArtifactsConfig {
+    fn default() -> Self {
+        Self {
+            behavior: ArtifactBehavior::Redirect,
+            s3: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactBehavior {
+    Redirect,
+    Proxy,
+    ProxyCacheS3,
+}
+
+impl Default for ArtifactBehavior {
+    fn default() -> Self {
+        Self::Redirect
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("failed to read config: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("failed to parse config YAML: {0}")]
+    Yaml(#[from] serde_yaml::Error),
+    #[error("unsupported phase-one configuration: {0}")]
+    Unsupported(String),
+    #[error("invalid configuration: {0}")]
+    Invalid(String),
+}
+
+fn looks_like_range(version: &str) -> bool {
+    version.contains('<')
+        || version.contains('>')
+        || version.contains('=')
+        || version.contains('~')
+        || version.contains('^')
+        || version.contains(',')
+        || version.contains(' ')
+}
+
+mod duration_format {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&humantime::format_duration(*duration).to_string())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        humantime::parse_duration(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(raw: &str) -> Result<Config, ConfigError> {
+        let config = serde_yaml::from_str::<Config>(raw)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn defaults_are_phase_one_conservative() {
+        let config = Config::default();
+        assert_eq!(config.policy.minimum_age, Duration::from_secs(72 * 60 * 60));
+        assert_eq!(
+            config.policy.missing_publish_time,
+            MissingPublishTime::Block
+        );
+        assert_eq!(config.policy.malicious.mode, MaliciousMode::Naive);
+        assert!(config.policy.malicious.only_mal_ids);
+        assert_eq!(
+            config.policy.malicious.on_osv_error,
+            OsvErrorBehavior::Block
+        );
+        assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_local_malicious_mode() {
+        let err = load(
+            r#"
+policy:
+  malicious:
+    mode: local
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("mode: naive"));
+    }
+
+    #[test]
+    fn rejects_metadata_cache_enabled() {
+        let err = load(
+            r#"
+metadata_cache:
+  enabled: true
+  backend: cachebox
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("metadata_cache.enabled"));
+    }
+
+    #[test]
+    fn rejects_proxy_artifacts() {
+        let err = load(
+            r#"
+artifacts:
+  behavior: proxy
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("artifacts.behavior"));
+    }
+
+    #[test]
+    fn rejects_s3_artifact_cache_config() {
+        let err = load(
+            r#"
+artifacts:
+  behavior: redirect
+  s3:
+    bucket: packages
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("S3"));
+    }
+
+    #[test]
+    fn rejects_malicious_store_config() {
+        let err = load(
+            r#"
+malicious_store:
+  mongodb:
+    uri: mongodb://127.0.0.1:27017
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("local malicious store"));
+    }
+
+    #[test]
+    fn rejects_allowlist_wildcard() {
+        let err = load(
+            r#"
+allowlist:
+  - ecosystem: npm
+    name: lodash
+    version: "*"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exact versions"));
+    }
+
+    #[test]
+    fn rejects_blocklist_ranges() {
+        let err = load(
+            r#"
+blocklist:
+  - ecosystem: npm
+    name: lodash
+    versions: ["<4.17.21"]
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exact versions and *"));
+    }
+}

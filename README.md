@@ -78,4 +78,12 @@ Example deployment files:
 
 ## Implementation Status
 
-This repository is currently documentation-only. No Rust workspace or source code has been created yet.
+Phase one has a Rust single-crate scaffold with YAML configuration validation, deterministic policy primitives, a trait-backed naive OSV checker, and command routing for:
+
+```sh
+osv-proxy serve --config osv-proxy.yaml
+osv-proxy check npm:lodash@4.17.21 --config osv-proxy.yaml
+osv-proxy config validate --config osv-proxy.yaml
+```
+
+Registry metadata serving, artifact proxying, local malicious storage, metadata caching, and `sync-malicious` are intentionally deferred.
