@@ -66,6 +66,19 @@ pub struct Artifact {
     pub hashes: ArtifactHashes,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackageIdentity {
+    pub ecosystem: Ecosystem,
+    pub name: String,
+    pub version: String,
+}
+
+impl PackageIdentity {
+    pub fn identity(&self) -> String {
+        format!("{}:{}@{}", self.ecosystem, self.name, self.version)
+    }
+}
+
 impl Artifact {
     pub fn package(
         ecosystem: Ecosystem,
@@ -94,6 +107,16 @@ pub fn parse_identity(
     value: &str,
     published_at: Option<DateTime<Utc>>,
 ) -> Result<Artifact, ArtifactParseError> {
+    let identity = parse_package_identity(value)?;
+    Ok(Artifact::package(
+        identity.ecosystem,
+        identity.name,
+        identity.version,
+        published_at,
+    ))
+}
+
+pub fn parse_package_identity(value: &str) -> Result<PackageIdentity, ArtifactParseError> {
     let (ecosystem, rest) = value
         .split_once(':')
         .ok_or_else(|| ArtifactParseError::InvalidIdentity(value.to_string()))?;
@@ -109,7 +132,11 @@ pub fn parse_identity(
     if name.is_empty() || version.is_empty() {
         return Err(ArtifactParseError::InvalidIdentity(value.to_string()));
     }
-    Ok(Artifact::package(ecosystem, name, version, published_at))
+    Ok(PackageIdentity {
+        ecosystem,
+        name: ecosystem.normalize_name(name),
+        version: version.to_string(),
+    })
 }
 
 pub fn normalize_pypi_name(name: &str) -> String {
@@ -155,5 +182,14 @@ mod tests {
         let artifact = parse_identity("pypi:My_Package.Name@1.0.0", None).unwrap();
         assert_eq!(artifact.name, "my-package-name");
         assert_eq!(artifact.identity(), "pypi:my-package-name@1.0.0");
+    }
+
+    #[test]
+    fn parses_package_identity_without_constructing_artifact() {
+        let identity = parse_package_identity("npm:@babel/core@7.24.0").unwrap();
+        assert_eq!(identity.ecosystem, Ecosystem::Npm);
+        assert_eq!(identity.name, "@babel/core");
+        assert_eq!(identity.version, "7.24.0");
+        assert_eq!(identity.identity(), "npm:@babel/core@7.24.0");
     }
 }

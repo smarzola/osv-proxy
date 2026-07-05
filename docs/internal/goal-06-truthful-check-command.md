@@ -65,7 +65,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Baseline and command contract
 - [x] Milestone 1: Adapter artifact lookup APIs
-- [ ] Milestone 2: Registry-backed CLI check orchestration
+- [x] Milestone 2: Registry-backed CLI check orchestration
 - [ ] Milestone 3: Tests and docs for truthful check
 - [ ] Milestone 4: Final regression and adversarial audit
 
@@ -199,6 +199,20 @@ cargo test policy
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note, 2026-07-06:
+
+- Implemented default `check` as registry-backed orchestration: parse package identity without constructing a partial artifact, fetch npm/PyPI metadata through adapter lookup APIs, evaluate each registry-derived artifact, print aggregate JSON with per-artifact decisions, and return non-zero for blocked results.
+- Retained manual artifact evaluation only as `eval`, with synthetic mode in output and command help.
+- PyPI check evaluates every file for the requested version and reports an aggregate allow only when all file decisions allow.
+- Adapted to the current concurrent config shape by using `policy.osv.api_url`, `policy.osv.on_error`, and preserving `policy.osv.only_mal_ids`.
+- Verification run:
+  - `cargo test cli`: passed, 7 matching tests.
+  - `cargo test npm`: sandbox run passed 25 matching unit/server tests, then selected `npm_install_uses_proxy_for_allowed_and_blocked_versions` and failed with `Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }`; rerun outside sandbox passed all 25 matching unit/server tests plus the npm e2e test.
+  - `cargo test pypi`: passed, 24 matching tests.
+  - `cargo test policy`: passed, 17 matching tests.
+  - `cargo fmt --check`: passed.
+- Commit: pending.
 
 ## Milestone 3: Tests and Docs for Truthful Check
 

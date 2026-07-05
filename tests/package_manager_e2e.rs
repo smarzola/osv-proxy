@@ -163,7 +163,7 @@ fn start_proxy(upstream_base_url: String) -> TestServer {
             config.server.public_base_url = proxy_base_url.clone();
             config.upstreams.npm.registry_url = upstream_base_url.clone();
             config.upstreams.pypi.simple_url = format!("{upstream_base_url}/simple");
-            config.policy.malicious.osv_api_url = upstream_base_url.clone();
+            config.policy.osv.api_url = upstream_base_url.clone();
             config.blocklist.push(BlocklistEntry {
                 ecosystem: Ecosystem::Npm,
                 name: NPM_PACKAGE.to_string(),

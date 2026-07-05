@@ -88,7 +88,7 @@ impl<'a> PolicyEngine<'a> {
                     }
                 }
                 Some(Err(err)) => {
-                    if self.config.policy.malicious.on_osv_error == OsvErrorBehavior::Block {
+                    if self.config.policy.osv.on_error == OsvErrorBehavior::Block {
                         return blocked(
                             DecisionReason::Malicious,
                             artifact,
@@ -100,7 +100,7 @@ impl<'a> PolicyEngine<'a> {
                     }
                 }
                 None => {
-                    if self.config.policy.malicious.on_osv_error == OsvErrorBehavior::Block {
+                    if self.config.policy.osv.on_error == OsvErrorBehavior::Block {
                         return blocked(
                             DecisionReason::Malicious,
                             artifact,
@@ -202,9 +202,8 @@ impl<'a> PolicyEngine<'a> {
     }
 
     fn blocking_malicious_hit(&self, hits: Vec<MaliciousHit>) -> Option<MaliciousHit> {
-        hits.into_iter().find(|hit| {
-            !self.config.policy.malicious.only_mal_ids || hit.osv_id.starts_with("MAL-")
-        })
+        hits.into_iter()
+            .find(|hit| !self.config.policy.osv.only_mal_ids || hit.osv_id.starts_with("MAL-"))
     }
 }
 
@@ -245,9 +244,7 @@ fn blocked(
 mod tests {
     use super::*;
     use crate::artifact::{Artifact, Ecosystem};
-    use crate::config::{
-        AllowlistEntry, BlocklistEntry, MaliciousConfig, MaliciousMode, PolicyConfig,
-    };
+    use crate::config::{AllowlistEntry, BlocklistEntry, OsvConfig, PolicyConfig};
     use crate::malicious::MaliciousError;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -416,7 +413,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_mal_advisories_do_not_block_when_only_mal_ids_is_true() {
+    async fn non_mal_advisories_do_not_block() {
         let config = Config::default();
         let decision = PolicyEngine::new(&config)
             .evaluate(
@@ -431,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn non_mal_advisories_block_when_only_mal_ids_is_false() {
         let mut config = Config::default();
-        config.policy.malicious.only_mal_ids = false;
+        config.policy.osv.only_mal_ids = false;
         let decision = PolicyEngine::new(&config)
             .evaluate(
                 &old_artifact(),
@@ -469,7 +466,7 @@ mod tests {
     #[tokio::test]
     async fn osv_error_can_allow() {
         let mut config = Config::default();
-        config.policy.malicious.on_osv_error = OsvErrorBehavior::Allow;
+        config.policy.osv.on_error = OsvErrorBehavior::Allow;
         let decision = PolicyEngine::new(&config)
             .evaluate(&old_artifact(), now(), &FakeChecker::failing())
             .await;
@@ -501,11 +498,10 @@ mod tests {
         let mut config = Config {
             policy: PolicyConfig {
                 minimum_age: Duration::from_secs(72 * 60 * 60),
-                malicious: MaliciousConfig {
-                    mode: MaliciousMode::Naive,
+                osv: OsvConfig {
                     only_mal_ids: true,
-                    osv_api_url: "https://api.osv.dev".to_string(),
-                    on_osv_error: OsvErrorBehavior::Block,
+                    api_url: "https://api.osv.dev".to_string(),
+                    on_error: OsvErrorBehavior::Block,
                 },
                 ..PolicyConfig::default()
             },

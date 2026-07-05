@@ -14,9 +14,6 @@ pub struct Config {
     pub policy: PolicyConfig,
     pub allowlist: Vec<AllowlistEntry>,
     pub blocklist: Vec<BlocklistEntry>,
-    pub metadata_cache: MetadataCacheConfig,
-    pub artifacts: ArtifactsConfig,
-    pub malicious_store: Option<serde_yaml::Value>,
 }
 
 impl Config {
@@ -33,40 +30,10 @@ impl Config {
                 "policy.minimum_age is too large for policy evaluation".to_string(),
             )
         })?;
-        if self.policy.malicious.mode != MaliciousMode::Naive {
-            return Err(ConfigError::Unsupported(
-                "phase one supports only policy.malicious.mode: naive".to_string(),
-            ));
-        }
-        if self.metadata_cache.enabled {
-            return Err(ConfigError::Unsupported(
-                "phase one supports only metadata_cache.enabled: false".to_string(),
-            ));
-        }
-        if self.metadata_cache.backend.is_some() {
-            return Err(ConfigError::Unsupported(
-                "phase one does not support metadata_cache backend configuration".to_string(),
-            ));
-        }
-        if self.artifacts.behavior != ArtifactBehavior::Redirect {
-            return Err(ConfigError::Unsupported(
-                "phase one supports only artifacts.behavior: redirect".to_string(),
-            ));
-        }
-        if self.artifacts.s3.is_some() {
-            return Err(ConfigError::Unsupported(
-                "phase one does not support S3 artifact cache configuration".to_string(),
-            ));
-        }
-        if self.malicious_store.is_some() {
-            return Err(ConfigError::Unsupported(
-                "phase one does not support local malicious store configuration".to_string(),
-            ));
-        }
         for entry in &self.allowlist {
             if entry.version == "*" {
                 return Err(ConfigError::Unsupported(
-                    "allowlist entries must use exact versions in phase one".to_string(),
+                    "allowlist entries must use exact versions".to_string(),
                 ));
             }
             if entry.bypass_malicious && entry.reason.trim().is_empty() {
@@ -84,7 +51,7 @@ impl Config {
             for version in &entry.versions {
                 if version != "*" && looks_like_range(version) {
                     return Err(ConfigError::Unsupported(
-                        "phase one blocklist supports only exact versions and *".to_string(),
+                        "blocklist entries support only exact versions and *".to_string(),
                     ));
                 }
             }
@@ -134,14 +101,12 @@ impl Default for NpmUpstreamConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct PypiUpstreamConfig {
     pub simple_url: String,
-    pub files_url: String,
 }
 
 impl Default for PypiUpstreamConfig {
     fn default() -> Self {
         Self {
             simple_url: "https://pypi.org/simple".to_string(),
-            files_url: "https://files.pythonhosted.org".to_string(),
         }
     }
 }
@@ -152,7 +117,7 @@ pub struct PolicyConfig {
     #[serde(with = "duration_format")]
     pub minimum_age: Duration,
     pub missing_publish_time: MissingPublishTime,
-    pub malicious: MaliciousConfig,
+    pub osv: OsvConfig,
 }
 
 impl Default for PolicyConfig {
@@ -160,7 +125,7 @@ impl Default for PolicyConfig {
         Self {
             minimum_age: Duration::from_secs(72 * 60 * 60),
             missing_publish_time: MissingPublishTime::Block,
-            malicious: MaliciousConfig::default(),
+            osv: OsvConfig::default(),
         }
     }
 }
@@ -174,30 +139,20 @@ pub enum MissingPublishTime {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct MaliciousConfig {
-    pub mode: MaliciousMode,
+pub struct OsvConfig {
     pub only_mal_ids: bool,
-    pub osv_api_url: String,
-    pub on_osv_error: OsvErrorBehavior,
+    pub api_url: String,
+    pub on_error: OsvErrorBehavior,
 }
 
-impl Default for MaliciousConfig {
+impl Default for OsvConfig {
     fn default() -> Self {
         Self {
-            mode: MaliciousMode::Naive,
             only_mal_ids: true,
-            osv_api_url: "https://api.osv.dev".to_string(),
-            on_osv_error: OsvErrorBehavior::Block,
+            api_url: "https://api.osv.dev".to_string(),
+            on_error: OsvErrorBehavior::Block,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MaliciousMode {
-    #[default]
-    Naive,
-    Local,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,45 +204,13 @@ impl BlocklistEntry {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct MetadataCacheConfig {
-    pub enabled: bool,
-    pub backend: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ArtifactsConfig {
-    pub behavior: ArtifactBehavior,
-    pub s3: Option<serde_yaml::Value>,
-}
-
-impl Default for ArtifactsConfig {
-    fn default() -> Self {
-        Self {
-            behavior: ArtifactBehavior::Redirect,
-            s3: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactBehavior {
-    #[default]
-    Redirect,
-    Proxy,
-    ProxyCacheS3,
-}
-
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to read config: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to parse config YAML: {0}")]
     Yaml(#[from] serde_yaml::Error),
-    #[error("unsupported phase-one configuration: {0}")]
+    #[error("unsupported configuration: {0}")]
     Unsupported(String),
     #[error("invalid configuration: {0}")]
     Invalid(String),
@@ -334,25 +257,21 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_phase_one_conservative() {
+    fn defaults_are_conservative() {
         let config = Config::default();
         assert_eq!(config.policy.minimum_age, Duration::from_secs(72 * 60 * 60));
         assert_eq!(
             config.policy.missing_publish_time,
             MissingPublishTime::Block
         );
-        assert_eq!(config.policy.malicious.mode, MaliciousMode::Naive);
-        assert!(config.policy.malicious.only_mal_ids);
-        assert_eq!(
-            config.policy.malicious.on_osv_error,
-            OsvErrorBehavior::Block
-        );
-        assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
+        assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
+        assert!(config.policy.osv.only_mal_ids);
+        assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         config.validate().unwrap();
     }
 
     #[test]
-    fn rejects_local_malicious_mode() {
+    fn rejects_old_malicious_section() {
         let err = load(
             r#"
 policy:
@@ -361,11 +280,11 @@ policy:
 "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("mode: naive"));
+        assert!(err.to_string().contains("unknown field `malicious`"));
     }
 
     #[test]
-    fn rejects_metadata_cache_enabled() {
+    fn rejects_metadata_cache_config() {
         let err = load(
             r#"
 metadata_cache:
@@ -374,11 +293,11 @@ metadata_cache:
 "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("metadata_cache.enabled"));
+        assert!(err.to_string().contains("unknown field `metadata_cache`"));
     }
 
     #[test]
-    fn rejects_proxy_artifacts() {
+    fn rejects_artifacts_config() {
         let err = load(
             r#"
 artifacts:
@@ -386,33 +305,7 @@ artifacts:
 "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("artifacts.behavior"));
-    }
-
-    #[test]
-    fn rejects_proxy_cache_s3_artifacts() {
-        let err = load(
-            r#"
-artifacts:
-  behavior: proxy_cache_s3
-"#,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("artifacts.behavior"));
-    }
-
-    #[test]
-    fn rejects_s3_artifact_cache_config() {
-        let err = load(
-            r#"
-artifacts:
-  behavior: redirect
-  s3:
-    bucket: packages
-"#,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("S3"));
+        assert!(err.to_string().contains("unknown field `artifacts`"));
     }
 
     #[test]
@@ -425,7 +318,7 @@ malicious_store:
 "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("local malicious store"));
+        assert!(err.to_string().contains("unknown field `malicious_store`"));
     }
 
     #[test]
@@ -493,11 +386,11 @@ policy:
     }
 
     #[test]
-    fn rejects_unknown_malicious_config_key() {
+    fn rejects_unknown_osv_config_key() {
         let err = load(
             r#"
 policy:
-  malicious:
+  osv:
     typo: true
 "#,
         )
@@ -525,30 +418,6 @@ upstreams:
 upstreams:
   pypi:
     typo: true
-"#,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("unknown field `typo`"));
-    }
-
-    #[test]
-    fn rejects_unknown_metadata_cache_config_key() {
-        let err = load(
-            r#"
-metadata_cache:
-  typo: true
-"#,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("unknown field `typo`"));
-    }
-
-    #[test]
-    fn rejects_unknown_artifacts_config_key() {
-        let err = load(
-            r#"
-artifacts:
-  typo: true
 "#,
         )
         .unwrap_err();

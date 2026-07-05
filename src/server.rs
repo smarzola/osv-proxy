@@ -20,10 +20,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.server.listen).await?;
-    println!(
-        "serving phase-one redirect proxy on {}",
-        listener.local_addr()?
-    );
+    println!("serving osv-proxy on {}", listener.local_addr()?);
     serve_listener(listener, config).await
 }
 
@@ -77,7 +74,7 @@ pub async fn route_request_with_accept(
 ) -> RegistryResponse {
     let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
     let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
-    let checker = OsvHttpClient::new(&config.policy.malicious.osv_api_url);
+    let checker = OsvHttpClient::new(&config.policy.osv.api_url);
     route_request_with_dependencies(
         config,
         method,
