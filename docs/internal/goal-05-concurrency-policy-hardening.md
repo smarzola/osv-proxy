@@ -69,7 +69,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Baseline and async design lock
 - [x] Milestone 1: Tokio HTTP server and request timeouts
-- [ ] Milestone 2: Nonblocking upstream clients and bounded malicious checks
+- [x] Milestone 2: Nonblocking upstream clients and bounded malicious checks
 - [ ] Milestone 3: npm artifact basename enforcement
 - [ ] Milestone 4: Strict config validation
 - [ ] Milestone 5: PyPI Simple root compatibility
@@ -141,7 +141,7 @@ Status note - 2026-07-05:
   - `cargo test server` passed outside the sandbox: 17 server-filtered tests passed.
   - `cargo test e2e` passed outside the sandbox: 4 e2e-filtered library tests passed.
   - `cargo fmt --check` passed.
-- Commit: pending.
+- Commit: `3b7781f`.
 
 Problem:
 
@@ -183,6 +183,21 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 2: Nonblocking Upstream Clients and Bounded Malicious Checks
+
+Status note - 2026-07-05:
+
+- Converted live npm, PyPI, and OSV clients from `reqwest::blocking::Client` to nonblocking `reqwest::Client` with 5 second connect timeouts and 10 second request timeouts.
+- Added an async `MaliciousChecker::check_many` path. The OSV client uses `/v1/querybatch` for metadata filtering and keeps `/v1/query` for direct artifact serving.
+- Metadata filtering for npm versions and PyPI files now performs one request-local batch malicious check, then evaluates policy with the returned per-artifact results. This does not add metadata caching or persistent malicious storage.
+- Direct npm and PyPI artifact serving still performs a single second policy check for the requested artifact.
+- Updated tests with fake batch-aware checkers that assert metadata filtering uses one batch call and zero single malicious calls when the batch path is available.
+- Verification:
+  - `cargo test malicious` passed: 8 filtered tests passed.
+  - `cargo test policy` passed: 14 filtered tests passed.
+  - `cargo test npm` failed in the sandbox only at the package-manager e2e loopback bind with `Operation not permitted`; `cargo test npm` passed outside the sandbox with 17 library-filtered tests and 1 package-manager integration test.
+  - `cargo test pypi` passed: 18 filtered tests passed.
+  - `cargo test e2e` passed outside the sandbox: 4 e2e-filtered library tests passed.
+- Commit: pending.
 
 Problem:
 

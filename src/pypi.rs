@@ -3,16 +3,20 @@ use crate::config::Config;
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use reqwest::blocking::Client;
 use reqwest::header::ACCEPT;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 use thiserror::Error;
 
 const SIMPLE_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 const SIMPLE_HTML_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+html";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct PypiSimpleClient {
@@ -24,27 +28,35 @@ impl PypiSimpleClient {
     pub fn new(simple_url: impl Into<String>) -> Self {
         Self {
             simple_url: simple_url.into().trim_end_matches('/').to_string(),
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("PyPI HTTP client should build with static timeout configuration"),
         }
     }
 }
 
-pub trait PypiSimpleProvider {
-    fn fetch_simple_root(&self) -> Result<String, PypiError>;
-    fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, PypiError>;
+#[async_trait]
+pub trait PypiSimpleProvider: Send + Sync {
+    async fn fetch_simple_root(&self) -> Result<String, PypiError>;
+    async fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, PypiError>;
 }
 
+#[async_trait]
 impl PypiSimpleProvider for PypiSimpleClient {
-    fn fetch_simple_root(&self) -> Result<String, PypiError> {
+    async fn fetch_simple_root(&self) -> Result<String, PypiError> {
         Ok(self
             .client
             .get(&self.simple_url)
-            .send()?
+            .send()
+            .await?
             .error_for_status()?
-            .text()?)
+            .text()
+            .await?)
     }
 
-    fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, PypiError> {
+    async fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, PypiError> {
         let project = normalize_pypi_name(project);
         Ok(self
             .client
@@ -53,9 +65,11 @@ impl PypiSimpleProvider for PypiSimpleClient {
                 ACCEPT,
                 "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.latest+json",
             )
-            .send()?
+            .send()
+            .await?
             .error_for_status()?
-            .json::<SimpleProject>()?)
+            .json::<SimpleProject>()
+            .await?)
     }
 }
 
@@ -67,23 +81,26 @@ pub fn package_artifact(
     Artifact::package(Ecosystem::Pypi, name, version, published_at)
 }
 
-pub fn simple_root_response(
+pub async fn simple_root_response(
     upstream: &dyn PypiSimpleProvider,
 ) -> Result<RegistryResponse, PypiError> {
-    Ok(RegistryResponse::html(200, upstream.fetch_simple_root()?))
+    Ok(RegistryResponse::html(
+        200,
+        upstream.fetch_simple_root().await?,
+    ))
 }
 
-pub fn simple_project_response(
+pub async fn simple_project_response(
     config: &Config,
     upstream: &dyn PypiSimpleProvider,
     checker: &dyn MaliciousChecker,
     project: &str,
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, PypiError> {
-    simple_project_response_for_accept(config, upstream, checker, project, now, None)
+    simple_project_response_for_accept(config, upstream, checker, project, now, None).await
 }
 
-pub fn simple_project_response_for_accept(
+pub async fn simple_project_response_for_accept(
     config: &Config,
     upstream: &dyn PypiSimpleProvider,
     checker: &dyn MaliciousChecker,
@@ -92,8 +109,8 @@ pub fn simple_project_response_for_accept(
     accept: Option<&str>,
 ) -> Result<RegistryResponse, PypiError> {
     let project = normalize_pypi_name(project);
-    let raw = upstream.fetch_project_json(&project)?;
-    let filtered = filter_simple_project(config, checker, &project, raw, now)?;
+    let raw = upstream.fetch_project_json(&project).await?;
+    let filtered = filter_simple_project(config, checker, &project, raw, now).await?;
 
     if wants_simple_json(accept) {
         let mut response = RegistryResponse::json(200, &serde_json::to_value(&filtered)?)?;
@@ -106,7 +123,7 @@ pub fn simple_project_response_for_accept(
     }
 }
 
-pub fn artifact_response(
+pub async fn artifact_response(
     config: &Config,
     upstream: &dyn PypiSimpleProvider,
     checker: &dyn MaliciousChecker,
@@ -116,7 +133,7 @@ pub fn artifact_response(
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, PypiError> {
     let project = normalize_pypi_name(project);
-    let raw = upstream.fetch_project_json(&project)?;
+    let raw = upstream.fetch_project_json(&project).await?;
     let file = raw
         .files
         .iter()
@@ -133,7 +150,9 @@ pub fn artifact_response(
         ));
     }
 
-    let decision = PolicyEngine::new(config).evaluate(&artifact, now, checker);
+    let decision = PolicyEngine::new(config)
+        .evaluate(&artifact, now, checker)
+        .await;
     if decision.allowed {
         Ok(RegistryResponse::redirect(
             artifact
@@ -160,7 +179,7 @@ pub fn error_response(error: &PypiError) -> RegistryResponse {
     RegistryResponse::json(status, &body).expect("static error response should serialize")
 }
 
-fn filter_simple_project(
+async fn filter_simple_project(
     config: &Config,
     checker: &dyn MaliciousChecker,
     project: &str,
@@ -174,10 +193,27 @@ fn filter_simple_project(
 
     let mut allowed_versions = BTreeSet::new();
     let mut allowed_files = Vec::new();
+    let artifacts = simple
+        .files
+        .iter()
+        .map(|file| artifact_from_file(config, project, file))
+        .collect::<Result<Vec<_>, _>>()?;
+    let malicious_results = checker
+        .check_many(&artifacts)
+        .await
+        .map_err(|err| err.to_string());
 
-    for mut file in simple.files {
-        let artifact = artifact_from_file(config, project, &file)?;
-        let decision = PolicyEngine::new(config).evaluate(&artifact, now, checker);
+    for (index, mut file) in simple.files.into_iter().enumerate() {
+        let artifact = &artifacts[index];
+        let malicious_result = match &malicious_results {
+            Ok(results) => Some(Ok(results.get(index).cloned().unwrap_or_default())),
+            Err(err) => Some(Err(err.clone())),
+        };
+        let decision = PolicyEngine::new(config).evaluate_with_malicious_result(
+            artifact,
+            now,
+            malicious_result,
+        );
         if decision.allowed {
             let version = artifact.version.clone();
             file.url = proxy_file_url(config, project, &version, &file.filename);
@@ -440,9 +476,10 @@ mod tests {
     use crate::config::{BlocklistEntry, MissingPublishTime};
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::policy::{Decision, DecisionReason};
+    use async_trait::async_trait;
     use chrono::Duration as ChronoDuration;
-    use std::cell::Cell;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     struct StaticSimple {
         root: String,
@@ -458,12 +495,13 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl PypiSimpleProvider for StaticSimple {
-        fn fetch_simple_root(&self) -> Result<String, PypiError> {
+        async fn fetch_simple_root(&self) -> Result<String, PypiError> {
             Ok(self.root.clone())
         }
 
-        fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, PypiError> {
+        async fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, PypiError> {
             self.projects
                 .get(&normalize_pypi_name(project))
                 .cloned()
@@ -472,21 +510,32 @@ mod tests {
     }
 
     struct CleanChecker {
-        calls: Cell<u32>,
+        calls: AtomicU32,
+        batch_calls: AtomicU32,
     }
 
     impl CleanChecker {
         fn new() -> Self {
             Self {
-                calls: Cell::new(0),
+                calls: AtomicU32::new(0),
+                batch_calls: AtomicU32::new(0),
             }
         }
     }
 
+    #[async_trait]
     impl MaliciousChecker for CleanChecker {
-        fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
-            self.calls.set(self.calls.get() + 1);
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Vec::new())
+        }
+
+        async fn check_many(
+            &self,
+            artifacts: &[Artifact],
+        ) -> Result<Vec<Vec<MaliciousHit>>, MaliciousError> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Vec::new(); artifacts.len()])
         }
     }
 
@@ -547,8 +596,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pypi_simple_json_filters_blocked_and_too_young_files_and_recomputes_versions() {
+    #[tokio::test]
+    async fn pypi_simple_json_filters_blocked_and_too_young_files_and_recomputes_versions() {
         let mut config = Config::default();
         config.server.public_base_url = "https://proxy.example/".to_string();
         config.upstreams.pypi.simple_url = "https://pypi.example/simple".to_string();
@@ -569,6 +618,7 @@ mod tests {
             now(),
             Some(SIMPLE_JSON_CONTENT_TYPE),
         )
+        .await
         .unwrap();
         let body: SimpleProject = serde_json::from_slice(&response.body).unwrap();
 
@@ -589,11 +639,12 @@ mod tests {
             "https://proxy.example/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz"
         );
         assert_eq!(body.files[0].upload_time, Some(old_time()));
-        assert_eq!(checker.calls.get(), 3);
+        assert_eq!(checker.batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn pypi_simple_html_is_rendered_from_filtered_json_model() {
+    #[tokio::test]
+    async fn pypi_simple_html_is_rendered_from_filtered_json_model() {
         let mut config = Config::default();
         config.server.public_base_url = "https://proxy.example".to_string();
         config.upstreams.pypi.simple_url = "https://pypi.example/simple".to_string();
@@ -606,8 +657,9 @@ mod tests {
         let upstream = StaticSimple::new("demo", simple_fixture());
         let checker = CleanChecker::new();
 
-        let response =
-            simple_project_response(&config, &upstream, &checker, "demo", now()).unwrap();
+        let response = simple_project_response(&config, &upstream, &checker, "demo", now())
+            .await
+            .unwrap();
         let body = String::from_utf8(response.body).unwrap();
 
         assert_eq!(response.status, 200);
@@ -619,8 +671,8 @@ mod tests {
         assert!(!body.contains("demo-2.0.0-py3-none-any.whl"));
     }
 
-    #[test]
-    fn pypi_missing_json_upload_time_blocks_by_default() {
+    #[tokio::test]
+    async fn pypi_missing_json_upload_time_blocks_by_default() {
         let config = Config::default();
         let mut simple = simple_fixture();
         simple.files = vec![file(
@@ -639,6 +691,7 @@ mod tests {
             now(),
             Some(SIMPLE_JSON_CONTENT_TYPE),
         )
+        .await
         .unwrap();
         let body: SimpleProject = serde_json::from_slice(&response.body).unwrap();
 
@@ -646,8 +699,8 @@ mod tests {
         assert!(body.versions.is_empty());
     }
 
-    #[test]
-    fn pypi_missing_json_upload_time_can_be_allowed_explicitly() {
+    #[tokio::test]
+    async fn pypi_missing_json_upload_time_can_be_allowed_explicitly() {
         let mut config = Config::default();
         config.policy.missing_publish_time = MissingPublishTime::Allow;
         let mut simple = simple_fixture();
@@ -667,6 +720,7 @@ mod tests {
             now(),
             Some(SIMPLE_JSON_CONTENT_TYPE),
         )
+        .await
         .unwrap();
         let body: SimpleProject = serde_json::from_slice(&response.body).unwrap();
 
@@ -674,8 +728,8 @@ mod tests {
         assert_eq!(body.versions, vec!["1.0.0"]);
     }
 
-    #[test]
-    fn pypi_artifact_allowed_file_redirects_to_upstream_and_rechecks_policy() {
+    #[tokio::test]
+    async fn pypi_artifact_allowed_file_redirects_to_upstream_and_rechecks_policy() {
         let mut config = Config::default();
         config.upstreams.pypi.simple_url = "https://pypi.example/simple".to_string();
         let upstream = StaticSimple::new("demo", simple_fixture());
@@ -690,6 +744,7 @@ mod tests {
             "demo-1.0.0.tar.gz",
             now(),
         )
+        .await
         .unwrap();
 
         assert_eq!(response.status, 302);
@@ -700,11 +755,11 @@ mod tests {
                 "https://files.example/packages/demo-1.0.0.tar.gz".to_string()
             )]
         );
-        assert_eq!(checker.calls.get(), 1);
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn pypi_artifact_blocked_file_returns_structured_403() {
+    #[tokio::test]
+    async fn pypi_artifact_blocked_file_returns_structured_403() {
         let mut config = Config::default();
         config.blocklist.push(BlocklistEntry {
             ecosystem: Ecosystem::Pypi,
@@ -724,6 +779,7 @@ mod tests {
             "demo-1.0.0.tar.gz",
             now(),
         )
+        .await
         .unwrap();
         let body: Decision = serde_json::from_slice(&response.body).unwrap();
 
@@ -733,8 +789,8 @@ mod tests {
         assert_eq!(body.package, "pypi:demo@1.0.0");
     }
 
-    #[test]
-    fn pypi_artifact_too_young_file_returns_structured_403() {
+    #[tokio::test]
+    async fn pypi_artifact_too_young_file_returns_structured_403() {
         let config = Config::default();
         let upstream = StaticSimple::new("demo", simple_fixture());
         let checker = CleanChecker::new();
@@ -748,6 +804,7 @@ mod tests {
             "demo-2.0.0-py3-none-any.whl",
             now(),
         )
+        .await
         .unwrap();
         let body: Decision = serde_json::from_slice(&response.body).unwrap();
 
@@ -756,10 +813,10 @@ mod tests {
         assert_eq!(body.package, "pypi:demo@2.0.0");
     }
 
-    #[test]
-    fn pypi_simple_root_returns_upstream_html() {
+    #[tokio::test]
+    async fn pypi_simple_root_returns_upstream_html() {
         let upstream = StaticSimple::new("demo", simple_fixture());
-        let response = simple_root_response(&upstream).unwrap();
+        let response = simple_root_response(&upstream).await.unwrap();
 
         assert_eq!(response.status, 200);
         assert!(String::from_utf8(response.body)

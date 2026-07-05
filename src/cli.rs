@@ -66,7 +66,9 @@ pub async fn execute(cli: Cli) -> anyhow::Result<()> {
                 .with_context(|| format!("config validation failed for {}", config.display()))?;
             let artifact = parse_identity(&package, published_at)?;
             let checker = OsvHttpClient::new(&config.policy.malicious.osv_api_url);
-            let decision = PolicyEngine::new(&config).evaluate(&artifact, Utc::now(), &checker);
+            let decision = PolicyEngine::new(&config)
+                .evaluate(&artifact, Utc::now(), &checker)
+                .await;
             println!("{}", serde_json::to_string_pretty(&decision)?);
             if decision.allowed {
                 Ok(())

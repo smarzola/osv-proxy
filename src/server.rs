@@ -3,6 +3,7 @@ use crate::malicious::{MaliciousChecker, OsvHttpClient};
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
 use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
 use crate::response::RegistryResponse;
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri};
@@ -59,25 +60,16 @@ async fn registry_handler(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    let response = tokio::task::spawn_blocking(move || {
-        route_request_with_accept(&config, &method, &path, accept.as_deref())
-    })
-    .await
-    .unwrap_or_else(|err| {
-        simple_response(
-            500,
-            &format!("request handling task failed before completion: {err}"),
-        )
-    });
+    let response = route_request_with_accept(&config, &method, &path, accept.as_deref()).await;
 
     registry_response_into_http(response)
 }
 
-pub fn route_request(config: &Config, method: &str, path: &str) -> RegistryResponse {
-    route_request_with_accept(config, method, path, None)
+pub async fn route_request(config: &Config, method: &str, path: &str) -> RegistryResponse {
+    route_request_with_accept(config, method, path, None).await
 }
 
-pub fn route_request_with_accept(
+pub async fn route_request_with_accept(
     config: &Config,
     method: &str,
     path: &str,
@@ -98,9 +90,10 @@ pub fn route_request_with_accept(
             accept,
         },
     )
+    .await
 }
 
-pub fn route_request_with_upstream(
+pub async fn route_request_with_upstream(
     config: &Config,
     method: &str,
     path: &str,
@@ -117,9 +110,10 @@ pub fn route_request_with_upstream(
         upstream,
         &MissingPypiUpstream,
     )
+    .await
 }
 
-pub fn route_request_with_upstreams(
+pub async fn route_request_with_upstreams(
     config: &Config,
     method: &str,
     path: &str,
@@ -140,6 +134,7 @@ pub fn route_request_with_upstreams(
             accept: None,
         },
     )
+    .await
 }
 
 struct RouteDependencies<'a> {
@@ -149,7 +144,7 @@ struct RouteDependencies<'a> {
     accept: Option<&'a str>,
 }
 
-fn route_request_with_dependencies(
+async fn route_request_with_dependencies(
     config: &Config,
     method: &str,
     path: &str,
@@ -168,6 +163,7 @@ fn route_request_with_dependencies(
             &package,
             now,
         )
+        .await
         .unwrap_or_else(|err| npm::error_response(&err)),
         Some(NpmRoute::Artifact { package, tarball }) => npm::artifact_response(
             config,
@@ -177,9 +173,11 @@ fn route_request_with_dependencies(
             &tarball,
             now,
         )
+        .await
         .unwrap_or_else(|err| npm::error_response(&err)),
         None => match parse_pypi_route(path) {
             Some(PypiRoute::SimpleRoot) => pypi::simple_root_response(dependencies.pypi_upstream)
+                .await
                 .unwrap_or_else(|err| pypi::error_response(&err)),
             Some(PypiRoute::SimpleProject { project }) => pypi::simple_project_response_for_accept(
                 config,
@@ -189,6 +187,7 @@ fn route_request_with_dependencies(
                 now,
                 dependencies.accept,
             )
+            .await
             .unwrap_or_else(|err| pypi::error_response(&err)),
             Some(PypiRoute::Artifact {
                 project,
@@ -203,6 +202,7 @@ fn route_request_with_dependencies(
                 &filename,
                 now,
             )
+            .await
             .unwrap_or_else(|err| pypi::error_response(&err)),
             None => simple_response(404, "not found"),
         },
@@ -235,14 +235,18 @@ fn simple_response(status: u16, message: &str) -> RegistryResponse {
 
 struct MissingPypiUpstream;
 
+#[async_trait]
 impl PypiSimpleProvider for MissingPypiUpstream {
-    fn fetch_simple_root(&self) -> Result<String, pypi::PypiError> {
+    async fn fetch_simple_root(&self) -> Result<String, pypi::PypiError> {
         Err(pypi::PypiError::InvalidSimpleJson(
             "PyPI upstream was not provided".to_string(),
         ))
     }
 
-    fn fetch_project_json(&self, _project: &str) -> Result<pypi::SimpleProject, pypi::PypiError> {
+    async fn fetch_project_json(
+        &self,
+        _project: &str,
+    ) -> Result<pypi::SimpleProject, pypi::PypiError> {
         Err(pypi::PypiError::InvalidSimpleJson(
             "PyPI upstream was not provided".to_string(),
         ))
@@ -398,8 +402,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl NpmMetadataProvider for StaticUpstream {
-        fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError> {
+        async fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError> {
             self.metadata.get(package).cloned().ok_or_else(|| {
                 NpmError::InvalidMetadata(format!("missing static metadata for {package}"))
             })
@@ -420,12 +425,16 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl PypiSimpleProvider for StaticPypiUpstream {
-        fn fetch_simple_root(&self) -> Result<String, pypi::PypiError> {
+        async fn fetch_simple_root(&self) -> Result<String, pypi::PypiError> {
             Ok(self.root.clone())
         }
 
-        fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, pypi::PypiError> {
+        async fn fetch_project_json(
+            &self,
+            project: &str,
+        ) -> Result<SimpleProject, pypi::PypiError> {
             self.projects
                 .get(&crate::artifact::normalize_pypi_name(project))
                 .cloned()
@@ -435,8 +444,9 @@ mod tests {
 
     struct CleanChecker;
 
+    #[async_trait]
     impl MaliciousChecker for CleanChecker {
-        fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
             Ok(Vec::new())
         }
     }
@@ -453,8 +463,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl MaliciousChecker for MaliciousPackageChecker {
-        fn check(&self, artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+        async fn check(&self, artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
             if artifact.identity() == self.package {
                 Ok(vec![MaliciousHit {
                     osv_id: "MAL-2026-000001".to_string(),
@@ -525,8 +536,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_documented_npm_routes() {
+    #[tokio::test]
+    async fn parses_documented_npm_routes() {
         assert_eq!(
             parse_npm_route("/npm/lodash"),
             Some(NpmRoute::Metadata {
@@ -555,8 +566,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parses_encoded_scoped_npm_metadata_route() {
+    #[tokio::test]
+    async fn parses_encoded_scoped_npm_metadata_route() {
         assert_eq!(
             parse_npm_route("/npm/@babel%2Fcore?write=true"),
             Some(NpmRoute::Metadata {
@@ -565,8 +576,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parses_documented_pypi_routes() {
+    #[tokio::test]
+    async fn parses_documented_pypi_routes() {
         assert_eq!(
             parse_pypi_route("/pypi/simple/"),
             Some(PypiRoute::SimpleRoot)
@@ -587,8 +598,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn routes_npm_metadata_with_mocked_upstream() {
+    #[tokio::test]
+    async fn routes_npm_metadata_with_mocked_upstream() {
         let config = Config::default();
         let upstream = StaticUpstream::with(
             "lodash",
@@ -615,7 +626,8 @@ mod tests {
             now(),
             &CleanChecker,
             &upstream,
-        );
+        )
+        .await;
 
         assert_eq!(response.status, 200);
         let body: Value = serde_json::from_slice(&response.body).unwrap();
@@ -625,8 +637,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn routes_npm_artifact_with_mocked_upstream() {
+    #[tokio::test]
+    async fn routes_npm_artifact_with_mocked_upstream() {
         let config = Config::default();
         let upstream = StaticUpstream::with(
             "@babel/core",
@@ -652,7 +664,8 @@ mod tests {
             now(),
             &CleanChecker,
             &upstream,
-        );
+        )
+        .await;
 
         assert_eq!(response.status, 302);
         assert_eq!(
@@ -664,8 +677,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn routes_pypi_simple_project_with_mocked_upstream() {
+    #[tokio::test]
+    async fn routes_pypi_simple_project_with_mocked_upstream() {
         let config = Config::default();
         let npm_upstream = StaticUpstream::with("unused", json!({}));
         let mut simple = pypi_simple_fixture();
@@ -685,7 +698,8 @@ mod tests {
             &CleanChecker,
             &npm_upstream,
             &pypi_upstream,
-        );
+        )
+        .await;
         let body = String::from_utf8(response.body).unwrap();
 
         assert_eq!(response.status, 200);
@@ -694,8 +708,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn routes_pypi_simple_json_when_client_accepts_json() {
+    #[tokio::test]
+    async fn routes_pypi_simple_json_when_client_accepts_json() {
         let config = Config::default();
         let npm_upstream = StaticUpstream::with("unused", json!({}));
         let pypi_upstream = StaticPypiUpstream::with("demo", pypi_simple_fixture());
@@ -711,7 +725,8 @@ mod tests {
                 pypi_upstream: &pypi_upstream,
                 accept: Some("application/vnd.pypi.simple.v1+json"),
             },
-        );
+        )
+        .await;
         let body: Value = serde_json::from_slice(&response.body).unwrap();
 
         assert_eq!(response.status, 200);
@@ -732,8 +747,8 @@ mod tests {
         assert!(!body.to_string().contains("demo-2.0.0-py3-none-any.whl"));
     }
 
-    #[test]
-    fn routes_pypi_artifact_with_mocked_upstream() {
+    #[tokio::test]
+    async fn routes_pypi_artifact_with_mocked_upstream() {
         let config = Config::default();
         let npm_upstream = StaticUpstream::with("unused", json!({}));
         let mut simple = pypi_simple_fixture();
@@ -753,7 +768,8 @@ mod tests {
             &CleanChecker,
             &npm_upstream,
             &pypi_upstream,
-        );
+        )
+        .await;
 
         assert_eq!(response.status, 302);
         assert_eq!(
@@ -765,8 +781,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn e2e_npm_route_filters_metadata_redirects_allowed_and_blocks_direct_artifact() {
+    #[tokio::test]
+    async fn e2e_npm_route_filters_metadata_redirects_allowed_and_blocks_direct_artifact() {
         let mut config = Config::default();
         config.blocklist.push(BlocklistEntry {
             ecosystem: Ecosystem::Npm,
@@ -812,7 +828,8 @@ mod tests {
             now(),
             &CleanChecker,
             &npm_upstream,
-        );
+        )
+        .await;
         assert_eq!(metadata_response.status, 200);
         let metadata: Value = serde_json::from_slice(&metadata_response.body).unwrap();
         assert!(metadata["versions"]
@@ -836,7 +853,8 @@ mod tests {
             now(),
             &CleanChecker,
             &npm_upstream,
-        );
+        )
+        .await;
         assert_eq!(allowed_artifact_response.status, 302);
         assert_eq!(
             allowed_artifact_response.headers,
@@ -853,15 +871,16 @@ mod tests {
             now(),
             &CleanChecker,
             &npm_upstream,
-        );
+        )
+        .await;
         let blocked_body: Value = serde_json::from_slice(&blocked_artifact_response.body).unwrap();
         assert_eq!(blocked_artifact_response.status, 403);
         assert_eq!(blocked_body["allowed"], false);
         assert_eq!(blocked_body["package"], "npm:demo@1.0.1");
     }
 
-    #[test]
-    fn e2e_npm_route_filters_malicious_metadata_and_blocks_artifact() {
+    #[tokio::test]
+    async fn e2e_npm_route_filters_malicious_metadata_and_blocks_artifact() {
         let config = Config::default();
         let npm_upstream = StaticUpstream::with(
             "demo",
@@ -899,7 +918,8 @@ mod tests {
             now(),
             &checker,
             &npm_upstream,
-        );
+        )
+        .await;
         let metadata: Value = serde_json::from_slice(&metadata_response.body).unwrap();
 
         assert_eq!(metadata_response.status, 200);
@@ -920,15 +940,16 @@ mod tests {
             now(),
             &checker,
             &npm_upstream,
-        );
+        )
+        .await;
         let blocked_body: Value = serde_json::from_slice(&blocked_artifact_response.body).unwrap();
         assert_eq!(blocked_artifact_response.status, 403);
         assert_eq!(blocked_body["reason"], "malicious");
         assert_eq!(blocked_body["rule_id"], "MAL-2026-000001");
     }
 
-    #[test]
-    fn e2e_pypi_route_filters_simple_redirects_allowed_and_blocks_direct_artifact() {
+    #[tokio::test]
+    async fn e2e_pypi_route_filters_simple_redirects_allowed_and_blocks_direct_artifact() {
         let mut config = Config::default();
         config.blocklist.push(BlocklistEntry {
             ecosystem: Ecosystem::Pypi,
@@ -947,7 +968,8 @@ mod tests {
             &CleanChecker,
             &npm_upstream,
             &pypi_upstream,
-        );
+        )
+        .await;
         assert_eq!(simple_response.status, 200);
         let simple_body = String::from_utf8(simple_response.body).unwrap();
         assert!(simple_body.contains(
@@ -964,7 +986,8 @@ mod tests {
             &CleanChecker,
             &npm_upstream,
             &pypi_upstream,
-        );
+        )
+        .await;
         assert_eq!(allowed_artifact_response.status, 302);
         assert_eq!(
             allowed_artifact_response.headers,
@@ -982,15 +1005,16 @@ mod tests {
             &CleanChecker,
             &npm_upstream,
             &pypi_upstream,
-        );
+        )
+        .await;
         let blocked_body: Value = serde_json::from_slice(&blocked_artifact_response.body).unwrap();
         assert_eq!(blocked_artifact_response.status, 403);
         assert_eq!(blocked_body["allowed"], false);
         assert_eq!(blocked_body["package"], "pypi:demo@1.0.1");
     }
 
-    #[test]
-    fn e2e_pypi_route_filters_malicious_json_and_blocks_artifact() {
+    #[tokio::test]
+    async fn e2e_pypi_route_filters_malicious_json_and_blocks_artifact() {
         let config = Config::default();
         let npm_upstream = StaticUpstream::with("unused", json!({}));
         let pypi_upstream = StaticPypiUpstream::with("Demo", pypi_simple_fixture());
@@ -1007,7 +1031,8 @@ mod tests {
                 pypi_upstream: &pypi_upstream,
                 accept: Some("application/vnd.pypi.simple.v1+json"),
             },
-        );
+        )
+        .await;
         let simple_body: Value = serde_json::from_slice(&simple_response.body).unwrap();
 
         assert_eq!(simple_response.status, 200);
@@ -1026,7 +1051,8 @@ mod tests {
             &checker,
             &npm_upstream,
             &pypi_upstream,
-        );
+        )
+        .await;
         let blocked_body: Value = serde_json::from_slice(&blocked_artifact_response.body).unwrap();
 
         assert_eq!(blocked_artifact_response.status, 403);
@@ -1034,8 +1060,8 @@ mod tests {
         assert_eq!(blocked_body["rule_id"], "MAL-2026-000001");
     }
 
-    #[test]
-    fn method_mismatch_returns_405() {
+    #[tokio::test]
+    async fn method_mismatch_returns_405() {
         let response = route_request_with_upstream(
             &Config::default(),
             "POST",
@@ -1043,12 +1069,13 @@ mod tests {
             now(),
             &CleanChecker,
             &StaticUpstream::with("lodash", json!({})),
-        );
+        )
+        .await;
         assert_eq!(response.status, 405);
     }
 
-    #[test]
-    fn parses_accept_header_case_insensitively() {
+    #[tokio::test]
+    async fn parses_accept_header_case_insensitively() {
         let request = "GET /pypi/simple/demo/ HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.pypi.simple.v1+json\r\n\r\n";
         assert_eq!(
             header_value(request, "accept").as_deref(),
@@ -1099,8 +1126,8 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
     }
 
-    #[test]
-    fn clean_checker_uses_npm_artifacts() {
+    #[tokio::test]
+    async fn clean_checker_uses_npm_artifacts() {
         let artifact = Artifact::package(Ecosystem::Npm, "lodash", "4.17.21", None);
         assert_eq!(artifact.identity(), "npm:lodash@4.17.21");
     }

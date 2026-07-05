@@ -3,10 +3,15 @@ use crate::config::Config;
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde_json::{json, Map, Value};
+use std::time::Duration;
 use thiserror::Error;
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct NpmRegistryClient {
@@ -18,17 +23,23 @@ impl NpmRegistryClient {
     pub fn new(registry_url: impl Into<String>) -> Self {
         Self {
             registry_url: registry_url.into().trim_end_matches('/').to_string(),
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("npm HTTP client should build with static timeout configuration"),
         }
     }
 }
 
-pub trait NpmMetadataProvider {
-    fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError>;
+#[async_trait]
+pub trait NpmMetadataProvider: Send + Sync {
+    async fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError>;
 }
 
+#[async_trait]
 impl NpmMetadataProvider for NpmRegistryClient {
-    fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError> {
+    async fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError> {
         let url = format!(
             "{}/{}",
             self.registry_url,
@@ -37,9 +48,11 @@ impl NpmMetadataProvider for NpmRegistryClient {
         Ok(self
             .client
             .get(url)
-            .send()?
+            .send()
+            .await?
             .error_for_status()?
-            .json::<Value>()?)
+            .json::<Value>()
+            .await?)
     }
 }
 
@@ -53,19 +66,19 @@ pub fn package_artifact(
     Artifact::package(Ecosystem::Npm, name, version, published_at)
 }
 
-pub fn metadata_response(
+pub async fn metadata_response(
     config: &Config,
     upstream: &dyn NpmMetadataProvider,
     checker: &dyn MaliciousChecker,
     package: &str,
     now: DateTime<Utc>,
 ) -> Result<NpmResponse, NpmError> {
-    let raw = upstream.fetch_package_metadata(package)?;
-    let filtered = filter_metadata(config, checker, package, raw, now)?;
+    let raw = upstream.fetch_package_metadata(package).await?;
+    let filtered = filter_metadata(config, checker, package, raw, now).await?;
     Ok(NpmResponse::json(200, &filtered)?)
 }
 
-pub fn artifact_response(
+pub async fn artifact_response(
     config: &Config,
     upstream: &dyn NpmMetadataProvider,
     checker: &dyn MaliciousChecker,
@@ -75,9 +88,11 @@ pub fn artifact_response(
 ) -> Result<NpmResponse, NpmError> {
     let version = infer_version_from_tarball(package, tarball)
         .ok_or_else(|| NpmError::InvalidTarballName(tarball.to_string()))?;
-    let metadata = upstream.fetch_package_metadata(package)?;
+    let metadata = upstream.fetch_package_metadata(package).await?;
     let artifact = artifact_from_metadata(package, &version, tarball, &metadata)?;
-    let decision = PolicyEngine::new(config).evaluate(&artifact, now, checker);
+    let decision = PolicyEngine::new(config)
+        .evaluate(&artifact, now, checker)
+        .await;
 
     if decision.allowed {
         let location = artifact
@@ -106,7 +121,7 @@ pub fn error_response(error: &NpmError) -> NpmResponse {
     NpmResponse::json(status, &body).expect("static error response should serialize")
 }
 
-fn filter_metadata(
+async fn filter_metadata(
     config: &Config,
     checker: &dyn MaliciousChecker,
     package: &str,
@@ -119,8 +134,30 @@ fn filter_metadata(
         .get_mut("versions")
         .and_then(Value::as_object_mut)
         .ok_or_else(|| NpmError::InvalidMetadata("metadata.versions must be an object".into()))?;
+    let version_names = versions.keys().cloned().collect::<Vec<_>>();
+    let artifacts = version_names
+        .iter()
+        .map(|version| {
+            let version_metadata = versions
+                .get(version)
+                .expect("version key should exist while collecting npm artifacts");
+            let published_at = time_metadata
+                .as_ref()
+                .and_then(|time| time.get(version))
+                .and_then(Value::as_str)
+                .and_then(parse_npm_time);
+            artifact_from_version_metadata(package, version, version_metadata, published_at)
+        })
+        .collect::<Vec<_>>();
+    let malicious_results = checker
+        .check_many(&artifacts)
+        .await
+        .map_err(|err| err.to_string());
 
-    versions.retain(|version, version_metadata| {
+    for (index, version) in version_names.iter().enumerate() {
+        let Some(version_metadata) = versions.get_mut(version) else {
+            continue;
+        };
         let published_at = time_metadata
             .as_ref()
             .and_then(|time| time.get(version))
@@ -128,7 +165,15 @@ fn filter_metadata(
             .and_then(parse_npm_time);
         let artifact =
             artifact_from_version_metadata(package, version, version_metadata, published_at);
-        let decision = PolicyEngine::new(config).evaluate(&artifact, now, checker);
+        let malicious_result = match &malicious_results {
+            Ok(results) => Some(Ok(results.get(index).cloned().unwrap_or_default())),
+            Err(err) => Some(Err(err.clone())),
+        };
+        let decision = PolicyEngine::new(config).evaluate_with_malicious_result(
+            &artifact,
+            now,
+            malicious_result,
+        );
         if decision.allowed {
             if let Some(dist) = version_metadata
                 .get_mut("dist")
@@ -145,11 +190,10 @@ fn filter_metadata(
                 );
             }
             kept_versions.push(version.clone());
-            true
         } else {
-            false
+            versions.remove(version);
         }
-    });
+    }
 
     if let Some(dist_tags) = metadata.get_mut("dist-tags").and_then(Value::as_object_mut) {
         dist_tags.retain(|_, tagged_version| {
@@ -301,9 +345,10 @@ mod tests {
     use crate::config::BlocklistEntry;
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::policy::Decision;
+    use async_trait::async_trait;
     use chrono::Duration as ChronoDuration;
-    use std::cell::Cell;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     struct StaticUpstream {
         metadata: HashMap<String, Value>,
@@ -317,8 +362,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl NpmMetadataProvider for StaticUpstream {
-        fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError> {
+        async fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError> {
             self.metadata.get(package).cloned().ok_or_else(|| {
                 NpmError::InvalidMetadata(format!("missing static metadata for {package}"))
             })
@@ -326,21 +372,32 @@ mod tests {
     }
 
     struct CleanChecker {
-        calls: Cell<u32>,
+        calls: AtomicU32,
+        batch_calls: AtomicU32,
     }
 
     impl CleanChecker {
         fn new() -> Self {
             Self {
-                calls: Cell::new(0),
+                calls: AtomicU32::new(0),
+                batch_calls: AtomicU32::new(0),
             }
         }
     }
 
+    #[async_trait]
     impl MaliciousChecker for CleanChecker {
-        fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
-            self.calls.set(self.calls.get() + 1);
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(Vec::new())
+        }
+
+        async fn check_many(
+            &self,
+            artifacts: &[Artifact],
+        ) -> Result<Vec<Vec<MaliciousHit>>, MaliciousError> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Vec::new(); artifacts.len()])
         }
     }
 
@@ -391,8 +448,8 @@ mod tests {
         })
     }
 
-    #[test]
-    fn npm_metadata_filters_versions_rewrites_tarballs_and_dist_tags() {
+    #[tokio::test]
+    async fn npm_metadata_filters_versions_rewrites_tarballs_and_dist_tags() {
         let mut config = Config::default();
         config.server.public_base_url = "https://proxy.example".to_string();
         config.blocklist.push(BlocklistEntry {
@@ -404,7 +461,9 @@ mod tests {
         let upstream = StaticUpstream::new("demo", metadata_fixture());
         let checker = CleanChecker::new();
 
-        let response = metadata_response(&config, &upstream, &checker, "demo", now()).unwrap();
+        let response = metadata_response(&config, &upstream, &checker, "demo", now())
+            .await
+            .unwrap();
         assert_eq!(response.status, 200);
         let body: Value = serde_json::from_slice(&response.body).unwrap();
         let versions = body["versions"].as_object().unwrap();
@@ -420,11 +479,12 @@ mod tests {
         );
         assert_eq!(body["versions"]["1.0.0"]["dist"]["shasum"], "abc123");
         assert_eq!(body["dist-tags"], json!({ "stable": "1.0.0" }));
-        assert_eq!(checker.calls.get(), 3);
+        assert_eq!(checker.batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn npm_metadata_preserves_scoped_package_names_in_proxy_urls() {
+    #[tokio::test]
+    async fn npm_metadata_preserves_scoped_package_names_in_proxy_urls() {
         let mut config = Config::default();
         config.server.public_base_url = "https://proxy.example/".to_string();
         let metadata = json!({
@@ -444,8 +504,9 @@ mod tests {
         let upstream = StaticUpstream::new("@babel/core", metadata);
         let checker = CleanChecker::new();
 
-        let response =
-            metadata_response(&config, &upstream, &checker, "@babel/core", now()).unwrap();
+        let response = metadata_response(&config, &upstream, &checker, "@babel/core", now())
+            .await
+            .unwrap();
         let body: Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(
             body["versions"]["7.24.0"]["dist"]["tarball"],
@@ -453,8 +514,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn npm_artifact_allowed_tarball_redirects_to_upstream() {
+    #[tokio::test]
+    async fn npm_artifact_allowed_tarball_redirects_to_upstream() {
         let config = Config::default();
         let metadata = json!({
             "name": "@babel/core",
@@ -480,6 +541,7 @@ mod tests {
             "core-7.24.0.tgz",
             now(),
         )
+        .await
         .unwrap();
 
         assert_eq!(response.status, 302);
@@ -490,11 +552,11 @@ mod tests {
                 "https://registry.example/@babel/core/-/core-7.24.0.tgz".to_string()
             )]
         );
-        assert_eq!(checker.calls.get(), 1);
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn npm_artifact_blocked_tarball_returns_structured_403() {
+    #[tokio::test]
+    async fn npm_artifact_blocked_tarball_returns_structured_403() {
         let mut config = Config::default();
         config.blocklist.push(BlocklistEntry {
             ecosystem: Ecosystem::Npm,
@@ -526,6 +588,7 @@ mod tests {
             "demo-1.0.0.tgz",
             now(),
         )
+        .await
         .unwrap();
         let body: Decision = serde_json::from_slice(&response.body).unwrap();
 
@@ -556,8 +619,8 @@ mod tests {
         assert_eq!(encode_package_for_registry("lodash"), "lodash");
     }
 
-    #[test]
-    fn too_young_metadata_version_is_removed() {
+    #[tokio::test]
+    async fn too_young_metadata_version_is_removed() {
         let config = Config::default();
         let checker = CleanChecker::new();
         let mut metadata = metadata_fixture();
@@ -567,7 +630,9 @@ mod tests {
             .remove("1.0.1");
         let upstream = StaticUpstream::new("demo", metadata);
 
-        let response = metadata_response(&config, &upstream, &checker, "demo", now()).unwrap();
+        let response = metadata_response(&config, &upstream, &checker, "demo", now())
+            .await
+            .unwrap();
         let body: Value = serde_json::from_slice(&response.body).unwrap();
 
         assert!(body["versions"].as_object().unwrap().contains_key("1.0.0"));

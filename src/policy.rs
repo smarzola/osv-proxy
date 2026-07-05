@@ -41,17 +41,39 @@ impl<'a> PolicyEngine<'a> {
         Self { config }
     }
 
-    pub fn evaluate(
+    pub async fn evaluate(
         &self,
         artifact: &Artifact,
         now: DateTime<Utc>,
         malicious_checker: &dyn MaliciousChecker,
     ) -> Decision {
+        let malicious_result = if self
+            .find_allowlist_entry(artifact)
+            .is_some_and(|entry| entry.bypass_malicious)
+        {
+            None
+        } else {
+            Some(
+                malicious_checker
+                    .check(artifact)
+                    .await
+                    .map_err(|err| err.to_string()),
+            )
+        };
+        self.evaluate_with_malicious_result(artifact, now, malicious_result)
+    }
+
+    pub fn evaluate_with_malicious_result(
+        &self,
+        artifact: &Artifact,
+        now: DateTime<Utc>,
+        malicious_result: Option<Result<Vec<MaliciousHit>, String>>,
+    ) -> Decision {
         let allowlist_entry = self.find_allowlist_entry(artifact);
 
         if !allowlist_entry.is_some_and(|entry| entry.bypass_malicious) {
-            match malicious_checker.check(artifact) {
-                Ok(hits) => {
+            match malicious_result {
+                Some(Ok(hits)) => {
                     if let Some(hit) = self.blocking_malicious_hit(hits) {
                         return blocked(
                             DecisionReason::Malicious,
@@ -63,7 +85,7 @@ impl<'a> PolicyEngine<'a> {
                         );
                     }
                 }
-                Err(err) => {
+                Some(Err(err)) => {
                     if self.config.policy.malicious.on_osv_error == OsvErrorBehavior::Block {
                         return blocked(
                             DecisionReason::Malicious,
@@ -75,6 +97,7 @@ impl<'a> PolicyEngine<'a> {
                         );
                     }
                 }
+                None => {}
             }
         }
 
@@ -213,13 +236,14 @@ mod tests {
         AllowlistEntry, BlocklistEntry, MaliciousConfig, MaliciousMode, PolicyConfig,
     };
     use crate::malicious::MaliciousError;
-    use std::cell::Cell;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     struct FakeChecker {
         hits: Vec<MaliciousHit>,
         fail: bool,
-        calls: Cell<u32>,
+        calls: AtomicU32,
     }
 
     impl FakeChecker {
@@ -227,7 +251,7 @@ mod tests {
             Self {
                 hits: Vec::new(),
                 fail: false,
-                calls: Cell::new(0),
+                calls: AtomicU32::new(0),
             }
         }
 
@@ -240,7 +264,7 @@ mod tests {
                     modified: None,
                 }],
                 fail: false,
-                calls: Cell::new(0),
+                calls: AtomicU32::new(0),
             }
         }
 
@@ -248,17 +272,20 @@ mod tests {
             Self {
                 hits: Vec::new(),
                 fail: true,
-                calls: Cell::new(0),
+                calls: AtomicU32::new(0),
             }
         }
     }
 
+    #[async_trait]
     impl MaliciousChecker for FakeChecker {
-        fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
-            self.calls.set(self.calls.get() + 1);
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
-                let err = reqwest::blocking::get("http://[::1").unwrap_err();
-                return Err(MaliciousError::Request(err));
+                return Err(MaliciousError::InvalidBatchResponse {
+                    expected: 1,
+                    actual: 0,
+                });
             }
             Ok(self.hits.clone())
         }
@@ -279,17 +306,18 @@ mod tests {
         )
     }
 
-    #[test]
-    fn allows_old_package() {
+    #[tokio::test]
+    async fn allows_old_package() {
         let config = Config::default();
-        let decision =
-            PolicyEngine::new(&config).evaluate(&old_artifact(), now(), &FakeChecker::clean());
+        let decision = PolicyEngine::new(&config)
+            .evaluate(&old_artifact(), now(), &FakeChecker::clean())
+            .await;
         assert!(decision.allowed);
         assert_eq!(decision.reason, DecisionReason::Allowed);
     }
 
-    #[test]
-    fn blocks_too_young_package() {
+    #[tokio::test]
+    async fn blocks_too_young_package() {
         let config = Config::default();
         let artifact = Artifact::package(
             Ecosystem::Npm,
@@ -297,32 +325,38 @@ mod tests {
             "4.17.21",
             Some(now() - ChronoDuration::hours(12)),
         );
-        let decision = PolicyEngine::new(&config).evaluate(&artifact, now(), &FakeChecker::clean());
+        let decision = PolicyEngine::new(&config)
+            .evaluate(&artifact, now(), &FakeChecker::clean())
+            .await;
         assert!(!decision.allowed);
         assert_eq!(decision.reason, DecisionReason::TooYoung);
         assert!(decision.eligible_at.is_some());
     }
 
-    #[test]
-    fn blocks_missing_publish_time_by_default() {
+    #[tokio::test]
+    async fn blocks_missing_publish_time_by_default() {
         let config = Config::default();
         let artifact = Artifact::package(Ecosystem::Npm, "lodash", "4.17.21", None);
-        let decision = PolicyEngine::new(&config).evaluate(&artifact, now(), &FakeChecker::clean());
+        let decision = PolicyEngine::new(&config)
+            .evaluate(&artifact, now(), &FakeChecker::clean())
+            .await;
         assert!(!decision.allowed);
         assert_eq!(decision.reason, DecisionReason::MissingPublishTime);
     }
 
-    #[test]
-    fn can_allow_missing_publish_time() {
+    #[tokio::test]
+    async fn can_allow_missing_publish_time() {
         let mut config = Config::default();
         config.policy.missing_publish_time = MissingPublishTime::Allow;
         let artifact = Artifact::package(Ecosystem::Npm, "lodash", "4.17.21", None);
-        let decision = PolicyEngine::new(&config).evaluate(&artifact, now(), &FakeChecker::clean());
+        let decision = PolicyEngine::new(&config)
+            .evaluate(&artifact, now(), &FakeChecker::clean())
+            .await;
         assert!(decision.allowed);
     }
 
-    #[test]
-    fn blocks_manual_wildcard_blocklist() {
+    #[tokio::test]
+    async fn blocks_manual_wildcard_blocklist() {
         let mut config = Config::default();
         config.blocklist.push(BlocklistEntry {
             ecosystem: Ecosystem::Npm,
@@ -330,14 +364,15 @@ mod tests {
             versions: vec!["*".to_string()],
             reason: "blocked".to_string(),
         });
-        let decision =
-            PolicyEngine::new(&config).evaluate(&old_artifact(), now(), &FakeChecker::clean());
+        let decision = PolicyEngine::new(&config)
+            .evaluate(&old_artifact(), now(), &FakeChecker::clean())
+            .await;
         assert!(!decision.allowed);
         assert_eq!(decision.reason, DecisionReason::ManuallyBlocked);
     }
 
-    #[test]
-    fn blocks_manual_exact_blocklist() {
+    #[tokio::test]
+    async fn blocks_manual_exact_blocklist() {
         let mut config = Config::default();
         config.blocklist.push(BlocklistEntry {
             ecosystem: Ecosystem::Npm,
@@ -345,69 +380,78 @@ mod tests {
             versions: vec!["4.17.21".to_string()],
             reason: "blocked".to_string(),
         });
-        let decision =
-            PolicyEngine::new(&config).evaluate(&old_artifact(), now(), &FakeChecker::clean());
+        let decision = PolicyEngine::new(&config)
+            .evaluate(&old_artifact(), now(), &FakeChecker::clean())
+            .await;
         assert!(!decision.allowed);
         assert_eq!(decision.reason, DecisionReason::ManuallyBlocked);
     }
 
-    #[test]
-    fn mal_ids_block() {
+    #[tokio::test]
+    async fn mal_ids_block() {
         let config = Config::default();
-        let decision = PolicyEngine::new(&config).evaluate(
-            &old_artifact(),
-            now(),
-            &FakeChecker::with_hit("MAL-2026-000001"),
-        );
+        let decision = PolicyEngine::new(&config)
+            .evaluate(
+                &old_artifact(),
+                now(),
+                &FakeChecker::with_hit("MAL-2026-000001"),
+            )
+            .await;
         assert!(!decision.allowed);
         assert_eq!(decision.reason, DecisionReason::Malicious);
         assert_eq!(decision.rule_id.as_deref(), Some("MAL-2026-000001"));
     }
 
-    #[test]
-    fn non_mal_advisories_do_not_block_when_only_mal_ids_is_true() {
+    #[tokio::test]
+    async fn non_mal_advisories_do_not_block_when_only_mal_ids_is_true() {
         let config = Config::default();
-        let decision = PolicyEngine::new(&config).evaluate(
-            &old_artifact(),
-            now(),
-            &FakeChecker::with_hit("GHSA-abcd-1234"),
-        );
+        let decision = PolicyEngine::new(&config)
+            .evaluate(
+                &old_artifact(),
+                now(),
+                &FakeChecker::with_hit("GHSA-abcd-1234"),
+            )
+            .await;
         assert!(decision.allowed);
     }
 
-    #[test]
-    fn non_mal_advisories_block_when_only_mal_ids_is_false() {
+    #[tokio::test]
+    async fn non_mal_advisories_block_when_only_mal_ids_is_false() {
         let mut config = Config::default();
         config.policy.malicious.only_mal_ids = false;
-        let decision = PolicyEngine::new(&config).evaluate(
-            &old_artifact(),
-            now(),
-            &FakeChecker::with_hit("GHSA-abcd-1234"),
-        );
+        let decision = PolicyEngine::new(&config)
+            .evaluate(
+                &old_artifact(),
+                now(),
+                &FakeChecker::with_hit("GHSA-abcd-1234"),
+            )
+            .await;
         assert!(!decision.allowed);
         assert_eq!(decision.reason, DecisionReason::Malicious);
     }
 
-    #[test]
-    fn osv_error_blocks_by_default() {
+    #[tokio::test]
+    async fn osv_error_blocks_by_default() {
         let config = Config::default();
-        let decision =
-            PolicyEngine::new(&config).evaluate(&old_artifact(), now(), &FakeChecker::failing());
+        let decision = PolicyEngine::new(&config)
+            .evaluate(&old_artifact(), now(), &FakeChecker::failing())
+            .await;
         assert!(!decision.allowed);
         assert_eq!(decision.reason, DecisionReason::Malicious);
     }
 
-    #[test]
-    fn osv_error_can_allow() {
+    #[tokio::test]
+    async fn osv_error_can_allow() {
         let mut config = Config::default();
         config.policy.malicious.on_osv_error = OsvErrorBehavior::Allow;
-        let decision =
-            PolicyEngine::new(&config).evaluate(&old_artifact(), now(), &FakeChecker::failing());
+        let decision = PolicyEngine::new(&config)
+            .evaluate(&old_artifact(), now(), &FakeChecker::failing())
+            .await;
         assert!(decision.allowed);
     }
 
-    #[test]
-    fn allowlist_bypass_malicious_skips_checker() {
+    #[tokio::test]
+    async fn allowlist_bypass_malicious_skips_checker() {
         let mut config = Config::default();
         config.allowlist.push(AllowlistEntry {
             ecosystem: Ecosystem::Npm,
@@ -418,14 +462,16 @@ mod tests {
             reason: "false positive".to_string(),
         });
         let checker = FakeChecker::with_hit("MAL-2026-000001");
-        let decision = PolicyEngine::new(&config).evaluate(&old_artifact(), now(), &checker);
+        let decision = PolicyEngine::new(&config)
+            .evaluate(&old_artifact(), now(), &checker)
+            .await;
         assert!(decision.allowed);
         assert_eq!(decision.reason, DecisionReason::Allowlisted);
-        assert_eq!(checker.calls.get(), 0);
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn allowlist_without_bypasses_still_checks_policy() {
+    #[tokio::test]
+    async fn allowlist_without_bypasses_still_checks_policy() {
         let mut config = Config {
             policy: PolicyConfig {
                 minimum_age: Duration::from_secs(72 * 60 * 60),
@@ -447,11 +493,13 @@ mod tests {
             bypass_malicious: false,
             reason: "tracked".to_string(),
         });
-        let decision = PolicyEngine::new(&config).evaluate(
-            &old_artifact(),
-            now(),
-            &FakeChecker::with_hit("MAL-2026-000001"),
-        );
+        let decision = PolicyEngine::new(&config)
+            .evaluate(
+                &old_artifact(),
+                now(),
+                &FakeChecker::with_hit("MAL-2026-000001"),
+            )
+            .await;
         assert!(!decision.allowed);
         assert_eq!(decision.reason, DecisionReason::Malicious);
     }

@@ -1,11 +1,28 @@
 use crate::artifact::Artifact;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
 
-pub trait MaliciousChecker {
-    fn check(&self, artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError>;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[async_trait]
+pub trait MaliciousChecker: Send + Sync {
+    async fn check(&self, artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError>;
+
+    async fn check_many(
+        &self,
+        artifacts: &[Artifact],
+    ) -> Result<Vec<Vec<MaliciousHit>>, MaliciousError> {
+        let mut results = Vec::with_capacity(artifacts.len());
+        for artifact in artifacts {
+            results.push(self.check(artifact).await?);
+        }
+        Ok(results)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +37,8 @@ pub struct MaliciousHit {
 pub enum MaliciousError {
     #[error("OSV request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("OSV batch response returned {actual} results for {expected} queries")]
+    InvalidBatchResponse { expected: usize, actual: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -32,13 +51,18 @@ impl OsvHttpClient {
     pub fn new(api_url: impl Into<String>) -> Self {
         Self {
             api_url: api_url.into().trim_end_matches('/').to_string(),
-            client: Client::new(),
+            client: Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .timeout(REQUEST_TIMEOUT)
+                .build()
+                .expect("OSV HTTP client should build with static timeout configuration"),
         }
     }
 }
 
+#[async_trait]
 impl MaliciousChecker for OsvHttpClient {
-    fn check(&self, artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+    async fn check(&self, artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
         let url = format!("{}/v1/query", self.api_url);
         let response = self
             .client
@@ -50,27 +74,80 @@ impl MaliciousChecker for OsvHttpClient {
                 },
                 version: &artifact.version,
             })
-            .send()?
+            .send()
+            .await?
             .error_for_status()?
-            .json::<OsvQueryResponse>()?;
+            .json::<OsvQueryResponse>()
+            .await?;
+
+        Ok(hits_from_vulns(response.vulns))
+    }
+
+    async fn check_many(
+        &self,
+        artifacts: &[Artifact],
+    ) -> Result<Vec<Vec<MaliciousHit>>, MaliciousError> {
+        if artifacts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let url = format!("{}/v1/querybatch", self.api_url);
+        let queries = artifacts
+            .iter()
+            .map(|artifact| OsvQueryRequest {
+                package: OsvPackage {
+                    name: &artifact.name,
+                    ecosystem: artifact.ecosystem.osv_name(),
+                },
+                version: &artifact.version,
+            })
+            .collect::<Vec<_>>();
+        let response = self
+            .client
+            .post(url)
+            .json(&OsvBatchQueryRequest { queries })
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<OsvBatchQueryResponse>()
+            .await?;
+
+        if response.results.len() != artifacts.len() {
+            return Err(MaliciousError::InvalidBatchResponse {
+                expected: artifacts.len(),
+                actual: response.results.len(),
+            });
+        }
 
         Ok(response
-            .vulns
+            .results
             .into_iter()
-            .map(|vuln| MaliciousHit {
-                osv_id: vuln.id,
-                summary: vuln.summary,
-                source: "osv".to_string(),
-                modified: vuln.modified,
-            })
+            .map(|result| hits_from_vulns(result.vulns))
             .collect())
     }
+}
+
+fn hits_from_vulns(vulns: Vec<OsvVulnerability>) -> Vec<MaliciousHit> {
+    vulns
+        .into_iter()
+        .map(|vuln| MaliciousHit {
+            osv_id: vuln.id,
+            summary: vuln.summary,
+            source: "osv".to_string(),
+            modified: vuln.modified,
+        })
+        .collect()
 }
 
 #[derive(Debug, Serialize)]
 struct OsvQueryRequest<'a> {
     package: OsvPackage<'a>,
     version: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct OsvBatchQueryRequest<'a> {
+    queries: Vec<OsvQueryRequest<'a>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +160,12 @@ struct OsvPackage<'a> {
 struct OsvQueryResponse {
     #[serde(default)]
     vulns: Vec<OsvVulnerability>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OsvBatchQueryResponse {
+    #[serde(default)]
+    results: Vec<OsvQueryResponse>,
 }
 
 #[derive(Debug, Deserialize)]

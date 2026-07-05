@@ -151,7 +151,14 @@ fn start_fixture_upstream(fixture: FixtureArtifacts) -> TestServer {
 
 fn start_proxy(upstream_base_url: String) -> TestServer {
     start_http_server(move |proxy_base_url| {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
         Arc::new(move |request| {
+            let runtime = Arc::clone(&runtime);
             let mut config = Config::default();
             config.server.public_base_url = proxy_base_url.clone();
             config.upstreams.npm.registry_url = upstream_base_url.clone();
@@ -170,12 +177,12 @@ fn start_proxy(upstream_base_url: String) -> TestServer {
                 reason: "package-manager e2e blocked pypi version".to_string(),
             });
 
-            server::route_request_with_accept(
+            runtime.block_on(server::route_request_with_accept(
                 &config,
                 &request.method,
                 &request.path,
                 request.header("accept"),
-            )
+            ))
         })
     })
 }
@@ -188,6 +195,15 @@ fn fixture_response(
     let path = request.path.split('?').next().unwrap_or(&request.path);
     if request.method == "POST" && path == "/v1/query" {
         return RegistryResponse::json(200, &json!({ "vulns": [] })).unwrap();
+    }
+    if request.method == "POST" && path == "/v1/querybatch" {
+        let body = serde_json::from_slice::<serde_json::Value>(&request.body).unwrap();
+        let query_count = body["queries"].as_array().map(Vec::len).unwrap_or_default();
+        return RegistryResponse::json(
+            200,
+            &json!({ "results": vec![json!({ "vulns": [] }); query_count] }),
+        )
+        .unwrap();
     }
 
     if request.method == "GET" && path == format!("/{NPM_PACKAGE}") {
@@ -410,6 +426,7 @@ struct HttpRequest {
     method: String,
     path: String,
     headers: Vec<(String, String)>,
+    body: Vec<u8>,
 }
 
 impl HttpRequest {
@@ -473,6 +490,7 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         method,
         path,
         headers,
+        body: buffer[body_start..body_start + content_length].to_vec(),
     })
 }
 
