@@ -168,10 +168,18 @@ Run the test suite:
 cargo test
 ```
 
-Run the route-level end-to-end tests:
+Run only the route-level policy flow tests:
 
 ```sh
 cargo test e2e
+```
+
+Run only the package-manager end-to-end tests. These start local fixture
+registries and a local proxy, then run `npm install` and `uv pip install`
+against the proxy:
+
+```sh
+cargo test --test package_manager_e2e
 ```
 
 Format check:

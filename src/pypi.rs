@@ -282,7 +282,10 @@ fn proxy_file_url(config: &Config, project: &str, version: &str, filename: &str)
 fn infer_version_from_filename(project: &str, filename: &str) -> Option<String> {
     if let Some(stem) = filename.strip_suffix(".whl") {
         let mut parts = stem.split('-');
-        parts.next()?;
+        let distribution = parts.next()?;
+        if normalize_pypi_name(distribution) != normalize_pypi_name(project) {
+            return None;
+        }
         return parts
             .next()
             .filter(|version| !version.is_empty())
@@ -389,15 +392,27 @@ pub struct SimpleFile {
     pub url: String,
     #[serde(default)]
     pub hashes: BTreeMap<String, String>,
-    #[serde(default, rename = "requires-python")]
+    #[serde(
+        default,
+        rename = "requires-python",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub requires_python: Option<String>,
-    #[serde(default, rename = "dist-info-metadata")]
+    #[serde(
+        default,
+        rename = "dist-info-metadata",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub dist_info_metadata: Option<Value>,
-    #[serde(default, rename = "gpg-sig")]
+    #[serde(default, rename = "gpg-sig", skip_serializing_if = "Option::is_none")]
     pub gpg_sig: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub yanked: Option<Value>,
-    #[serde(default, rename = "upload-time")]
+    #[serde(
+        default,
+        rename = "upload-time",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub upload_time: Option<DateTime<Utc>>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
