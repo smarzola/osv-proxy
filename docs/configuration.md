@@ -80,7 +80,8 @@ policy:
     on_osv_error: "block"
 ```
 
-- `minimum_age`: minimum age before a package version can be installed.
+- `minimum_age`: minimum age before a package version can be installed. It must
+  be a valid duration that fits policy evaluation.
 - `missing_publish_time`: `block` or `allow`.
 - `malicious.mode`: must be `naive` in this phase.
 - `malicious.only_mal_ids`: when true, only OSV IDs starting with `MAL-` block.
@@ -150,6 +151,10 @@ These settings intentionally fail validation:
 - `artifacts.behavior: proxy`
 - `artifacts.behavior: proxy_cache_s3`
 - `artifacts.s3`
+
+Unknown YAML keys also fail validation at the top level and inside supported
+sections such as `server`, `upstreams`, `policy`, `metadata_cache`, and
+`artifacts`.
 
 The implementation has no local malicious store, no MongoDB or mongolino sync,
 no cachebox backend, no in-process metadata cache, and no S3 artifact cache.

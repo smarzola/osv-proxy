@@ -1,4 +1,5 @@
 use crate::artifact::{normalize_pypi_name, Ecosystem};
+use chrono::Duration as ChronoDuration;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -6,7 +7,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
     pub upstreams: UpstreamsConfig,
@@ -27,6 +28,11 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        ChronoDuration::from_std(self.policy.minimum_age).map_err(|_| {
+            ConfigError::Invalid(
+                "policy.minimum_age is too large for policy evaluation".to_string(),
+            )
+        })?;
         if self.policy.malicious.mode != MaliciousMode::Naive {
             return Err(ConfigError::Unsupported(
                 "phase one supports only policy.malicious.mode: naive".to_string(),
@@ -88,7 +94,7 @@ impl Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     pub listen: String,
     pub public_base_url: String,
@@ -104,14 +110,14 @@ impl Default for ServerConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct UpstreamsConfig {
     pub npm: NpmUpstreamConfig,
     pub pypi: PypiUpstreamConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct NpmUpstreamConfig {
     pub registry_url: String,
 }
@@ -125,7 +131,7 @@ impl Default for NpmUpstreamConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PypiUpstreamConfig {
     pub simple_url: String,
     pub files_url: String,
@@ -141,7 +147,7 @@ impl Default for PypiUpstreamConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
     #[serde(with = "duration_format")]
     pub minimum_age: Duration,
@@ -167,7 +173,7 @@ pub enum MissingPublishTime {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MaliciousConfig {
     pub mode: MaliciousMode,
     pub only_mal_ids: bool,
@@ -202,6 +208,7 @@ pub enum OsvErrorBehavior {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AllowlistEntry {
     pub ecosystem: Ecosystem,
     pub name: String,
@@ -224,6 +231,7 @@ impl AllowlistEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlocklistEntry {
     pub ecosystem: Ecosystem,
     pub name: String,
@@ -242,14 +250,14 @@ impl BlocklistEntry {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MetadataCacheConfig {
     pub enabled: bool,
     pub backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ArtifactsConfig {
     pub behavior: ArtifactBehavior,
     pub s3: Option<serde_yaml::Value>,
@@ -446,5 +454,118 @@ blocklist:
         )
         .unwrap_err();
         assert!(err.to_string().contains("exact versions and *"));
+    }
+
+    #[test]
+    fn rejects_unknown_top_level_config_key() {
+        let err = load(
+            r#"
+typo: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rejects_unknown_server_config_key() {
+        let err = load(
+            r#"
+server:
+  listen: "127.0.0.1:8080"
+  typo: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rejects_unknown_policy_config_key() {
+        let err = load(
+            r#"
+policy:
+  typo: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rejects_unknown_malicious_config_key() {
+        let err = load(
+            r#"
+policy:
+  malicious:
+    typo: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rejects_unknown_npm_upstream_config_key() {
+        let err = load(
+            r#"
+upstreams:
+  npm:
+    typo: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rejects_unknown_pypi_upstream_config_key() {
+        let err = load(
+            r#"
+upstreams:
+  pypi:
+    typo: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rejects_unknown_metadata_cache_config_key() {
+        let err = load(
+            r#"
+metadata_cache:
+  typo: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rejects_unknown_artifacts_config_key() {
+        let err = load(
+            r#"
+artifacts:
+  typo: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rejects_minimum_age_too_large_for_policy_evaluation() {
+        let err = load(
+            r#"
+policy:
+  minimum_age: "18446744073709551615s"
+"#,
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("policy.minimum_age is too large"));
     }
 }

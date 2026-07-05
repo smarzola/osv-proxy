@@ -71,7 +71,7 @@ When a milestone is complete:
 - [x] Milestone 1: Tokio HTTP server and request timeouts
 - [x] Milestone 2: Nonblocking upstream clients and bounded malicious checks
 - [x] Milestone 3: npm artifact basename enforcement
-- [ ] Milestone 4: Strict config validation
+- [x] Milestone 4: Strict config validation
 - [ ] Milestone 5: PyPI Simple root compatibility
 - [ ] Milestone 6: Final regression and docs audit
 
@@ -253,7 +253,7 @@ Status note - 2026-07-05:
   - `cargo test npm` passed outside the sandbox: 19 library-filtered tests and 1 package-manager integration test passed.
   - `cargo test e2e_npm` passed: 2 e2e npm route tests passed.
   - `cargo test server` passed outside the sandbox: 17 server-filtered tests passed.
-- Commit: pending.
+- Commit: `dc74bc3`.
 
 Problem:
 
@@ -290,6 +290,18 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 4: Strict Config Validation
+
+Status note - 2026-07-05:
+
+- Added Serde unknown-field rejection for supported config structs: top-level config, `server`, `upstreams`, `upstreams.npm`, `upstreams.pypi`, `policy`, `policy.malicious`, `allowlist`, `blocklist`, `metadata_cache`, and `artifacts`.
+- Added config-load validation that `policy.minimum_age` can be converted to `chrono::Duration`, preventing policy evaluation panics from oversize durations.
+- Added tests for unknown top-level keys and nested unknown keys under `policy`, `policy.malicious`, `server`, `upstreams.npm`, `upstreams.pypi`, `metadata_cache`, and `artifacts`, plus an oversize `minimum_age` test.
+- Updated configuration docs to state that unknown YAML keys fail validation and `minimum_age` must fit policy evaluation.
+- Verification:
+  - `cargo test config` passed: 19 filtered tests passed.
+  - `cargo run -- config validate --config examples/phase1/osv-proxy.yaml` passed and printed `configuration is valid for phase one`.
+  - `cargo test policy` passed: 16 filtered tests passed.
+- Commit: pending.
 
 Problem:
 
