@@ -12,7 +12,7 @@
 8. `MAL-*` block
 9. exact allowlist
 
-Then add PyPI, local mongolino mode, cachebox, and proxy/S3 artifact modes.
+Then add PyPI, local MongoDB-compatible mode, mongolino deployment examples, cachebox, and proxy/S3 artifact modes.
 
 ## Milestone 1: Config and Policy Engine
 
@@ -99,13 +99,13 @@ Acceptance tests:
 - allowed file returns redirect
 - blocked file returns 403
 
-## Milestone 5: Local Malicious Mode with mongolino/MongoDB-Compatible Store
+## Milestone 5: Local Malicious Mode with MongoDB-Compatible Store
 
 Build:
 
 - `MaliciousPackageStore` trait
-- MongoDB-compatible implementation
-- mongolino config support
+- MongoDB-compatible implementation using the MongoDB wire protocol
+- mongolino integration examples using the same MongoDB URI config
 - background OSV `MAL` sync
 - `sync-malicious` command
 - local lookup
@@ -115,8 +115,8 @@ Acceptance tests:
 - sync stores `MAL` records
 - lookup finds malicious package by ecosystem/name/version
 - local mode does not call OSV API during request handling
-- mongolino-backed store works through MongoDB-compatible client
-- MongoDB-backed store works with same interface
+- mongolino works through the MongoDB-compatible client and the standard `mongodb.uri` config
+- MongoDB works through the same interface and config shape
 
 ## Milestone 6: cachebox Metadata Cache
 

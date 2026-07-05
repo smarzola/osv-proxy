@@ -28,7 +28,6 @@ osv-proxy/
         osv_client.rs
         naive.rs
         local.rs
-        mongolino.rs
         mongo.rs
         sync.rs
         store.rs
@@ -140,4 +139,6 @@ Use traits for external services:
 - artifact backend
 - audit sink
 
-The policy engine should not know whether malicious data comes from OSV live calls, mongolino, or MongoDB.
+The policy engine should not know whether malicious data comes from OSV live calls or the local store.
+
+The local malicious store should have one MongoDB-compatible implementation using the MongoDB wire protocol. mongolino is not a separate backend inside `osv-proxy`; it is a single-binary MongoDB-compatible server that can satisfy the same `mongodb.uri` config as MongoDB.

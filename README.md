@@ -41,7 +41,7 @@ Required for v1:
 - exact-version allowlist
 - OSV malicious lookup modes: naive and local
 - local malicious mode backed by MongoDB-compatible storage
-- mongolino support for simple single-file local deployments
+- mongolino deployment examples for simple single-file local storage
 - metadata cache disabled or cachebox-backed only
 - artifact behavior: redirect, proxy, and proxy with S3-compatible cache
 - structured audit logs
@@ -66,9 +66,15 @@ Not in v1:
 - [Architecture](docs/architecture.md)
 - [Policy Model](docs/policy.md)
 - [Configuration](docs/configuration.md)
+- [Mongolino Integration](docs/mongolino-integration.md)
 - [Registry Behavior](docs/registry-behavior.md)
 - [Milestones](docs/milestones.md)
 - [Client Configuration](docs/client-configuration.md)
+
+Example deployment files:
+
+- [Mongolino-backed local store config](examples/mongolino/osv-proxy.yaml)
+- [Mongolino compose pattern](examples/mongolino/compose.yaml)
 
 ## Implementation Status
 

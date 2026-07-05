@@ -43,12 +43,8 @@ blocklist:
 metadata_cache:
   enabled: false
 malicious_store:
-  backend: "mongolino"
-  mongolino:
-    path: "./data/osv-proxy-malicious.db"
-    listen: "127.0.0.1:27018"
   mongodb:
-    uri: "mongodb://localhost:27017"
+    uri: "mongodb://127.0.0.1:27018"
     database: "osv_proxy"
     collection: "malicious_packages"
   sync:
@@ -110,10 +106,10 @@ policy:
     only_mal_ids: true
     on_osv_error: "block"
 malicious_store:
-  backend: "mongolino"
-  mongolino:
-    path: "./data/osv-proxy-malicious.db"
-    listen: "127.0.0.1:27018"
+  mongodb:
+    uri: "mongodb://127.0.0.1:27018"
+    database: "osv_proxy"
+    collection: "malicious_packages"
   sync:
     enabled: true
     interval: "15m"
@@ -129,6 +125,8 @@ metadata_cache:
 artifacts:
   behavior: "redirect"
 ```
+
+The recommended public deployment can point `malicious_store.mongodb.uri` at mongolino for a cheap single-file local store, or at MongoDB for a managed or multi-instance deployment. `osv-proxy` should not expose a separate `mongolino` config branch.
 
 ## Metadata Cache
 

@@ -101,7 +101,7 @@ It provides:
 - artifact redirect, proxy, and S3-cache modes
 - naive OSV API mode
 - local MongoDB-compatible malicious store mode
-- mongolino support for single-file local deployments
+- mongolino integration examples for single-file local deployments
 - cachebox support for metadata caching
 - YAML configuration
 - structured audit logs

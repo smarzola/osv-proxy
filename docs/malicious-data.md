@@ -28,14 +28,14 @@ Naive mode is useful for initial development, smoke tests, small installations, 
 
 ## Local Mode
 
-Local mode checks a local MongoDB-compatible store containing malicious package records. It supports:
+Local mode checks a MongoDB-compatible store containing malicious package records through one interface:
 
-- `mongolino`
-- MongoDB
+- mongolino, when a cheap single-binary local server is desired
+- MongoDB, when a managed or multi-instance deployment is desired
 
-mongolino should be the default local backend for simple deployments. MongoDB should be supported for multi-instance or production deployments.
+Both are reached through the same `mongodb.uri` configuration and MongoDB wire-protocol client. mongolino is not a second backend shape inside `osv-proxy`.
 
-The policy engine must not know which backend is used.
+The policy engine must not know which server is behind the MongoDB-compatible store.
 
 ```rust
 #[async_trait]
@@ -82,7 +82,7 @@ Indexes:
 3. Keep only npm and PyPI for v1.
 4. Normalize ecosystem and package names.
 5. Extract affected exact versions.
-6. Upsert into MongoDB-compatible store.
+6. Upsert into the MongoDB-compatible store.
 7. Record last successful sync timestamp.
 
 The first implementation can use OSV database dumps for full sync. Incremental sync can be added later.
