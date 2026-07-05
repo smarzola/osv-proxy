@@ -5,8 +5,14 @@ use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
 use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
-use serde_json::json;
+use reqwest::header::ACCEPT;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
+
+const SIMPLE_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
+const SIMPLE_HTML_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+html";
 
 #[derive(Debug, Clone)]
 pub struct PypiSimpleClient {
@@ -25,7 +31,7 @@ impl PypiSimpleClient {
 
 pub trait PypiSimpleProvider {
     fn fetch_simple_root(&self) -> Result<String, PypiError>;
-    fn fetch_project_simple(&self, project: &str) -> Result<String, PypiError>;
+    fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, PypiError>;
 }
 
 impl PypiSimpleProvider for PypiSimpleClient {
@@ -38,14 +44,18 @@ impl PypiSimpleProvider for PypiSimpleClient {
             .text()?)
     }
 
-    fn fetch_project_simple(&self, project: &str) -> Result<String, PypiError> {
+    fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, PypiError> {
         let project = normalize_pypi_name(project);
         Ok(self
             .client
             .get(format!("{}/{}/", self.simple_url, project))
+            .header(
+                ACCEPT,
+                "application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.latest+json",
+            )
             .send()?
             .error_for_status()?
-            .text()?)
+            .json::<SimpleProject>()?)
     }
 }
 
@@ -70,10 +80,30 @@ pub fn simple_project_response(
     project: &str,
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, PypiError> {
+    simple_project_response_for_accept(config, upstream, checker, project, now, None)
+}
+
+pub fn simple_project_response_for_accept(
+    config: &Config,
+    upstream: &dyn PypiSimpleProvider,
+    checker: &dyn MaliciousChecker,
+    project: &str,
+    now: DateTime<Utc>,
+    accept: Option<&str>,
+) -> Result<RegistryResponse, PypiError> {
     let project = normalize_pypi_name(project);
-    let raw = upstream.fetch_project_simple(&project)?;
-    let filtered = filter_simple_project_html(config, checker, &project, &raw, now)?;
-    Ok(RegistryResponse::html(200, filtered))
+    let raw = upstream.fetch_project_json(&project)?;
+    let filtered = filter_simple_project(config, checker, &project, raw, now)?;
+
+    if wants_simple_json(accept) {
+        let mut response = RegistryResponse::json(200, &serde_json::to_value(&filtered)?)?;
+        response.set_content_type(SIMPLE_JSON_CONTENT_TYPE);
+        Ok(response)
+    } else {
+        let mut response = RegistryResponse::html(200, render_simple_html(&filtered));
+        response.set_content_type(SIMPLE_HTML_CONTENT_TYPE);
+        Ok(response)
+    }
 }
 
 pub fn artifact_response(
@@ -86,13 +116,24 @@ pub fn artifact_response(
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, PypiError> {
     let project = normalize_pypi_name(project);
-    let raw = upstream.fetch_project_simple(&project)?;
-    let link = find_file_link(config, &project, version, filename, &raw)?.ok_or_else(|| {
-        PypiError::FileNotFound(project.clone(), version.to_string(), filename.to_string())
-    })?;
-    let artifact = artifact_from_link(config, &project, &link)?;
-    let decision = PolicyEngine::new(config).evaluate(&artifact, now, checker);
+    let raw = upstream.fetch_project_json(&project)?;
+    let file = raw
+        .files
+        .iter()
+        .find(|file| file.filename == filename)
+        .ok_or_else(|| {
+            PypiError::FileNotFound(project.clone(), version.to_string(), filename.to_string())
+        })?;
+    let artifact = artifact_from_file(config, &project, file)?;
+    if artifact.version != version {
+        return Err(PypiError::FileNotFound(
+            project,
+            version.to_string(),
+            filename.to_string(),
+        ));
+    }
 
+    let decision = PolicyEngine::new(config).evaluate(&artifact, now, checker);
     if decision.allowed {
         Ok(RegistryResponse::redirect(
             artifact
@@ -109,7 +150,7 @@ pub fn error_response(error: &PypiError) -> RegistryResponse {
     let status = match error {
         PypiError::FileNotFound(_, _, _) | PypiError::InvalidFilename(_) => 404,
         PypiError::Upstream(_) => 502,
-        PypiError::Json(_) | PypiError::InvalidSimpleHtml(_) | PypiError::MissingFileUrl(_) => 500,
+        PypiError::Json(_) | PypiError::InvalidSimpleJson(_) | PypiError::MissingFileUrl(_) => 500,
     };
     let body = json!({
         "allowed": false,
@@ -119,116 +160,123 @@ pub fn error_response(error: &PypiError) -> RegistryResponse {
     RegistryResponse::json(status, &body).expect("static error response should serialize")
 }
 
-fn filter_simple_project_html(
+fn filter_simple_project(
     config: &Config,
     checker: &dyn MaliciousChecker,
     project: &str,
-    html: &str,
+    mut simple: SimpleProject,
     now: DateTime<Utc>,
-) -> Result<String, PypiError> {
-    rewrite_anchor_links(html, |link| {
-        let artifact = artifact_from_link(config, project, link)?;
-        let decision = PolicyEngine::new(config).evaluate(&artifact, now, checker);
-        if decision.allowed {
-            let fragment = split_fragment(&link.href).1.unwrap_or_default();
-            Ok(Some(format!(
-                "{}/pypi/packages/{}/{}/{}{}",
-                config.server.public_base_url.trim_end_matches('/'),
-                project,
-                artifact.version,
-                artifact
-                    .filename
-                    .as_deref()
-                    .ok_or_else(|| PypiError::InvalidFilename(link.href.clone()))?,
-                fragment
-            )))
-        } else {
-            Ok(None)
-        }
-    })
-}
-
-fn find_file_link(
-    config: &Config,
-    project: &str,
-    version: &str,
-    filename: &str,
-    html: &str,
-) -> Result<Option<SimpleLink>, PypiError> {
-    let mut found = None;
-    rewrite_anchor_links(html, |link| {
-        let artifact = artifact_from_link(config, project, link)?;
-        if artifact.version == version && artifact.filename.as_deref() == Some(filename) {
-            found = Some(link.clone());
-        }
-        Ok(Some(link.href.clone()))
-    })?;
-    Ok(found)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SimpleLink {
-    href: String,
-    upload_time: Option<DateTime<Utc>>,
-}
-
-fn rewrite_anchor_links<F>(html: &str, mut decide: F) -> Result<String, PypiError>
-where
-    F: FnMut(&SimpleLink) -> Result<Option<String>, PypiError>,
-{
-    let mut output = String::with_capacity(html.len());
-    let mut cursor = 0;
-
-    while let Some(relative_start) = html[cursor..].to_ascii_lowercase().find("<a") {
-        let start = cursor + relative_start;
-        output.push_str(&html[cursor..start]);
-        let Some(open_end_relative) = html[start..].find('>') else {
-            output.push_str(&html[start..]);
-            return Ok(output);
-        };
-        let open_end = start + open_end_relative + 1;
-        let close_end = html[open_end..]
-            .to_ascii_lowercase()
-            .find("</a>")
-            .map(|close_start_relative| open_end + close_start_relative + "</a>".len())
-            .unwrap_or(open_end);
-        let anchor = &html[start..close_end];
-        let opening = &html[start..open_end];
-
-        if let Some(href) = attr_value(opening, "href") {
-            let link = SimpleLink {
-                href,
-                upload_time: attr_value(opening, "data-upload-time")
-                    .and_then(|raw| parse_pypi_time(&raw)),
-            };
-            if let Some(new_href) = decide(&link)? {
-                output.push_str(&replace_href(anchor, &new_href));
-            }
-        } else {
-            output.push_str(anchor);
-        }
-        cursor = close_end;
+) -> Result<SimpleProject, PypiError> {
+    simple.name = normalize_pypi_name(&simple.name);
+    if simple.name.is_empty() {
+        simple.name = project.to_string();
     }
 
-    output.push_str(&html[cursor..]);
-    Ok(output)
+    let mut allowed_versions = BTreeSet::new();
+    let mut allowed_files = Vec::new();
+
+    for mut file in simple.files {
+        let artifact = artifact_from_file(config, project, &file)?;
+        let decision = PolicyEngine::new(config).evaluate(&artifact, now, checker);
+        if decision.allowed {
+            let version = artifact.version.clone();
+            file.url = proxy_file_url(config, project, &version, &file.filename);
+            allowed_versions.insert(version);
+            allowed_files.push(file);
+        }
+    }
+
+    simple.files = allowed_files;
+    simple.versions = allowed_versions.into_iter().collect();
+    Ok(simple)
 }
 
-fn artifact_from_link(
+fn artifact_from_file(
     config: &Config,
     project: &str,
-    link: &SimpleLink,
+    file: &SimpleFile,
 ) -> Result<Artifact, PypiError> {
-    let (href_without_fragment, fragment) = split_fragment(&link.href);
-    let filename = filename_from_href(href_without_fragment)
-        .ok_or_else(|| PypiError::InvalidFilename(link.href.clone()))?;
-    let version = infer_version_from_filename(project, &filename)
-        .ok_or_else(|| PypiError::InvalidFilename(filename.clone()))?;
-    let mut artifact = package_artifact(project, version, link.upload_time);
-    artifact.filename = Some(filename);
-    artifact.upstream_url = Some(resolve_simple_href(config, project, href_without_fragment));
-    artifact.hashes = hashes_from_fragment(fragment);
+    let version = infer_version_from_filename(project, &file.filename)
+        .ok_or_else(|| PypiError::InvalidFilename(file.filename.clone()))?;
+    let mut artifact = package_artifact(project, version, file.upload_time);
+    artifact.filename = Some(file.filename.clone());
+    artifact.upstream_url = Some(resolve_simple_href(config, project, &file.url));
+    artifact.hashes = hashes_from_file(file);
     Ok(artifact)
+}
+
+fn hashes_from_file(file: &SimpleFile) -> ArtifactHashes {
+    ArtifactHashes {
+        sha256: file.hashes.get("sha256").cloned(),
+        sha512: file.hashes.get("sha512").cloned(),
+        integrity: None,
+    }
+}
+
+fn wants_simple_json(accept: Option<&str>) -> bool {
+    let Some(accept) = accept else {
+        return false;
+    };
+    accept
+        .split(',')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .any(|part| {
+            let media_type = part.split(';').next().unwrap_or("").trim();
+            media_type == SIMPLE_JSON_CONTENT_TYPE
+                || media_type == "application/vnd.pypi.simple.latest+json"
+                || media_type == "application/json"
+        })
+}
+
+fn render_simple_html(simple: &SimpleProject) -> String {
+    let mut html = String::from("<!DOCTYPE html>\n<html><body>\n");
+    for file in &simple.files {
+        html.push_str("<a href=\"");
+        html.push_str(&escape_attr(&url_with_hash_fragment(file)));
+        html.push('"');
+        if let Some(requires_python) = &file.requires_python {
+            html.push_str(" data-requires-python=\"");
+            html.push_str(&escape_attr(requires_python));
+            html.push('"');
+        }
+        if let Some(yanked) = &file.yanked {
+            html.push_str(" data-yanked");
+            if let Some(reason) = yanked.as_str() {
+                html.push_str("=\"");
+                html.push_str(&escape_attr(reason));
+                html.push('"');
+            }
+        }
+        if let Some(upload_time) = file.upload_time {
+            html.push_str(" data-upload-time=\"");
+            html.push_str(&upload_time.to_rfc3339());
+            html.push('"');
+        }
+        html.push('>');
+        html.push_str(&escape_text(&file.filename));
+        html.push_str("</a>\n");
+    }
+    html.push_str("</body></html>\n");
+    html
+}
+
+fn url_with_hash_fragment(file: &SimpleFile) -> String {
+    if let Some(hash) = file.hashes.get("sha256") {
+        if !file.url.contains('#') {
+            return format!("{}#sha256={hash}", file.url);
+        }
+    }
+    file.url.clone()
+}
+
+fn proxy_file_url(config: &Config, project: &str, version: &str, filename: &str) -> String {
+    format!(
+        "{}/pypi/packages/{}/{}/{}",
+        config.server.public_base_url.trim_end_matches('/'),
+        normalize_pypi_name(project),
+        version,
+        filename
+    )
 }
 
 fn infer_version_from_filename(project: &str, filename: &str) -> Option<String> {
@@ -248,7 +296,7 @@ fn infer_version_from_filename(project: &str, filename: &str) -> Option<String> 
         .or_else(|| filename.strip_suffix(".tgz"))?;
     let pieces = stem.split('-').collect::<Vec<_>>();
     for index in 1..pieces.len() {
-        if normalize_pypi_name(&pieces[..index].join("-")) == project {
+        if normalize_pypi_name(&pieces[..index].join("-")) == normalize_pypi_name(project) {
             return Some(pieces[index..].join("-"));
         }
     }
@@ -256,34 +304,11 @@ fn infer_version_from_filename(project: &str, filename: &str) -> Option<String> 
         .and_then(|(_, version)| (!version.is_empty()).then(|| version.to_string()))
 }
 
-fn filename_from_href(href_without_fragment: &str) -> Option<String> {
-    href_without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(href_without_fragment)
-        .rsplit('/')
-        .next()
-        .filter(|segment| !segment.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn split_fragment(href: &str) -> (&str, Option<&str>) {
-    if let Some((url, fragment)) = href.split_once('#') {
-        (url, Some(&href[url.len()..url.len() + fragment.len() + 1]))
-    } else {
-        (href, None)
-    }
-}
-
-fn hashes_from_fragment(fragment: Option<&str>) -> ArtifactHashes {
-    let mut hashes = ArtifactHashes::default();
-    if let Some(fragment) = fragment.and_then(|value| value.strip_prefix("#sha256=")) {
-        hashes.sha256 = Some(fragment.to_string());
-    }
-    hashes
-}
-
 fn resolve_simple_href(config: &Config, project: &str, href_without_fragment: &str) -> String {
+    let href_without_fragment = href_without_fragment
+        .split('#')
+        .next()
+        .unwrap_or(href_without_fragment);
     if href_without_fragment.starts_with("http://") || href_without_fragment.starts_with("https://")
     {
         return href_without_fragment.to_string();
@@ -332,116 +357,50 @@ fn normalize_url_path(url: &str) -> String {
     format!("{origin}/{}", segments.join("/"))
 }
 
-fn attr_value(opening: &str, name: &str) -> Option<String> {
-    let bytes = opening.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        let name_start = index;
-        while index < bytes.len()
-            && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'-' | b'_'))
-        {
-            index += 1;
-        }
-        if name_start == index {
-            index += 1;
-            continue;
-        }
-        let attr_name = &opening[name_start..index];
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index >= bytes.len() || bytes[index] != b'=' {
-            continue;
-        }
-        index += 1;
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-            index += 1;
-        }
-        if index >= bytes.len() {
-            return None;
-        }
-        let value = if matches!(bytes[index], b'"' | b'\'') {
-            let quote = bytes[index];
-            index += 1;
-            let value_start = index;
-            while index < bytes.len() && bytes[index] != quote {
-                index += 1;
-            }
-            let value = opening[value_start..index].to_string();
-            index += usize::from(index < bytes.len());
-            value
-        } else {
-            let value_start = index;
-            while index < bytes.len() && !bytes[index].is_ascii_whitespace() && bytes[index] != b'>'
-            {
-                index += 1;
-            }
-            opening[value_start..index].to_string()
-        };
-        if attr_name.eq_ignore_ascii_case(name) {
-            return Some(value);
-        }
-    }
-    None
+fn escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
-fn replace_href(anchor: &str, new_href: &str) -> String {
-    let Some(open_end) = anchor.find('>').map(|index| index + 1) else {
-        return anchor.to_string();
-    };
-    let opening = &anchor[..open_end];
-    let Some(href_start) = opening.to_ascii_lowercase().find("href") else {
-        return anchor.to_string();
-    };
-    let Some(equal_relative) = opening[href_start..].find('=') else {
-        return anchor.to_string();
-    };
-    let value_start = href_start + equal_relative + 1;
-    let bytes = opening.as_bytes();
-    let mut index = value_start;
-    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
-        index += 1;
-    }
-    if index >= bytes.len() {
-        return anchor.to_string();
-    }
-    let (replace_start, replace_end, quote) = if matches!(bytes[index], b'"' | b'\'') {
-        let quote = bytes[index] as char;
-        let replace_start = index + 1;
-        let replace_end = opening[replace_start..]
-            .find(quote)
-            .map(|relative| replace_start + relative)
-            .unwrap_or(opening.len());
-        (replace_start, replace_end, None)
-    } else {
-        let replace_start = index;
-        let replace_end = opening[replace_start..]
-            .find(|ch: char| ch.is_ascii_whitespace() || ch == '>')
-            .map(|relative| replace_start + relative)
-            .unwrap_or(opening.len());
-        (replace_start, replace_end, Some('"'))
-    };
-
-    let mut replaced = String::with_capacity(anchor.len() + new_href.len());
-    replaced.push_str(&anchor[..replace_start]);
-    if let Some(quote) = quote {
-        replaced.push(quote);
-    }
-    replaced.push_str(new_href);
-    if let Some(quote) = quote {
-        replaced.push(quote);
-    }
-    replaced.push_str(&anchor[replace_end..]);
-    replaced
+fn escape_text(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
-fn parse_pypi_time(raw: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(raw)
-        .ok()
-        .map(|timestamp| timestamp.with_timezone(&Utc))
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleProject {
+    #[serde(default)]
+    pub meta: BTreeMap<String, Value>,
+    pub name: String,
+    #[serde(default)]
+    pub files: Vec<SimpleFile>,
+    #[serde(default)]
+    pub versions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpleFile {
+    pub filename: String,
+    pub url: String,
+    #[serde(default)]
+    pub hashes: BTreeMap<String, String>,
+    #[serde(default, rename = "requires-python")]
+    pub requires_python: Option<String>,
+    #[serde(default, rename = "dist-info-metadata")]
+    pub dist_info_metadata: Option<Value>,
+    #[serde(default, rename = "gpg-sig")]
+    pub gpg_sig: Option<bool>,
+    #[serde(default)]
+    pub yanked: Option<Value>,
+    #[serde(default, rename = "upload-time")]
+    pub upload_time: Option<DateTime<Utc>>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Error)]
@@ -450,8 +409,8 @@ pub enum PypiError {
     Upstream(#[from] reqwest::Error),
     #[error("PyPI JSON handling failed: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("invalid PyPI Simple HTML: {0}")]
-    InvalidSimpleHtml(String),
+    #[error("invalid PyPI Simple JSON: {0}")]
+    InvalidSimpleJson(String),
     #[error("invalid PyPI filename: {0}")]
     InvalidFilename(String),
     #[error("PyPI file URL missing for {0}")]
@@ -463,7 +422,7 @@ pub enum PypiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::BlocklistEntry;
+    use crate::config::{BlocklistEntry, MissingPublishTime};
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::policy::{Decision, DecisionReason};
     use chrono::Duration as ChronoDuration;
@@ -472,14 +431,14 @@ mod tests {
 
     struct StaticSimple {
         root: String,
-        projects: HashMap<String, String>,
+        projects: HashMap<String, SimpleProject>,
     }
 
     impl StaticSimple {
-        fn new(project: &str, html: &str) -> Self {
+        fn new(project: &str, simple: SimpleProject) -> Self {
             Self {
                 root: "<html><body><a href=\"requests/\">requests</a></body></html>".to_string(),
-                projects: HashMap::from([(normalize_pypi_name(project), html.to_string())]),
+                projects: HashMap::from([(normalize_pypi_name(project), simple)]),
             }
         }
     }
@@ -489,11 +448,11 @@ mod tests {
             Ok(self.root.clone())
         }
 
-        fn fetch_project_simple(&self, project: &str) -> Result<String, PypiError> {
+        fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, PypiError> {
             self.projects
                 .get(&normalize_pypi_name(project))
                 .cloned()
-                .ok_or_else(|| PypiError::InvalidSimpleHtml(format!("missing {project}")))
+                .ok_or_else(|| PypiError::InvalidSimpleJson(format!("missing {project}")))
         }
     }
 
@@ -522,16 +481,59 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    fn simple_fixture() -> &'static str {
-        r#"<html><body>
-<a href="https://files.example/packages/demo-1.0.0.tar.gz#sha256=abc" data-upload-time="2026-06-01T00:00:00Z">demo-1.0.0.tar.gz</a>
-<a href="https://files.example/packages/demo-1.0.1.tar.gz#sha256=bad" data-upload-time="2026-06-01T00:00:00Z">demo-1.0.1.tar.gz</a>
-<a href="../../packages/demo-2.0.0-py3-none-any.whl#sha256=new" data-upload-time="2026-07-05T00:00:00Z">demo-2.0.0-py3-none-any.whl</a>
-</body></html>"#
+    fn old_time() -> DateTime<Utc> {
+        now() - ChronoDuration::hours(100)
+    }
+
+    fn new_time() -> DateTime<Utc> {
+        now() - ChronoDuration::hours(12)
+    }
+
+    fn file(filename: &str, url: &str, upload_time: Option<DateTime<Utc>>) -> SimpleFile {
+        SimpleFile {
+            filename: filename.to_string(),
+            url: url.to_string(),
+            hashes: BTreeMap::from([("sha256".to_string(), format!("hash-{filename}"))]),
+            requires_python: Some(">=3.9".to_string()),
+            dist_info_metadata: None,
+            gpg_sig: None,
+            yanked: None,
+            upload_time,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn simple_fixture() -> SimpleProject {
+        SimpleProject {
+            meta: BTreeMap::from([("api-version".to_string(), json!("1.1"))]),
+            name: "demo".to_string(),
+            versions: vec![
+                "1.0.0".to_string(),
+                "1.0.1".to_string(),
+                "2.0.0".to_string(),
+            ],
+            files: vec![
+                file(
+                    "demo-1.0.0.tar.gz",
+                    "https://files.example/packages/demo-1.0.0.tar.gz",
+                    Some(old_time()),
+                ),
+                file(
+                    "demo-1.0.1.tar.gz",
+                    "https://files.example/packages/demo-1.0.1.tar.gz",
+                    Some(old_time()),
+                ),
+                file(
+                    "demo-2.0.0-py3-none-any.whl",
+                    "../../packages/demo-2.0.0-py3-none-any.whl",
+                    Some(new_time()),
+                ),
+            ],
+        }
     }
 
     #[test]
-    fn pypi_simple_filters_blocked_and_too_young_files_and_rewrites_allowed_links() {
+    fn pypi_simple_json_filters_blocked_and_too_young_files_and_recomputes_versions() {
         let mut config = Config::default();
         config.server.public_base_url = "https://proxy.example/".to_string();
         config.upstreams.pypi.simple_url = "https://pypi.example/simple".to_string();
@@ -544,21 +546,121 @@ mod tests {
         let upstream = StaticSimple::new("Demo", simple_fixture());
         let checker = CleanChecker::new();
 
-        let response =
-            simple_project_response(&config, &upstream, &checker, "Demo", now()).unwrap();
-        let body = String::from_utf8(response.body).unwrap();
+        let response = simple_project_response_for_accept(
+            &config,
+            &upstream,
+            &checker,
+            "Demo",
+            now(),
+            Some(SIMPLE_JSON_CONTENT_TYPE),
+        )
+        .unwrap();
+        let body: SimpleProject = serde_json::from_slice(&response.body).unwrap();
 
         assert_eq!(response.status, 200);
-        assert!(body.contains(
-            "https://proxy.example/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz#sha256=abc"
-        ));
-        assert!(!body.contains("demo-1.0.1.tar.gz"));
-        assert!(!body.contains("demo-2.0.0-py3-none-any.whl"));
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(name, _)| name == "content-type")
+                .map(|(_, value)| value.as_str()),
+            Some(SIMPLE_JSON_CONTENT_TYPE)
+        );
+        assert_eq!(body.versions, vec!["1.0.0"]);
+        assert_eq!(body.files.len(), 1);
+        assert_eq!(body.files[0].filename, "demo-1.0.0.tar.gz");
+        assert_eq!(
+            body.files[0].url,
+            "https://proxy.example/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz"
+        );
+        assert_eq!(body.files[0].upload_time, Some(old_time()));
         assert_eq!(checker.calls.get(), 3);
     }
 
     #[test]
-    fn pypi_artifact_allowed_file_redirects_to_upstream() {
+    fn pypi_simple_html_is_rendered_from_filtered_json_model() {
+        let mut config = Config::default();
+        config.server.public_base_url = "https://proxy.example".to_string();
+        config.upstreams.pypi.simple_url = "https://pypi.example/simple".to_string();
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Pypi,
+            name: "demo".to_string(),
+            versions: vec!["1.0.1".to_string()],
+            reason: "known bad".to_string(),
+        });
+        let upstream = StaticSimple::new("demo", simple_fixture());
+        let checker = CleanChecker::new();
+
+        let response =
+            simple_project_response(&config, &upstream, &checker, "demo", now()).unwrap();
+        let body = String::from_utf8(response.body).unwrap();
+
+        assert_eq!(response.status, 200);
+        assert!(body.contains(
+            "https://proxy.example/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz#sha256=hash-demo-1.0.0.tar.gz"
+        ));
+        assert!(body.contains("data-upload-time=\"2026-07-01T08:00:00+00:00\""));
+        assert!(!body.contains("demo-1.0.1.tar.gz"));
+        assert!(!body.contains("demo-2.0.0-py3-none-any.whl"));
+    }
+
+    #[test]
+    fn pypi_missing_json_upload_time_blocks_by_default() {
+        let config = Config::default();
+        let mut simple = simple_fixture();
+        simple.files = vec![file(
+            "demo-1.0.0.tar.gz",
+            "https://files.example/packages/demo-1.0.0.tar.gz",
+            None,
+        )];
+        let upstream = StaticSimple::new("demo", simple);
+        let checker = CleanChecker::new();
+
+        let response = simple_project_response_for_accept(
+            &config,
+            &upstream,
+            &checker,
+            "demo",
+            now(),
+            Some(SIMPLE_JSON_CONTENT_TYPE),
+        )
+        .unwrap();
+        let body: SimpleProject = serde_json::from_slice(&response.body).unwrap();
+
+        assert!(body.files.is_empty());
+        assert!(body.versions.is_empty());
+    }
+
+    #[test]
+    fn pypi_missing_json_upload_time_can_be_allowed_explicitly() {
+        let mut config = Config::default();
+        config.policy.missing_publish_time = MissingPublishTime::Allow;
+        let mut simple = simple_fixture();
+        simple.files = vec![file(
+            "demo-1.0.0.tar.gz",
+            "https://files.example/packages/demo-1.0.0.tar.gz",
+            None,
+        )];
+        let upstream = StaticSimple::new("demo", simple);
+        let checker = CleanChecker::new();
+
+        let response = simple_project_response_for_accept(
+            &config,
+            &upstream,
+            &checker,
+            "demo",
+            now(),
+            Some(SIMPLE_JSON_CONTENT_TYPE),
+        )
+        .unwrap();
+        let body: SimpleProject = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(body.files.len(), 1);
+        assert_eq!(body.versions, vec!["1.0.0"]);
+    }
+
+    #[test]
+    fn pypi_artifact_allowed_file_redirects_to_upstream_and_rechecks_policy() {
         let mut config = Config::default();
         config.upstreams.pypi.simple_url = "https://pypi.example/simple".to_string();
         let upstream = StaticSimple::new("demo", simple_fixture());
@@ -614,6 +716,29 @@ mod tests {
         assert!(!body.allowed);
         assert_eq!(body.reason, DecisionReason::ManuallyBlocked);
         assert_eq!(body.package, "pypi:demo@1.0.0");
+    }
+
+    #[test]
+    fn pypi_artifact_too_young_file_returns_structured_403() {
+        let config = Config::default();
+        let upstream = StaticSimple::new("demo", simple_fixture());
+        let checker = CleanChecker::new();
+
+        let response = artifact_response(
+            &config,
+            &upstream,
+            &checker,
+            "demo",
+            "2.0.0",
+            "demo-2.0.0-py3-none-any.whl",
+            now(),
+        )
+        .unwrap();
+        let body: Decision = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status, 403);
+        assert_eq!(body.reason, DecisionReason::TooYoung);
+        assert_eq!(body.package, "pypi:demo@2.0.0");
     }
 
     #[test]

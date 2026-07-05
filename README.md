@@ -15,8 +15,8 @@ cache.
   with `MAL-`.
 - Supports exact-version allowlist exceptions.
 - Supports exact-version and whole-package blocklist entries.
-- Filters npm metadata and PyPI Simple pages so blocked versions are not offered
-  to clients.
+- Filters npm metadata and PyPI Simple project metadata so blocked versions are
+  not offered to clients.
 - Rewrites allowed artifact URLs back through `osv-proxy`, then redirects to the
   upstream registry only after a second policy check.
 
@@ -25,7 +25,7 @@ cache.
 Implemented now:
 
 - npm metadata filtering and tarball redirects.
-- PyPI Simple HTML filtering and file redirects.
+- PyPI Simple JSON-backed filtering, HTML/JSON responses, and file redirects.
 - YAML config loading and validation.
 - `serve`, `check`, and `config validate` commands.
 - Naive OSV API checks during request handling.
@@ -153,6 +153,12 @@ For every package version or file, `osv-proxy` evaluates:
 
 Blocked artifact requests return HTTP `403` with a structured JSON decision.
 Allowed artifact requests return HTTP `302` to the upstream tarball or file URL.
+
+For PyPI project pages, `osv-proxy` fetches upstream Simple JSON and uses
+`files[].upload-time` for the age gate. If a client requests
+`application/vnd.pypi.simple.v1+json`, the proxy returns filtered Simple JSON.
+Otherwise it renders filtered Simple HTML from the same JSON-backed policy
+model.
 
 ## Development
 

@@ -31,4 +31,17 @@ impl RegistryResponse {
             body: Vec::new(),
         }
     }
+
+    pub fn set_content_type(&mut self, content_type: &str) {
+        if let Some((_, value)) = self
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name == "content-type")
+        {
+            *value = content_type.to_string();
+        } else {
+            self.headers
+                .push(("content-type".to_string(), content_type.to_string()));
+        }
+    }
 }

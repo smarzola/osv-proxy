@@ -43,23 +43,36 @@ fn handle_stream(config: &Config, stream: &mut TcpStream) -> anyhow::Result<()> 
         .split_whitespace();
     let method = parts.next().unwrap_or_default();
     let path = parts.next().unwrap_or_default();
-    let response = route_request(config, method, path);
+    let accept = header_value(&request, "accept");
+    let response = route_request_with_accept(config, method, path, accept.as_deref());
     write_response(stream, response)?;
     Ok(())
 }
 
 pub fn route_request(config: &Config, method: &str, path: &str) -> RegistryResponse {
+    route_request_with_accept(config, method, path, None)
+}
+
+pub fn route_request_with_accept(
+    config: &Config,
+    method: &str,
+    path: &str,
+    accept: Option<&str>,
+) -> RegistryResponse {
     let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
     let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
     let checker = OsvHttpClient::new(&config.policy.malicious.osv_api_url);
-    route_request_with_upstreams(
+    route_request_with_dependencies(
         config,
         method,
         path,
         Utc::now(),
-        &checker,
-        &npm_upstream,
-        &pypi_upstream,
+        RouteDependencies {
+            checker: &checker,
+            npm_upstream: &npm_upstream,
+            pypi_upstream: &pypi_upstream,
+            accept,
+        },
     )
 }
 
@@ -91,34 +104,76 @@ pub fn route_request_with_upstreams(
     npm_upstream: &dyn NpmMetadataProvider,
     pypi_upstream: &dyn PypiSimpleProvider,
 ) -> RegistryResponse {
+    route_request_with_dependencies(
+        config,
+        method,
+        path,
+        now,
+        RouteDependencies {
+            checker,
+            npm_upstream,
+            pypi_upstream,
+            accept: None,
+        },
+    )
+}
+
+struct RouteDependencies<'a> {
+    checker: &'a dyn MaliciousChecker,
+    npm_upstream: &'a dyn NpmMetadataProvider,
+    pypi_upstream: &'a dyn PypiSimpleProvider,
+    accept: Option<&'a str>,
+}
+
+fn route_request_with_dependencies(
+    config: &Config,
+    method: &str,
+    path: &str,
+    now: DateTime<Utc>,
+    dependencies: RouteDependencies<'_>,
+) -> RegistryResponse {
     if method != "GET" {
         return simple_response(405, "method not allowed");
     }
 
     match parse_npm_route(path) {
-        Some(NpmRoute::Metadata { package }) => {
-            npm::metadata_response(config, npm_upstream, checker, &package, now)
-                .unwrap_or_else(|err| npm::error_response(&err))
-        }
-        Some(NpmRoute::Artifact { package, tarball }) => {
-            npm::artifact_response(config, npm_upstream, checker, &package, &tarball, now)
-                .unwrap_or_else(|err| npm::error_response(&err))
-        }
+        Some(NpmRoute::Metadata { package }) => npm::metadata_response(
+            config,
+            dependencies.npm_upstream,
+            dependencies.checker,
+            &package,
+            now,
+        )
+        .unwrap_or_else(|err| npm::error_response(&err)),
+        Some(NpmRoute::Artifact { package, tarball }) => npm::artifact_response(
+            config,
+            dependencies.npm_upstream,
+            dependencies.checker,
+            &package,
+            &tarball,
+            now,
+        )
+        .unwrap_or_else(|err| npm::error_response(&err)),
         None => match parse_pypi_route(path) {
-            Some(PypiRoute::SimpleRoot) => pypi::simple_root_response(pypi_upstream)
+            Some(PypiRoute::SimpleRoot) => pypi::simple_root_response(dependencies.pypi_upstream)
                 .unwrap_or_else(|err| pypi::error_response(&err)),
-            Some(PypiRoute::SimpleProject { project }) => {
-                pypi::simple_project_response(config, pypi_upstream, checker, &project, now)
-                    .unwrap_or_else(|err| pypi::error_response(&err))
-            }
+            Some(PypiRoute::SimpleProject { project }) => pypi::simple_project_response_for_accept(
+                config,
+                dependencies.pypi_upstream,
+                dependencies.checker,
+                &project,
+                now,
+                dependencies.accept,
+            )
+            .unwrap_or_else(|err| pypi::error_response(&err)),
             Some(PypiRoute::Artifact {
                 project,
                 version,
                 filename,
             }) => pypi::artifact_response(
                 config,
-                pypi_upstream,
-                checker,
+                dependencies.pypi_upstream,
+                dependencies.checker,
                 &project,
                 &version,
                 &filename,
@@ -160,16 +215,25 @@ struct MissingPypiUpstream;
 
 impl PypiSimpleProvider for MissingPypiUpstream {
     fn fetch_simple_root(&self) -> Result<String, pypi::PypiError> {
-        Err(pypi::PypiError::InvalidSimpleHtml(
+        Err(pypi::PypiError::InvalidSimpleJson(
             "PyPI upstream was not provided".to_string(),
         ))
     }
 
-    fn fetch_project_simple(&self, _project: &str) -> Result<String, pypi::PypiError> {
-        Err(pypi::PypiError::InvalidSimpleHtml(
+    fn fetch_project_json(&self, _project: &str) -> Result<pypi::SimpleProject, pypi::PypiError> {
+        Err(pypi::PypiError::InvalidSimpleJson(
             "PyPI upstream was not provided".to_string(),
         ))
     }
+}
+
+fn header_value(request: &str, name: &str) -> Option<String> {
+    request.lines().skip(1).find_map(|line| {
+        let (header_name, value) = line.split_once(':')?;
+        header_name
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,7 +355,10 @@ mod tests {
     use crate::config::BlocklistEntry;
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::npm::NpmError;
+    use crate::pypi::{SimpleFile, SimpleProject};
+    use chrono::Duration as ChronoDuration;
     use serde_json::{json, Value};
+    use std::collections::BTreeMap;
     use std::collections::HashMap;
 
     struct StaticUpstream {
@@ -316,17 +383,14 @@ mod tests {
 
     struct StaticPypiUpstream {
         root: String,
-        projects: HashMap<String, String>,
+        projects: HashMap<String, SimpleProject>,
     }
 
     impl StaticPypiUpstream {
-        fn with(project: &str, html: &str) -> Self {
+        fn with(project: &str, simple: SimpleProject) -> Self {
             Self {
                 root: "<html><body><a href=\"demo/\">demo</a></body></html>".to_string(),
-                projects: HashMap::from([(
-                    crate::artifact::normalize_pypi_name(project),
-                    html.to_string(),
-                )]),
+                projects: HashMap::from([(crate::artifact::normalize_pypi_name(project), simple)]),
             }
         }
     }
@@ -336,11 +400,11 @@ mod tests {
             Ok(self.root.clone())
         }
 
-        fn fetch_project_simple(&self, project: &str) -> Result<String, pypi::PypiError> {
+        fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, pypi::PypiError> {
             self.projects
                 .get(&crate::artifact::normalize_pypi_name(project))
                 .cloned()
-                .ok_or_else(|| pypi::PypiError::InvalidSimpleHtml(format!("missing {project}")))
+                .ok_or_else(|| pypi::PypiError::InvalidSimpleJson(format!("missing {project}")))
         }
     }
 
@@ -352,10 +416,88 @@ mod tests {
         }
     }
 
+    struct MaliciousPackageChecker {
+        package: String,
+    }
+
+    impl MaliciousPackageChecker {
+        fn new(package: &str) -> Self {
+            Self {
+                package: package.to_string(),
+            }
+        }
+    }
+
+    impl MaliciousChecker for MaliciousPackageChecker {
+        fn check(&self, artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            if artifact.identity() == self.package {
+                Ok(vec![MaliciousHit {
+                    osv_id: "MAL-2026-000001".to_string(),
+                    summary: Some("malicious fixture".to_string()),
+                    source: "osv".to_string(),
+                    modified: None,
+                }])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+    }
+
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-05T12:00:00Z")
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    fn old_time() -> DateTime<Utc> {
+        now() - ChronoDuration::hours(100)
+    }
+
+    fn new_time() -> DateTime<Utc> {
+        now() - ChronoDuration::hours(12)
+    }
+
+    fn pypi_file(filename: &str, url: &str, upload_time: Option<DateTime<Utc>>) -> SimpleFile {
+        SimpleFile {
+            filename: filename.to_string(),
+            url: url.to_string(),
+            hashes: BTreeMap::from([("sha256".to_string(), format!("hash-{filename}"))]),
+            requires_python: None,
+            dist_info_metadata: None,
+            gpg_sig: None,
+            yanked: None,
+            upload_time,
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn pypi_simple_fixture() -> SimpleProject {
+        SimpleProject {
+            meta: BTreeMap::from([("api-version".to_string(), json!("1.1"))]),
+            name: "demo".to_string(),
+            versions: vec![
+                "1.0.0".to_string(),
+                "1.0.1".to_string(),
+                "2.0.0".to_string(),
+            ],
+            files: vec![
+                pypi_file(
+                    "demo-1.0.0.tar.gz",
+                    "https://files.example/packages/demo-1.0.0.tar.gz",
+                    Some(old_time()),
+                ),
+                pypi_file(
+                    "demo-1.0.1.tar.gz",
+                    "https://files.example/packages/demo-1.0.1.tar.gz",
+                    Some(old_time()),
+                ),
+                pypi_file(
+                    "demo-2.0.0-py3-none-any.whl",
+                    "https://files.example/packages/demo-2.0.0-py3-none-any.whl",
+                    Some(new_time()),
+                ),
+            ],
+        }
     }
 
     #[test]
@@ -501,12 +643,14 @@ mod tests {
     fn routes_pypi_simple_project_with_mocked_upstream() {
         let config = Config::default();
         let npm_upstream = StaticUpstream::with("unused", json!({}));
-        let pypi_upstream = StaticPypiUpstream::with(
-            "demo",
-            r#"<html><body>
-<a href="https://files.example/demo-1.0.0.tar.gz#sha256=abc" data-upload-time="2026-06-01T00:00:00Z">demo-1.0.0.tar.gz</a>
-</body></html>"#,
-        );
+        let mut simple = pypi_simple_fixture();
+        simple.files = vec![pypi_file(
+            "demo-1.0.0.tar.gz",
+            "https://files.example/demo-1.0.0.tar.gz",
+            Some(old_time()),
+        )];
+        simple.versions = vec!["1.0.0".to_string()];
+        let pypi_upstream = StaticPypiUpstream::with("demo", simple);
 
         let response = route_request_with_upstreams(
             &config,
@@ -521,20 +665,60 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert!(body.contains(
-            "http://127.0.0.1:8080/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz#sha256=abc"
+            "http://127.0.0.1:8080/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz#sha256=hash-demo-1.0.0.tar.gz"
         ));
+    }
+
+    #[test]
+    fn routes_pypi_simple_json_when_client_accepts_json() {
+        let config = Config::default();
+        let npm_upstream = StaticUpstream::with("unused", json!({}));
+        let pypi_upstream = StaticPypiUpstream::with("demo", pypi_simple_fixture());
+
+        let response = route_request_with_dependencies(
+            &config,
+            "GET",
+            "/pypi/simple/Demo/",
+            now(),
+            RouteDependencies {
+                checker: &CleanChecker,
+                npm_upstream: &npm_upstream,
+                pypi_upstream: &pypi_upstream,
+                accept: Some("application/vnd.pypi.simple.v1+json"),
+            },
+        );
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(name, _)| name == "content-type")
+                .map(|(_, value)| value.as_str()),
+            Some("application/vnd.pypi.simple.v1+json")
+        );
+        assert_eq!(body["versions"], json!(["1.0.0", "1.0.1"]));
+        assert_eq!(body["files"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["files"][0]["url"],
+            "http://127.0.0.1:8080/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz"
+        );
+        assert!(!body.to_string().contains("demo-2.0.0-py3-none-any.whl"));
     }
 
     #[test]
     fn routes_pypi_artifact_with_mocked_upstream() {
         let config = Config::default();
         let npm_upstream = StaticUpstream::with("unused", json!({}));
-        let pypi_upstream = StaticPypiUpstream::with(
-            "demo",
-            r#"<html><body>
-<a href="https://files.example/demo-1.0.0.tar.gz#sha256=abc" data-upload-time="2026-06-01T00:00:00Z">demo-1.0.0.tar.gz</a>
-</body></html>"#,
-        );
+        let mut simple = pypi_simple_fixture();
+        simple.files = vec![pypi_file(
+            "demo-1.0.0.tar.gz",
+            "https://files.example/demo-1.0.0.tar.gz",
+            Some(old_time()),
+        )];
+        simple.versions = vec!["1.0.0".to_string()];
+        let pypi_upstream = StaticPypiUpstream::with("demo", simple);
 
         let response = route_request_with_upstreams(
             &config,
@@ -652,6 +836,73 @@ mod tests {
     }
 
     #[test]
+    fn e2e_npm_route_filters_malicious_metadata_and_blocks_artifact() {
+        let config = Config::default();
+        let npm_upstream = StaticUpstream::with(
+            "demo",
+            json!({
+                "name": "demo",
+                "dist-tags": { "latest": "1.0.1", "stable": "1.0.0" },
+                "time": {
+                    "1.0.0": "2026-06-01T00:00:00Z",
+                    "1.0.1": "2026-06-01T00:00:00Z"
+                },
+                "versions": {
+                    "1.0.0": {
+                        "name": "demo",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": "https://registry.example/demo/-/demo-1.0.0.tgz"
+                        }
+                    },
+                    "1.0.1": {
+                        "name": "demo",
+                        "version": "1.0.1",
+                        "dist": {
+                            "tarball": "https://registry.example/demo/-/demo-1.0.1.tgz"
+                        }
+                    }
+                }
+            }),
+        );
+        let checker = MaliciousPackageChecker::new("npm:demo@1.0.1");
+
+        let metadata_response = route_request_with_upstream(
+            &config,
+            "GET",
+            "/npm/demo",
+            now(),
+            &checker,
+            &npm_upstream,
+        );
+        let metadata: Value = serde_json::from_slice(&metadata_response.body).unwrap();
+
+        assert_eq!(metadata_response.status, 200);
+        assert!(metadata["versions"]
+            .as_object()
+            .unwrap()
+            .contains_key("1.0.0"));
+        assert!(!metadata["versions"]
+            .as_object()
+            .unwrap()
+            .contains_key("1.0.1"));
+        assert_eq!(metadata["dist-tags"], json!({ "stable": "1.0.0" }));
+
+        let blocked_artifact_response = route_request_with_upstream(
+            &config,
+            "GET",
+            "/npm/demo/-/demo-1.0.1.tgz",
+            now(),
+            &checker,
+            &npm_upstream,
+        );
+        let blocked_body: Value = serde_json::from_slice(&blocked_artifact_response.body).unwrap();
+        assert_eq!(blocked_artifact_response.status, 403);
+        assert_eq!(blocked_body["reason"], "malicious");
+        assert_eq!(blocked_body["rule_id"], "MAL-2026-000001");
+    }
+
+    #[test]
     fn e2e_pypi_route_filters_simple_redirects_allowed_and_blocks_direct_artifact() {
         let mut config = Config::default();
         config.blocklist.push(BlocklistEntry {
@@ -661,13 +912,7 @@ mod tests {
             reason: "known bad".to_string(),
         });
         let npm_upstream = StaticUpstream::with("unused", json!({}));
-        let pypi_upstream = StaticPypiUpstream::with(
-            "Demo",
-            r#"<html><body>
-<a href="https://files.example/packages/demo-1.0.0.tar.gz#sha256=abc" data-upload-time="2026-06-01T00:00:00Z">demo-1.0.0.tar.gz</a>
-<a href="https://files.example/packages/demo-1.0.1.tar.gz#sha256=bad" data-upload-time="2026-06-01T00:00:00Z">demo-1.0.1.tar.gz</a>
-</body></html>"#,
-        );
+        let pypi_upstream = StaticPypiUpstream::with("Demo", pypi_simple_fixture());
 
         let simple_response = route_request_with_upstreams(
             &config,
@@ -681,9 +926,10 @@ mod tests {
         assert_eq!(simple_response.status, 200);
         let simple_body = String::from_utf8(simple_response.body).unwrap();
         assert!(simple_body.contains(
-            "http://127.0.0.1:8080/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz#sha256=abc"
+            "http://127.0.0.1:8080/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz#sha256=hash-demo-1.0.0.tar.gz"
         ));
         assert!(!simple_body.contains("demo-1.0.1.tar.gz"));
+        assert!(!simple_body.contains("demo-2.0.0-py3-none-any.whl"));
 
         let allowed_artifact_response = route_request_with_upstreams(
             &config,
@@ -719,6 +965,51 @@ mod tests {
     }
 
     #[test]
+    fn e2e_pypi_route_filters_malicious_json_and_blocks_artifact() {
+        let config = Config::default();
+        let npm_upstream = StaticUpstream::with("unused", json!({}));
+        let pypi_upstream = StaticPypiUpstream::with("Demo", pypi_simple_fixture());
+        let checker = MaliciousPackageChecker::new("pypi:demo@1.0.1");
+
+        let simple_response = route_request_with_dependencies(
+            &config,
+            "GET",
+            "/pypi/simple/Demo/",
+            now(),
+            RouteDependencies {
+                checker: &checker,
+                npm_upstream: &npm_upstream,
+                pypi_upstream: &pypi_upstream,
+                accept: Some("application/vnd.pypi.simple.v1+json"),
+            },
+        );
+        let simple_body: Value = serde_json::from_slice(&simple_response.body).unwrap();
+
+        assert_eq!(simple_response.status, 200);
+        assert_eq!(simple_body["versions"], json!(["1.0.0"]));
+        assert_eq!(simple_body["files"].as_array().unwrap().len(), 1);
+        assert!(!simple_body.to_string().contains("demo-1.0.1.tar.gz"));
+        assert!(!simple_body
+            .to_string()
+            .contains("demo-2.0.0-py3-none-any.whl"));
+
+        let blocked_artifact_response = route_request_with_upstreams(
+            &config,
+            "GET",
+            "/pypi/packages/demo/1.0.1/demo-1.0.1.tar.gz",
+            now(),
+            &checker,
+            &npm_upstream,
+            &pypi_upstream,
+        );
+        let blocked_body: Value = serde_json::from_slice(&blocked_artifact_response.body).unwrap();
+
+        assert_eq!(blocked_artifact_response.status, 403);
+        assert_eq!(blocked_body["reason"], "malicious");
+        assert_eq!(blocked_body["rule_id"], "MAL-2026-000001");
+    }
+
+    #[test]
     fn method_mismatch_returns_405() {
         let response = route_request_with_upstream(
             &Config::default(),
@@ -729,6 +1020,15 @@ mod tests {
             &StaticUpstream::with("lodash", json!({})),
         );
         assert_eq!(response.status, 405);
+    }
+
+    #[test]
+    fn parses_accept_header_case_insensitively() {
+        let request = "GET /pypi/simple/demo/ HTTP/1.1\r\nHost: localhost\r\nAccept: application/vnd.pypi.simple.v1+json\r\n\r\n";
+        assert_eq!(
+            header_value(request, "accept").as_deref(),
+            Some("application/vnd.pypi.simple.v1+json")
+        );
     }
 
     #[test]

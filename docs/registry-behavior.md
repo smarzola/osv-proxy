@@ -43,15 +43,10 @@ Manual block:
 
 ## Health Endpoints
 
-- `GET /healthz`: process is alive
-- `GET /readyz`: dependencies required by current config are reachable
+Health endpoints are not implemented in the current phase.
 
-`/readyz` should check:
-
-- config loaded
-- malicious store reachable when local mode is enabled
-- cachebox reachable when metadata cache is enabled
-- S3 reachable when `proxy_cache_s3` mode is enabled
+Future `/healthz` and `/readyz` endpoints should report process health and
+configured dependency readiness.
 
 ## npm Routes
 
@@ -72,17 +67,16 @@ Examples:
 For metadata requests:
 
 1. Fetch raw metadata from upstream npm registry.
-2. Optionally read/write raw metadata through cachebox.
-3. Parse all versions.
-4. Build an artifact for each version.
-5. Evaluate policy.
-6. Remove blocked versions from metadata.
-7. Rewrite allowed versions' `dist.tarball` URLs to `osv-proxy` artifact URLs.
-8. Preserve `dist.integrity` and `dist.shasum`.
-9. Recompute `dist-tags` so they do not point to filtered versions.
-10. Return filtered metadata.
+2. Parse all versions.
+3. Build an artifact for each version.
+4. Evaluate policy.
+5. Remove blocked versions from metadata.
+6. Rewrite allowed versions' `dist.tarball` URLs to `osv-proxy` artifact URLs.
+7. Preserve `dist.integrity` and `dist.shasum`.
+8. Recompute `dist-tags` so they do not point to filtered versions.
+9. Return filtered metadata.
 
-Tarball requests must evaluate policy again before redirecting, proxying, or serving cached bytes.
+Tarball requests evaluate policy again before redirecting.
 
 ## PyPI Routes
 
@@ -97,22 +91,25 @@ Examples:
 - `GET /pypi/simple/requests/`
 - `GET /pypi/packages/requests/2.32.3/requests-2.32.3-py3-none-any.whl`
 
-For `/pypi/simple/{project}/`:
+For `/pypi/simple/{project}/`, policy is evaluated from upstream Simple JSON
+project metadata. This matters because the JSON API provides `files[].upload-time`
+for the age gate.
 
 1. Normalize project name.
-2. Fetch upstream Simple API metadata.
-3. Optionally read/write raw metadata through cachebox.
-4. Parse file links.
-5. Extract filename, version, upstream URL, hash, and upload time when available.
-6. Build an artifact for every file/version.
-7. Evaluate policy.
-8. Remove blocked files.
-9. Rewrite allowed file links to `osv-proxy` artifact URLs.
-10. Return filtered Simple API response.
+2. Fetch upstream Simple JSON metadata.
+3. Extract filename, version, upstream URL, hashes, and `upload-time`.
+4. Build an artifact for every file/version.
+5. Evaluate policy.
+6. Remove blocked files.
+7. Recompute `versions` from allowed files.
+8. Rewrite allowed file URLs to `osv-proxy` artifact URLs.
+9. Return filtered Simple JSON when the client requests
+   `application/vnd.pypi.simple.v1+json`.
+10. Otherwise render a filtered Simple HTML page from the same filtered JSON
+    model.
 
-Support HTML Simple API first. Add JSON Simple API support as soon as practical.
-
-File routes must evaluate policy again before redirecting, proxying, or serving cached bytes.
+File routes fetch upstream Simple JSON, rebuild the requested artifact, and
+evaluate policy again before redirecting.
 
 ## Artifact Modes
 
@@ -126,6 +123,4 @@ if allowed -> 302 redirect to upstream artifact URL
 client -> downloads bytes from upstream registry/CDN
 ```
 
-Proxy mode streams bytes through `osv-proxy` without persistent caching.
-
-S3 cache mode checks S3 before fetching upstream, but policy must be checked before serving cached bytes.
+Proxy mode and S3 cache mode are not implemented in the current phase.

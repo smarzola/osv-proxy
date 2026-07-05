@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
@@ -87,21 +87,6 @@ impl Config {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            upstreams: UpstreamsConfig::default(),
-            policy: PolicyConfig::default(),
-            allowlist: Vec::new(),
-            blocklist: Vec::new(),
-            metadata_cache: MetadataCacheConfig::default(),
-            artifacts: ArtifactsConfig::default(),
-            malicious_store: None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
@@ -118,20 +103,11 @@ impl Default for ServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UpstreamsConfig {
     pub npm: NpmUpstreamConfig,
     pub pypi: PypiUpstreamConfig,
-}
-
-impl Default for UpstreamsConfig {
-    fn default() -> Self {
-        Self {
-            npm: NpmUpstreamConfig::default(),
-            pypi: PypiUpstreamConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,17 +186,12 @@ impl Default for MaliciousConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MaliciousMode {
+    #[default]
     Naive,
     Local,
-}
-
-impl Default for MaliciousMode {
-    fn default() -> Self {
-        Self::Naive
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,20 +241,11 @@ impl BlocklistEntry {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MetadataCacheConfig {
     pub enabled: bool,
     pub backend: Option<String>,
-}
-
-impl Default for MetadataCacheConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            backend: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,18 +264,13 @@ impl Default for ArtifactsConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactBehavior {
+    #[default]
     Redirect,
     Proxy,
     ProxyCacheS3,
-}
-
-impl Default for ArtifactBehavior {
-    fn default() -> Self {
-        Self::Redirect
-    }
 }
 
 #[derive(Debug, Error)]

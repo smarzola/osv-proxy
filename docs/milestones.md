@@ -80,21 +80,24 @@ Acceptance tests:
 
 Build:
 
-- PyPI Simple HTML route
+- PyPI Simple JSON-backed route with HTML/JSON responses
 - upstream fetch
-- file link parsing
+- file record parsing
 - version extraction from filename
 - hash preservation
+- `upload-time` extraction for the age gate
 - policy filtering
 - file URL rewriting
 - PyPI file redirect gate
 
 Acceptance tests:
 
-- blocked PyPI file removed from Simple page
-- too-new PyPI file removed from Simple page
+- blocked PyPI file removed from Simple response
+- too-new PyPI file removed from Simple response
+- missing `upload-time` follows policy
 - allowed PyPI file remains
 - file link points to `osv-proxy`
+- JSON `versions` contains only versions with allowed files
 - file route checks policy again
 - allowed file returns redirect
 - blocked file returns 403
