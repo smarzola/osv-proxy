@@ -158,7 +158,8 @@ For PyPI project pages, `osv-proxy` fetches upstream Simple JSON and uses
 `files[].upload-time` for the age gate. If a client requests
 `application/vnd.pypi.simple.v1+json`, the proxy returns filtered Simple JSON.
 Otherwise it renders filtered Simple HTML from the same JSON-backed policy
-model.
+model. The PyPI Simple root is rendered with project links that stay on
+`/pypi/simple/...` proxy routes.
 
 ## Development
 

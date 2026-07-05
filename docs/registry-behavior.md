@@ -98,6 +98,11 @@ For `/pypi/simple/{project}/`, policy is evaluated from upstream Simple JSON
 project metadata. This matters because the JSON API provides `files[].upload-time`
 for the age gate.
 
+For `/pypi/simple/`, the proxy fetches the upstream Simple root and renders a
+minimal root page whose project links point at
+`{server.public_base_url}/pypi/simple/{project}/`. Upstream `/simple/...`
+links are not passed through to clients.
+
 1. Normalize project name.
 2. Fetch upstream Simple JSON metadata.
 3. Extract filename, version, upstream URL, hashes, and `upload-time`.

@@ -82,11 +82,12 @@ pub fn package_artifact(
 }
 
 pub async fn simple_root_response(
+    config: &Config,
     upstream: &dyn PypiSimpleProvider,
 ) -> Result<RegistryResponse, PypiError> {
     Ok(RegistryResponse::html(
         200,
-        upstream.fetch_simple_root().await?,
+        render_simple_root_html(config, &upstream.fetch_simple_root().await?),
     ))
 }
 
@@ -294,6 +295,81 @@ fn render_simple_html(simple: &SimpleProject) -> String {
     }
     html.push_str("</body></html>\n");
     html
+}
+
+fn render_simple_root_html(config: &Config, upstream_html: &str) -> String {
+    let mut projects = BTreeSet::new();
+    for href in extract_href_values(upstream_html) {
+        if let Some(project) = project_from_root_href(config, &href) {
+            projects.insert(normalize_pypi_name(&project));
+        }
+    }
+
+    let mut html = String::from("<!DOCTYPE html>\n<html><body>\n");
+    for project in projects {
+        if project.is_empty() {
+            continue;
+        }
+        let href = format!(
+            "{}/pypi/simple/{project}/",
+            config.server.public_base_url.trim_end_matches('/')
+        );
+        html.push_str("<a href=\"");
+        html.push_str(&escape_attr(&href));
+        html.push_str("\">");
+        html.push_str(&escape_text(&project));
+        html.push_str("</a>\n");
+    }
+    html.push_str("</body></html>\n");
+    html
+}
+
+fn extract_href_values(html: &str) -> Vec<String> {
+    let mut hrefs = Vec::new();
+    let mut rest = html;
+    while let Some(index) = rest.find("href") {
+        rest = &rest[index + "href".len()..];
+        let trimmed = rest.trim_start();
+        let Some(after_equals) = trimmed.strip_prefix('=') else {
+            continue;
+        };
+        let after_equals = after_equals.trim_start();
+        let Some(quote) = after_equals
+            .chars()
+            .next()
+            .filter(|quote| *quote == '"' || *quote == '\'')
+        else {
+            continue;
+        };
+        let value_start = quote.len_utf8();
+        let Some(value_end) = after_equals[value_start..].find(quote) else {
+            break;
+        };
+        hrefs.push(after_equals[value_start..value_start + value_end].to_string());
+        rest = &after_equals[value_start + value_end + quote.len_utf8()..];
+    }
+    hrefs
+}
+
+fn project_from_root_href(config: &Config, href: &str) -> Option<String> {
+    let href = href.split('#').next().unwrap_or(href);
+    let href = href.split('?').next().unwrap_or(href).trim();
+    let simple_url = config.upstreams.pypi.simple_url.trim_end_matches('/');
+    let rest = if let Some(rest) = href.strip_prefix('/') {
+        rest.strip_prefix("simple/")?
+    } else if href.starts_with("http://") || href.starts_with("https://") {
+        if let Some(rest) = href.strip_prefix(&format!("{simple_url}/")) {
+            rest
+        } else {
+            let origin = origin(simple_url)?;
+            href.strip_prefix(&format!("{origin}/simple/"))?
+        }
+    } else {
+        href
+    };
+
+    let project = rest.trim_matches('/');
+    (!project.is_empty() && !project.contains('/')).then(|| project.to_string())
 }
 
 fn url_with_hash_fragment(file: &SimpleFile) -> String {
@@ -814,14 +890,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pypi_simple_root_returns_upstream_html() {
-        let upstream = StaticSimple::new("demo", simple_fixture());
-        let response = simple_root_response(&upstream).await.unwrap();
+    async fn pypi_simple_root_rewrites_links_to_proxy_routes() {
+        let mut config = Config::default();
+        config.server.public_base_url = "https://proxy.example".to_string();
+        config.upstreams.pypi.simple_url = "https://pypi.org/simple".to_string();
+        let mut upstream = StaticSimple::new("demo", simple_fixture());
+        upstream.root = r#"
+<!DOCTYPE html>
+<html><body>
+  <a href="/simple/demo/">demo</a>
+  <a href="relative-demo/">relative-demo</a>
+  <a href="https://pypi.org/simple/Needs&Escape/">Needs&Escape</a>
+</body></html>
+"#
+        .to_string();
+
+        let response = simple_root_response(&config, &upstream).await.unwrap();
+        let body = String::from_utf8(response.body).unwrap();
 
         assert_eq!(response.status, 200);
-        assert!(String::from_utf8(response.body)
-            .unwrap()
-            .contains("requests"));
+        assert!(body.contains("href=\"https://proxy.example/pypi/simple/demo/\""));
+        assert!(body.contains("href=\"https://proxy.example/pypi/simple/relative-demo/\""));
+        assert!(body.contains("href=\"https://proxy.example/pypi/simple/needs&amp;escape/\""));
+        assert!(body.contains(">needs&amp;escape</a>"));
+        assert!(!body.contains("href=\"/simple/demo/\""));
+        assert!(!body.contains("href=\"relative-demo/\""));
+        assert!(!body.contains("pypi.org/simple"));
     }
 
     #[test]

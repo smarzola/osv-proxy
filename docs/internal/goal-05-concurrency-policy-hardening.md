@@ -72,7 +72,7 @@ When a milestone is complete:
 - [x] Milestone 2: Nonblocking upstream clients and bounded malicious checks
 - [x] Milestone 3: npm artifact basename enforcement
 - [x] Milestone 4: Strict config validation
-- [ ] Milestone 5: PyPI Simple root compatibility
+- [x] Milestone 5: PyPI Simple root compatibility
 - [ ] Milestone 6: Final regression and docs audit
 
 ## Milestone 0: Baseline and Async Design Lock
@@ -301,7 +301,7 @@ Status note - 2026-07-05:
   - `cargo test config` passed: 19 filtered tests passed.
   - `cargo run -- config validate --config examples/phase1/osv-proxy.yaml` passed and printed `configuration is valid for phase one`.
   - `cargo test policy` passed: 16 filtered tests passed.
-- Commit: pending.
+- Commit: `a940cb7`.
 
 Problem:
 
@@ -341,6 +341,18 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 5: PyPI Simple Root Compatibility
+
+Status note - 2026-07-05:
+
+- Changed `GET /pypi/simple/` from upstream pass-through to a minimal rendered root page whose project links point at `{server.public_base_url}/pypi/simple/{project}/`.
+- Root rendering extracts project links from upstream absolute `/simple/...` paths, relative project links, and full upstream Simple URLs.
+- Added a root test covering absolute, relative, and full upstream links plus HTML escaping for rendered link hrefs and text.
+- Updated README and registry behavior docs to describe proxy-root rendering.
+- Verification:
+  - `cargo test pypi` passed: 19 filtered tests passed.
+  - `cargo test server` passed outside the sandbox: 18 server-filtered tests passed.
+  - `cargo test e2e_pypi` passed: 2 PyPI e2e route tests passed.
+- Commit: pending.
 
 Problem:
 

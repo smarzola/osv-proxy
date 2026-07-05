@@ -176,9 +176,11 @@ async fn route_request_with_dependencies(
         .await
         .unwrap_or_else(|err| npm::error_response(&err)),
         None => match parse_pypi_route(path) {
-            Some(PypiRoute::SimpleRoot) => pypi::simple_root_response(dependencies.pypi_upstream)
-                .await
-                .unwrap_or_else(|err| pypi::error_response(&err)),
+            Some(PypiRoute::SimpleRoot) => {
+                pypi::simple_root_response(config, dependencies.pypi_upstream)
+                    .await
+                    .unwrap_or_else(|err| pypi::error_response(&err))
+            }
             Some(PypiRoute::SimpleProject { project }) => pypi::simple_project_response_for_accept(
                 config,
                 dependencies.pypi_upstream,
