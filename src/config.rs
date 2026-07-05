@@ -265,6 +265,7 @@ mod tests {
             MissingPublishTime::Block
         );
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
+        assert!(config.policy.osv.only_mal_ids);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         config.validate().unwrap();
     }
@@ -398,16 +399,16 @@ policy:
     }
 
     #[test]
-    fn rejects_old_osv_mal_id_filter_flag() {
-        let err = load(
+    fn accepts_osv_mal_id_filter_flag() {
+        let config = load(
             r#"
 policy:
   osv:
     only_mal_ids: true
 "#,
         )
-        .unwrap_err();
-        assert!(err.to_string().contains("unknown field `only_mal_ids`"));
+        .unwrap();
+        assert!(config.policy.osv.only_mal_ids);
     }
 
     #[test]

@@ -67,7 +67,7 @@ When a milestone is complete:
 - [x] Milestone 1: Adapter artifact lookup APIs
 - [x] Milestone 2: Registry-backed CLI check orchestration
 - [x] Milestone 3: Tests and docs for truthful check
-- [ ] Milestone 4: Final regression and adversarial audit
+- [x] Milestone 4: Final regression and adversarial audit
 
 ## Milestone 0: Baseline and Command Contract
 
@@ -301,6 +301,21 @@ rg -n "parse_identity\\(&package, published_at\\)|published_at: Option<DateTime<
 rg -n "mongodb|cachebox|S3|proxy_cache_s3|memory cache|HashMap.*cache|artifact cache|proxy streaming" src examples docs
 git diff --check
 ```
+
+Status note, 2026-07-06:
+
+- Final audit confirmed default `check` parses package identity, dispatches to npm/PyPI registry lookup APIs, and does not construct a partial synthetic artifact. Synthetic/manual evaluation is isolated to `eval`.
+- npm artifact lookup shares the metadata-to-artifact builder used by tarball serving; PyPI lookup uses the same Simple JSON file-to-artifact builder as metadata filtering and file redirects.
+- Scope audit found no new forbidden implementation for local malicious storage, MongoDB, cachebox, S3, in-process metadata cache, artifact cache, or proxy streaming. Search hits are existing roadmap/docs and config rejection test strings.
+- Verification run:
+  - `cargo test`: passed outside sandbox, 92 library tests and 2 e2e tests.
+  - `cargo fmt --check`: passed.
+  - `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+  - `cargo run -- config validate --config examples/phase1/osv-proxy.yaml`: passed and printed `configuration is valid`.
+  - `rg -n "parse_identity\\(&package, published_at\\)|published_at: Option<DateTime<Utc>>|synthetic|eval" src README.md docs`: reviewed; default `check` has no synthetic artifact construction, and hits are `eval`, artifact model fields, or docs/history.
+  - `rg -n "mongodb|cachebox|S3|proxy_cache_s3|memory cache|HashMap.*cache|artifact cache|proxy streaming" src examples docs`: reviewed; no forbidden implementation added.
+  - `git diff --check`: passed.
+- Commit: pending.
 
 Commit requirement:
 
