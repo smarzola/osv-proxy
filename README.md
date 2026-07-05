@@ -1,98 +1,184 @@
 # osv-proxy
 
-`osv-proxy` is a Rust package registry security proxy for npm and PyPI.
+`osv-proxy` is a package-registry policy proxy for npm and PyPI.
 
-It sits between package managers and public registries, filters package metadata through deterministic policy, and rechecks policy before artifact downloads. The goal is a boring, reliable package registry firewall: no package version should be installable unless `osv-proxy` currently considers it allowed.
+It sits between package managers and public registries, filters package metadata
+through deterministic policy, and checks the same policy again before redirecting
+artifact downloads upstream. The first implementation is intentionally small:
+naive OSV lookup, redirect-only artifacts, no local storage, and no metadata
+cache.
 
-## Core Value
+## What It Does
 
-- Do not install package versions that are too new.
-- Do not install packages known to be malicious through OSV `MAL-*` records.
-- Allow explicit, audited exact-version exceptions.
-- Keep public-service artifact egress low by redirecting downloads upstream by default.
+- Blocks package versions that are too new for the configured minimum age.
+- Blocks package versions with OSV malicious-package records whose IDs start
+  with `MAL-`.
+- Supports exact-version allowlist exceptions.
+- Supports exact-version and whole-package blocklist entries.
+- Filters npm metadata and PyPI Simple pages so blocked versions are not offered
+  to clients.
+- Rewrites allowed artifact URLs back through `osv-proxy`, then redirects to the
+  upstream registry only after a second policy check.
 
-## First Supported Ecosystems
+## Current Scope
 
-- npm
-- PyPI
+Implemented now:
 
-The architecture should allow future adapters for Maven, RubyGems, crates.io, Go modules, Docker/OCI, NuGet, Composer, and other registries.
+- npm metadata filtering and tarball redirects.
+- PyPI Simple HTML filtering and file redirects.
+- YAML config loading and validation.
+- `serve`, `check`, and `config validate` commands.
+- Naive OSV API checks during request handling.
+- Redirect artifact behavior.
 
-## Planned Commands
+Not implemented yet:
+
+- Local malicious-package storage.
+- MongoDB or mongolino-backed sync.
+- Metadata caching.
+- Artifact proxying or S3 artifact caching.
+- `sync-malicious`.
+- Authentication, publishing, license policy, vulnerability severity policy, or
+  broad package scanning.
+
+## Install
+
+Build from source:
 
 ```sh
-osv-proxy serve --config osv-proxy.yaml
-osv-proxy check npm:lodash@4.17.21 --config osv-proxy.yaml
-osv-proxy sync-malicious --config osv-proxy.yaml
-osv-proxy config validate --config osv-proxy.yaml
+cargo build --release
 ```
 
-## V1 Scope
+Run the binary with Cargo during development:
 
-Required for v1:
+```sh
+cargo run -- config validate --config examples/phase1/osv-proxy.yaml
+```
 
-- Rust implementation
-- YAML local configuration
-- npm support
-- PyPI support
-- built-in malicious package blocking from OSV
-- minimum package age gate
-- manual blocklist
-- exact-version allowlist
-- OSV malicious lookup modes: naive and local
-- local malicious mode backed by MongoDB-compatible storage
-- mongolino deployment examples for simple single-file local storage
-- metadata cache disabled or cachebox-backed only
-- artifact behavior: redirect, proxy, and proxy with S3-compatible cache
-- structured audit logs
-- clear HTTP 403 error responses
+## Quick Start
 
-Not in v1:
+Validate the example config:
 
-- web UI
-- private package publishing
-- package vulnerability severity policy
-- license policy
-- SBOM ingestion
-- STIX/CSAF exports
-- user authentication
-- admin API
-- machine learning risk scoring
-- automatic package source-code scanning
+```sh
+cargo run -- config validate --config examples/phase1/osv-proxy.yaml
+```
 
-## Documentation
+Start the proxy:
 
-- [Product Specification](docs/product-spec.md)
-- [Architecture](docs/architecture.md)
-- [Policy Model](docs/policy.md)
-- [Configuration](docs/configuration.md)
-- [Mongolino Integration](docs/mongolino-integration.md)
-- [Registry Behavior](docs/registry-behavior.md)
+```sh
+cargo run -- serve --config examples/phase1/osv-proxy.yaml
+```
+
+Point npm at the proxy:
+
+```sh
+npm config set registry http://127.0.0.1:8080/npm/
+```
+
+Point pip at the proxy:
+
+```sh
+pip config set global.index-url http://127.0.0.1:8080/pypi/simple/
+```
+
+Use `uv` with the proxy:
+
+```sh
+uv pip install --index-url http://127.0.0.1:8080/pypi/simple/ requests
+```
+
+## Check a Package
+
+`check` evaluates one canonical package version and prints the policy decision:
+
+```sh
+cargo run -- check npm:lodash@4.17.21 \
+  --config examples/phase1/osv-proxy.yaml \
+  --published-at 2026-06-01T00:00:00Z
+```
+
+Package identities use this form:
+
+```text
+npm:lodash@4.17.21
+npm:@babel/core@7.24.0
+pypi:requests@2.32.3
+```
+
+The current `check` command does not fetch registry publish time by itself. With
+the default `missing_publish_time: block`, pass `--published-at` when checking a
+package that should be evaluated against the age gate.
+
+## Configuration
+
+The supported phase-one config is:
+
+```yaml
+server:
+  listen: "127.0.0.1:8080"
+  public_base_url: "http://127.0.0.1:8080"
+upstreams:
+  npm:
+    registry_url: "https://registry.npmjs.org"
+  pypi:
+    simple_url: "https://pypi.org/simple"
+    files_url: "https://files.pythonhosted.org"
+policy:
+  minimum_age: "72h"
+  missing_publish_time: "block"
+  malicious:
+    mode: "naive"
+    only_mal_ids: true
+    osv_api_url: "https://api.osv.dev"
+    on_osv_error: "block"
+metadata_cache:
+  enabled: false
+artifacts:
+  behavior: "redirect"
+```
+
+Unsupported modes fail config validation. In this phase, `policy.malicious.mode`
+must be `naive`, `metadata_cache.enabled` must be `false`, and
+`artifacts.behavior` must be `redirect`.
+
+## Policy Behavior
+
+For every package version or file, `osv-proxy` evaluates:
+
+1. Exact-version allowlist.
+2. OSV malicious records, using only `MAL-*` IDs by default.
+3. Manual blocklist.
+4. Minimum package age.
+5. Missing publish time behavior.
+
+Blocked artifact requests return HTTP `403` with a structured JSON decision.
+Allowed artifact requests return HTTP `302` to the upstream tarball or file URL.
+
+## Development
+
+Run the test suite:
+
+```sh
+cargo test
+```
+
+Run the route-level end-to-end tests:
+
+```sh
+cargo test e2e
+```
+
+Format check:
+
+```sh
+cargo fmt --check
+```
+
+## More Documentation
+
+- [Policy model](docs/policy.md)
+- [Configuration reference](docs/configuration.md)
+- [Registry behavior](docs/registry-behavior.md)
+- [Client configuration](docs/client-configuration.md)
+- [Architecture notes](docs/architecture.md)
 - [Milestones](docs/milestones.md)
-- [Client Configuration](docs/client-configuration.md)
-
-Example deployment files:
-
-- [Mongolino-backed local store config](examples/mongolino/osv-proxy.yaml)
-- [Mongolino compose pattern](examples/mongolino/compose.yaml)
-
-## Implementation Status
-
-Phase one has a Rust single-crate implementation with YAML configuration validation, deterministic policy primitives, a trait-backed naive OSV checker, npm metadata filtering, PyPI Simple metadata filtering, and redirect-only artifact routes. Policy is checked while generating metadata and checked again before npm tarball or PyPI file redirects.
-
-Supported in phase one:
-
-- naive OSV malicious checks
-- npm metadata filtering and tarball redirects
-- PyPI Simple metadata filtering and file redirects
-- redirect artifact behavior only
-- no local malicious storage
-- no metadata cache
-
-```sh
-osv-proxy serve --config osv-proxy.yaml
-osv-proxy check npm:lodash@4.17.21 --config osv-proxy.yaml
-osv-proxy config validate --config osv-proxy.yaml
-```
-
-Local malicious storage, metadata caching, artifact proxying, S3 artifact caching, and `sync-malicious` are intentionally deferred.
