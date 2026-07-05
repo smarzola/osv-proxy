@@ -2,6 +2,7 @@ use crate::artifact::{Artifact, ArtifactHashes, Ecosystem};
 use crate::config::Config;
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
+use crate::response::RegistryResponse;
 use chrono::{DateTime, Utc};
 use reqwest::blocking::Client;
 use serde_json::{json, Map, Value};
@@ -42,30 +43,7 @@ impl NpmMetadataProvider for NpmRegistryClient {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NpmResponse {
-    pub status: u16,
-    pub headers: Vec<(String, String)>,
-    pub body: Vec<u8>,
-}
-
-impl NpmResponse {
-    pub fn json(status: u16, body: &Value) -> Result<Self, NpmError> {
-        Ok(Self {
-            status,
-            headers: vec![("content-type".to_string(), "application/json".to_string())],
-            body: serde_json::to_vec(body)?,
-        })
-    }
-
-    pub fn redirect(location: String) -> Self {
-        Self {
-            status: 302,
-            headers: vec![("location".to_string(), location)],
-            body: Vec::new(),
-        }
-    }
-}
+pub type NpmResponse = RegistryResponse;
 
 pub fn package_artifact(
     name: impl AsRef<str>,
@@ -84,7 +62,7 @@ pub fn metadata_response(
 ) -> Result<NpmResponse, NpmError> {
     let raw = upstream.fetch_package_metadata(package)?;
     let filtered = filter_metadata(config, checker, package, raw, now)?;
-    NpmResponse::json(200, &filtered)
+    Ok(NpmResponse::json(200, &filtered)?)
 }
 
 pub fn artifact_response(
@@ -108,7 +86,7 @@ pub fn artifact_response(
         Ok(NpmResponse::redirect(location))
     } else {
         let body = serde_json::to_value(decision)?;
-        NpmResponse::json(403, &body)
+        Ok(NpmResponse::json(403, &body)?)
     }
 }
 

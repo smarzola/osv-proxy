@@ -1,6 +1,8 @@
 use crate::config::Config;
 use crate::malicious::{MaliciousChecker, OsvHttpClient};
-use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient, NpmResponse};
+use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
+use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
+use crate::response::RegistryResponse;
 use chrono::{DateTime, Utc};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -46,10 +48,19 @@ fn handle_stream(config: &Config, stream: &mut TcpStream) -> anyhow::Result<()> 
     Ok(())
 }
 
-pub fn route_request(config: &Config, method: &str, path: &str) -> NpmResponse {
-    let upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
+pub fn route_request(config: &Config, method: &str, path: &str) -> RegistryResponse {
+    let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
+    let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
     let checker = OsvHttpClient::new(&config.policy.malicious.osv_api_url);
-    route_request_with_upstream(config, method, path, Utc::now(), &checker, &upstream)
+    route_request_with_upstreams(
+        config,
+        method,
+        path,
+        Utc::now(),
+        &checker,
+        &npm_upstream,
+        &pypi_upstream,
+    )
 }
 
 pub fn route_request_with_upstream(
@@ -59,25 +70,67 @@ pub fn route_request_with_upstream(
     now: DateTime<Utc>,
     checker: &dyn MaliciousChecker,
     upstream: &dyn NpmMetadataProvider,
-) -> NpmResponse {
+) -> RegistryResponse {
+    route_request_with_upstreams(
+        config,
+        method,
+        path,
+        now,
+        checker,
+        upstream,
+        &MissingPypiUpstream,
+    )
+}
+
+pub fn route_request_with_upstreams(
+    config: &Config,
+    method: &str,
+    path: &str,
+    now: DateTime<Utc>,
+    checker: &dyn MaliciousChecker,
+    npm_upstream: &dyn NpmMetadataProvider,
+    pypi_upstream: &dyn PypiSimpleProvider,
+) -> RegistryResponse {
     if method != "GET" {
         return simple_response(405, "method not allowed");
     }
 
     match parse_npm_route(path) {
         Some(NpmRoute::Metadata { package }) => {
-            npm::metadata_response(config, upstream, checker, &package, now)
+            npm::metadata_response(config, npm_upstream, checker, &package, now)
                 .unwrap_or_else(|err| npm::error_response(&err))
         }
         Some(NpmRoute::Artifact { package, tarball }) => {
-            npm::artifact_response(config, upstream, checker, &package, &tarball, now)
+            npm::artifact_response(config, npm_upstream, checker, &package, &tarball, now)
                 .unwrap_or_else(|err| npm::error_response(&err))
         }
-        None => simple_response(404, "not found"),
+        None => match parse_pypi_route(path) {
+            Some(PypiRoute::SimpleRoot) => pypi::simple_root_response(pypi_upstream)
+                .unwrap_or_else(|err| pypi::error_response(&err)),
+            Some(PypiRoute::SimpleProject { project }) => {
+                pypi::simple_project_response(config, pypi_upstream, checker, &project, now)
+                    .unwrap_or_else(|err| pypi::error_response(&err))
+            }
+            Some(PypiRoute::Artifact {
+                project,
+                version,
+                filename,
+            }) => pypi::artifact_response(
+                config,
+                pypi_upstream,
+                checker,
+                &project,
+                &version,
+                &filename,
+                now,
+            )
+            .unwrap_or_else(|err| pypi::error_response(&err)),
+            None => simple_response(404, "not found"),
+        },
     }
 }
 
-fn write_response(stream: &mut TcpStream, response: NpmResponse) -> std::io::Result<()> {
+fn write_response(stream: &mut TcpStream, response: RegistryResponse) -> std::io::Result<()> {
     let reason = match response.status {
         200 => "OK",
         302 => "Found",
@@ -98,15 +151,79 @@ fn write_response(stream: &mut TcpStream, response: NpmResponse) -> std::io::Res
     Ok(())
 }
 
-fn simple_response(status: u16, message: &str) -> NpmResponse {
+fn simple_response(status: u16, message: &str) -> RegistryResponse {
     let body = serde_json::json!({ "message": message });
-    NpmResponse::json(status, &body).expect("static server response should serialize")
+    RegistryResponse::json(status, &body).expect("static server response should serialize")
+}
+
+struct MissingPypiUpstream;
+
+impl PypiSimpleProvider for MissingPypiUpstream {
+    fn fetch_simple_root(&self) -> Result<String, pypi::PypiError> {
+        Err(pypi::PypiError::InvalidSimpleHtml(
+            "PyPI upstream was not provided".to_string(),
+        ))
+    }
+
+    fn fetch_project_simple(&self, _project: &str) -> Result<String, pypi::PypiError> {
+        Err(pypi::PypiError::InvalidSimpleHtml(
+            "PyPI upstream was not provided".to_string(),
+        ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NpmRoute {
     Metadata { package: String },
     Artifact { package: String, tarball: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PypiRoute {
+    SimpleRoot,
+    SimpleProject {
+        project: String,
+    },
+    Artifact {
+        project: String,
+        version: String,
+        filename: String,
+    },
+}
+
+fn parse_pypi_route(path: &str) -> Option<PypiRoute> {
+    let path_without_query = path.split('?').next().unwrap_or(path);
+    if path_without_query == "/pypi/simple/" || path_without_query == "/pypi/simple" {
+        return Some(PypiRoute::SimpleRoot);
+    }
+
+    if let Some(rest) = path_without_query.strip_prefix("/pypi/simple/") {
+        let project = rest.trim_end_matches('/');
+        if !project.is_empty() && !project.contains('/') {
+            let project = percent_decode_segment(project)?;
+            return Some(PypiRoute::SimpleProject {
+                project: crate::artifact::normalize_pypi_name(&project),
+            });
+        }
+    }
+
+    let rest = path_without_query.strip_prefix("/pypi/packages/")?;
+    let segments = rest
+        .split('/')
+        .map(percent_decode_segment)
+        .collect::<Option<Vec<_>>>()?;
+    match segments.as_slice() {
+        [project, version, filename]
+            if !project.is_empty() && !version.is_empty() && !filename.is_empty() =>
+        {
+            Some(PypiRoute::Artifact {
+                project: crate::artifact::normalize_pypi_name(project),
+                version: version.to_string(),
+                filename: filename.to_string(),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn parse_npm_route(path: &str) -> Option<NpmRoute> {
@@ -196,6 +313,36 @@ mod tests {
         }
     }
 
+    struct StaticPypiUpstream {
+        root: String,
+        projects: HashMap<String, String>,
+    }
+
+    impl StaticPypiUpstream {
+        fn with(project: &str, html: &str) -> Self {
+            Self {
+                root: "<html><body><a href=\"demo/\">demo</a></body></html>".to_string(),
+                projects: HashMap::from([(
+                    crate::artifact::normalize_pypi_name(project),
+                    html.to_string(),
+                )]),
+            }
+        }
+    }
+
+    impl PypiSimpleProvider for StaticPypiUpstream {
+        fn fetch_simple_root(&self) -> Result<String, pypi::PypiError> {
+            Ok(self.root.clone())
+        }
+
+        fn fetch_project_simple(&self, project: &str) -> Result<String, pypi::PypiError> {
+            self.projects
+                .get(&crate::artifact::normalize_pypi_name(project))
+                .cloned()
+                .ok_or_else(|| pypi::PypiError::InvalidSimpleHtml(format!("missing {project}")))
+        }
+    }
+
     struct CleanChecker;
 
     impl MaliciousChecker for CleanChecker {
@@ -246,6 +393,28 @@ mod tests {
             parse_npm_route("/npm/@babel%2Fcore?write=true"),
             Some(NpmRoute::Metadata {
                 package: "@babel/core".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_documented_pypi_routes() {
+        assert_eq!(
+            parse_pypi_route("/pypi/simple/"),
+            Some(PypiRoute::SimpleRoot)
+        );
+        assert_eq!(
+            parse_pypi_route("/pypi/simple/My_Package.Name/"),
+            Some(PypiRoute::SimpleProject {
+                project: "my-package-name".to_string()
+            })
+        );
+        assert_eq!(
+            parse_pypi_route("/pypi/packages/My_Package.Name/1.0.0/demo-1.0.0.tar.gz"),
+            Some(PypiRoute::Artifact {
+                project: "my-package-name".to_string(),
+                version: "1.0.0".to_string(),
+                filename: "demo-1.0.0.tar.gz".to_string()
             })
         );
     }
@@ -323,6 +492,65 @@ mod tests {
             vec![(
                 "location".to_string(),
                 "https://registry.example/@babel/core/-/core-7.24.0.tgz".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn routes_pypi_simple_project_with_mocked_upstream() {
+        let config = Config::default();
+        let npm_upstream = StaticUpstream::with("unused", json!({}));
+        let pypi_upstream = StaticPypiUpstream::with(
+            "demo",
+            r#"<html><body>
+<a href="https://files.example/demo-1.0.0.tar.gz#sha256=abc" data-upload-time="2026-06-01T00:00:00Z">demo-1.0.0.tar.gz</a>
+</body></html>"#,
+        );
+
+        let response = route_request_with_upstreams(
+            &config,
+            "GET",
+            "/pypi/simple/Demo/",
+            now(),
+            &CleanChecker,
+            &npm_upstream,
+            &pypi_upstream,
+        );
+        let body = String::from_utf8(response.body).unwrap();
+
+        assert_eq!(response.status, 200);
+        assert!(body.contains(
+            "http://127.0.0.1:8080/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz#sha256=abc"
+        ));
+    }
+
+    #[test]
+    fn routes_pypi_artifact_with_mocked_upstream() {
+        let config = Config::default();
+        let npm_upstream = StaticUpstream::with("unused", json!({}));
+        let pypi_upstream = StaticPypiUpstream::with(
+            "demo",
+            r#"<html><body>
+<a href="https://files.example/demo-1.0.0.tar.gz#sha256=abc" data-upload-time="2026-06-01T00:00:00Z">demo-1.0.0.tar.gz</a>
+</body></html>"#,
+        );
+
+        let response = route_request_with_upstreams(
+            &config,
+            "GET",
+            "/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz",
+            now(),
+            &CleanChecker,
+            &npm_upstream,
+            &pypi_upstream,
+        );
+
+        assert_eq!(response.status, 302);
+        assert_eq!(
+            response.headers,
+            vec![(
+                "location".to_string(),
+                "https://files.example/demo-1.0.0.tar.gz".to_string()
             )]
         );
     }
