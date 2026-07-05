@@ -41,6 +41,20 @@ Not implemented yet:
 
 ## Install
 
+Download a prebuilt binary from the
+[GitHub releases](https://github.com/smarzola/osv-proxy/releases) page.
+
+Release archives are named by version and target:
+
+```text
+osv-proxy-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
+osv-proxy-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz
+osv-proxy-vX.Y.Z-x86_64-apple-darwin.tar.gz
+osv-proxy-vX.Y.Z-aarch64-apple-darwin.tar.gz
+```
+
+Each release also includes `SHA256SUMS`.
+
 Build from source:
 
 ```sh
