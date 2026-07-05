@@ -61,10 +61,10 @@ Build from source:
 cargo build --release
 ```
 
-Run the binary with Cargo during development:
+Run the binary:
 
 ```sh
-cargo run -- config validate --config examples/basic/osv-proxy.yaml
+osv-proxy config validate --config examples/basic/osv-proxy.yaml
 ```
 
 ## Quick Start
@@ -72,13 +72,13 @@ cargo run -- config validate --config examples/basic/osv-proxy.yaml
 Validate the example config:
 
 ```sh
-cargo run -- config validate --config examples/basic/osv-proxy.yaml
+osv-proxy config validate --config examples/basic/osv-proxy.yaml
 ```
 
 Start the proxy:
 
 ```sh
-cargo run -- serve --config examples/basic/osv-proxy.yaml
+osv-proxy serve --config examples/basic/osv-proxy.yaml
 ```
 
 Point npm at the proxy:
@@ -105,7 +105,7 @@ uv pip install --index-url http://127.0.0.1:8080/pypi/simple/ requests
 context used by proxy routes, evaluates policy, and prints structured JSON:
 
 ```sh
-cargo run -- check npm:lodash@4.17.21 \
+osv-proxy check npm:lodash@4.17.21 \
   --config examples/basic/osv-proxy.yaml
 ```
 
@@ -113,7 +113,7 @@ PyPI checks evaluate every file published for the requested version and allow
 the package only when every file is allowed:
 
 ```sh
-cargo run -- check pypi:requests@2.32.3 \
+osv-proxy check pypi:requests@2.32.3 \
   --config examples/basic/osv-proxy.yaml
 ```
 
@@ -133,7 +133,7 @@ proxy-equivalent and only evaluates the artifact fields supplied on the command
 line:
 
 ```sh
-cargo run -- eval npm:lodash@4.17.21 \
+osv-proxy eval npm:lodash@4.17.21 \
   --config examples/basic/osv-proxy.yaml \
   --published-at 2026-06-01T00:00:00Z
 ```
