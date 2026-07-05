@@ -3,50 +3,74 @@ use crate::malicious::{MaliciousChecker, OsvHttpClient};
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
 use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
 use crate::response::RegistryResponse;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri};
+use axum::routing::any;
+use axum::Router;
 use chrono::{DateTime, Utc};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tower_http::timeout::TimeoutLayer;
 
-pub fn serve(config: &Config) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(&config.server.listen)?;
+const REQUEST_BODY_LIMIT_BYTES: usize = 8192;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub async fn serve(config: Config) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(&config.server.listen).await?;
     println!(
         "serving phase-one redirect proxy on {}",
         listener.local_addr()?
     );
+    serve_listener(listener, config).await
+}
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(mut stream) => {
-                if let Err(err) = handle_stream(config, &mut stream) {
-                    eprintln!("request handling failed: {err}");
-                }
-            }
-            Err(err) => eprintln!("connection failed: {err}"),
-        }
-    }
-
+pub async fn serve_listener(listener: TcpListener, config: Config) -> anyhow::Result<()> {
+    axum::serve(listener, router(config)).await?;
     Ok(())
 }
 
-fn handle_stream(config: &Config, stream: &mut TcpStream) -> anyhow::Result<()> {
-    let mut buffer = [0_u8; 8192];
-    let bytes_read = stream.read(&mut buffer)?;
-    if bytes_read == 0 {
-        return Ok(());
-    }
+pub fn router(config: Config) -> Router {
+    Router::new()
+        .fallback(any(registry_handler))
+        .with_state(Arc::new(config))
+        .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ))
+}
 
-    let request = String::from_utf8_lossy(&buffer[..bytes_read]);
-    let mut parts = request
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let path = parts.next().unwrap_or_default();
-    let accept = header_value(&request, "accept");
-    let response = route_request_with_accept(config, method, path, accept.as_deref());
-    write_response(stream, response)?;
-    Ok(())
+async fn registry_handler(
+    State(config): State<Arc<Config>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let method = method.as_str().to_string();
+    let path = uri
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or_else(|| uri.path())
+        .to_string();
+    let accept = headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+
+    let response = tokio::task::spawn_blocking(move || {
+        route_request_with_accept(&config, &method, &path, accept.as_deref())
+    })
+    .await
+    .unwrap_or_else(|err| {
+        simple_response(
+            500,
+            &format!("request handling task failed before completion: {err}"),
+        )
+    });
+
+    registry_response_into_http(response)
 }
 
 pub fn route_request(config: &Config, method: &str, path: &str) -> RegistryResponse {
@@ -185,25 +209,23 @@ fn route_request_with_dependencies(
     }
 }
 
-fn write_response(stream: &mut TcpStream, response: RegistryResponse) -> std::io::Result<()> {
-    let reason = match response.status {
-        200 => "OK",
-        302 => "Found",
-        403 => "Forbidden",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        _ => "OK",
-    };
-    write!(stream, "HTTP/1.1 {} {}\r\n", response.status, reason)?;
-    write!(stream, "content-length: {}\r\n", response.body.len())?;
+fn registry_response_into_http(response: RegistryResponse) -> Response<Body> {
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
+    let mut builder = Response::builder().status(status);
+    let headers = builder
+        .headers_mut()
+        .expect("headers are available before response body is built");
     for (name, value) in response.headers {
-        write!(stream, "{name}: {value}\r\n")?;
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(&value),
+        ) {
+            headers.insert(name, value);
+        }
     }
-    write!(stream, "connection: close\r\n\r\n")?;
-    stream.write_all(&response.body)?;
-    Ok(())
+    builder
+        .body(Body::from(response.body))
+        .expect("registry response should convert to HTTP response")
 }
 
 fn simple_response(status: u16, message: &str) -> RegistryResponse {
@@ -227,6 +249,7 @@ impl PypiSimpleProvider for MissingPypiUpstream {
     }
 }
 
+#[cfg(test)]
 fn header_value(request: &str, name: &str) -> Option<String> {
     request.lines().skip(1).find_map(|line| {
         let (header_name, value) = line.split_once(':')?;
@@ -360,6 +383,8 @@ mod tests {
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::collections::HashMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tower::ServiceExt;
 
     struct StaticUpstream {
         metadata: HashMap<String, Value>,
@@ -1029,6 +1054,49 @@ mod tests {
             header_value(request, "accept").as_deref(),
             Some("application/vnd.pypi.simple.v1+json")
         );
+    }
+
+    #[tokio::test]
+    async fn router_returns_405_without_binding_live_port() {
+        let response = router(Config::default())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/npm/lodash")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn idle_connection_does_not_block_unrelated_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            serve_listener(listener, Config::default()).await.unwrap();
+        });
+
+        let _idle_connection = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(b"GET /missing HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            response
+        })
+        .await
+        .unwrap();
+
+        server.abort();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
     }
 
     #[test]

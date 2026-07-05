@@ -46,16 +46,16 @@ pub enum ConfigCommand {
     },
 }
 
-pub fn run() -> anyhow::Result<()> {
-    execute(Cli::parse())
+pub async fn run() -> anyhow::Result<()> {
+    execute(Cli::parse()).await
 }
 
-pub fn execute(cli: Cli) -> anyhow::Result<()> {
+pub async fn execute(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { config } => {
             let config = Config::load(&config)
                 .with_context(|| format!("config validation failed for {}", config.display()))?;
-            server::serve(&config)
+            server::serve(config).await
         }
         Command::Check {
             package,

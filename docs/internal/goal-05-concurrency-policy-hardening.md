@@ -68,7 +68,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
 - [x] Milestone 0: Baseline and async design lock
-- [ ] Milestone 1: Tokio HTTP server and request timeouts
+- [x] Milestone 1: Tokio HTTP server and request timeouts
 - [ ] Milestone 2: Nonblocking upstream clients and bounded malicious checks
 - [ ] Milestone 3: npm artifact basename enforcement
 - [ ] Milestone 4: Strict config validation
@@ -92,7 +92,7 @@ Status note - 2026-07-05:
   - npm, PyPI, and OSV clients will become nonblocking `reqwest::Client` instances with explicit connect/request timeouts in Milestone 2. Adapter traits will remain injectable so tests can use fake providers/checkers without live npm, PyPI, or OSV calls.
   - Server concurrency will be tested with a local bound listener by opening an idle or slow TCP connection, then proving a normal HTTP request still completes on another connection.
   - Metadata filtering will use a request-local batch or bounded-concurrency malicious-check path in Milestone 2. No in-process metadata cache, local malicious store, proxy streaming, S3, MongoDB, or cachebox integration will be added.
-- Commit: pending.
+- Commit: `ca6815a`.
 
 Problem:
 
@@ -129,6 +129,19 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 1: Tokio HTTP Server and Request Timeouts
+
+Status note - 2026-07-05:
+
+- Implemented `serve --config <path>` on a Tokio runtime with an Axum catch-all router, a Tokio listener, an 8 KiB default request body limit, and a 15 second Tower HTTP request timeout.
+- Preserved the existing deterministic route/policy behavior by keeping the route functions injectable for tests and adapting the live HTTP handler around them.
+- Added route verification through `Router::oneshot` without binding a live port for the non-GET 405 path.
+- Added a local-listener concurrency test that holds one idle TCP connection open and proves a second normal request returns `404 Not Found` instead of blocking behind the idle client.
+- Verification:
+  - `cargo test server` failed in the sandbox only at `TcpListener::bind("127.0.0.1:0")` with `Operation not permitted`.
+  - `cargo test server` passed outside the sandbox: 17 server-filtered tests passed.
+  - `cargo test e2e` passed outside the sandbox: 4 e2e-filtered library tests passed.
+  - `cargo fmt --check` passed.
+- Commit: pending.
 
 Problem:
 
