@@ -87,20 +87,30 @@ impl<'a> PolicyEngine<'a> {
                         );
                     }
                 }
-                Some(Err(err))
-                    if self.config.policy.malicious.on_osv_error == OsvErrorBehavior::Block =>
-                {
-                    return blocked(
-                        DecisionReason::Malicious,
-                        artifact,
-                        format!("Blocked because OSV malicious check failed: {err}"),
-                        None,
-                        Some("osv".to_string()),
-                        None,
-                    );
+                Some(Err(err)) => {
+                    if self.config.policy.malicious.on_osv_error == OsvErrorBehavior::Block {
+                        return blocked(
+                            DecisionReason::Malicious,
+                            artifact,
+                            format!("Blocked because OSV malicious check failed: {err}"),
+                            None,
+                            Some("osv".to_string()),
+                            None,
+                        );
+                    }
                 }
-                Some(Err(_)) => {}
-                None => {}
+                None => {
+                    if self.config.policy.malicious.on_osv_error == OsvErrorBehavior::Block {
+                        return blocked(
+                            DecisionReason::Malicious,
+                            artifact,
+                            "Blocked because OSV malicious check result was missing".to_string(),
+                            None,
+                            Some("osv".to_string()),
+                            None,
+                        );
+                    }
+                }
             }
         }
 
@@ -441,6 +451,19 @@ mod tests {
             .await;
         assert!(!decision.allowed);
         assert_eq!(decision.reason, DecisionReason::Malicious);
+    }
+
+    #[test]
+    fn missing_malicious_result_blocks_non_bypassed_artifact_by_default() {
+        let config = Config::default();
+        let decision =
+            PolicyEngine::new(&config).evaluate_with_malicious_result(&old_artifact(), now(), None);
+
+        assert!(!decision.allowed);
+        assert_eq!(decision.reason, DecisionReason::Malicious);
+        assert!(decision
+            .message
+            .contains("malicious check result was missing"));
     }
 
     #[tokio::test]

@@ -213,10 +213,19 @@ async fn filter_simple_project(
     let malicious_results = if checked_artifacts.is_empty() {
         Ok(Vec::new())
     } else {
-        checker
+        match checker
             .check_many(&checked_artifacts)
             .await
             .map_err(|err| err.to_string())
+        {
+            Ok(results) if results.len() == checked_artifacts.len() => Ok(results),
+            Ok(results) => Err(format!(
+                "malicious batch returned {} results for {} artifacts",
+                results.len(),
+                checked_artifacts.len()
+            )),
+            Err(err) => Err(err),
+        }
     };
 
     for (index, mut file) in simple.files.into_iter().enumerate() {
@@ -226,7 +235,12 @@ async fn filter_simple_project(
             .position(|(artifact_index, _)| *artifact_index == index)
         {
             match &malicious_results {
-                Ok(results) => Some(Ok(results.get(batch_index).cloned().unwrap_or_default())),
+                Ok(results) => results.get(batch_index).cloned().map(Ok).or_else(|| {
+                    Some(Err(format!(
+                        "malicious batch result missing for {}",
+                        artifact.identity()
+                    )))
+                }),
                 Err(err) => Some(Err(err.clone())),
             }
         } else {
@@ -648,6 +662,22 @@ mod tests {
         }
     }
 
+    struct ShortBatchChecker;
+
+    #[async_trait]
+    impl MaliciousChecker for ShortBatchChecker {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            Ok(Vec::new())
+        }
+
+        async fn check_many(
+            &self,
+            artifacts: &[Artifact],
+        ) -> Result<Vec<Vec<MaliciousHit>>, MaliciousError> {
+            Ok(vec![Vec::new(); artifacts.len().saturating_sub(1)])
+        }
+    }
+
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-05T12:00:00Z")
             .unwrap()
@@ -802,6 +832,44 @@ mod tests {
         assert_eq!(checker.batch_calls.load(Ordering::SeqCst), 1);
         assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
         assert_eq!(checker.batch_identities(), vec!["pypi:demo@1.0.0"]);
+    }
+
+    #[tokio::test]
+    async fn pypi_simple_json_short_malicious_batch_results_fail_closed() {
+        let config = Config::default();
+        let simple = SimpleProject {
+            meta: BTreeMap::from([("api-version".to_string(), json!("1.1"))]),
+            name: "demo".to_string(),
+            versions: vec!["1.0.0".to_string(), "1.0.1".to_string()],
+            files: vec![
+                file(
+                    "demo-1.0.0.tar.gz",
+                    "https://files.example/packages/demo-1.0.0.tar.gz",
+                    Some(old_time()),
+                ),
+                file(
+                    "demo-1.0.1.tar.gz",
+                    "https://files.example/packages/demo-1.0.1.tar.gz",
+                    Some(old_time()),
+                ),
+            ],
+        };
+        let upstream = StaticSimple::new("demo", simple);
+
+        let response = simple_project_response_for_accept(
+            &config,
+            &upstream,
+            &ShortBatchChecker,
+            "demo",
+            now(),
+            Some(SIMPLE_JSON_CONTENT_TYPE),
+        )
+        .await
+        .unwrap();
+        let body: SimpleProject = serde_json::from_slice(&response.body).unwrap();
+
+        assert!(body.files.is_empty());
+        assert!(body.versions.is_empty());
     }
 
     #[tokio::test]

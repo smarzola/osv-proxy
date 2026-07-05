@@ -164,10 +164,19 @@ async fn filter_metadata(
     let malicious_results = if checked_artifacts.is_empty() {
         Ok(Vec::new())
     } else {
-        checker
+        match checker
             .check_many(&checked_artifacts)
             .await
             .map_err(|err| err.to_string())
+        {
+            Ok(results) if results.len() == checked_artifacts.len() => Ok(results),
+            Ok(results) => Err(format!(
+                "malicious batch returned {} results for {} artifacts",
+                results.len(),
+                checked_artifacts.len()
+            )),
+            Err(err) => Err(err),
+        }
     };
 
     for (index, version) in version_names.iter().enumerate() {
@@ -186,7 +195,12 @@ async fn filter_metadata(
             .position(|(artifact_index, _)| *artifact_index == index)
         {
             match &malicious_results {
-                Ok(results) => Some(Ok(results.get(batch_index).cloned().unwrap_or_default())),
+                Ok(results) => results.get(batch_index).cloned().map(Ok).or_else(|| {
+                    Some(Err(format!(
+                        "malicious batch result missing for {}",
+                        artifact.identity()
+                    )))
+                }),
                 Err(err) => Some(Err(err.clone())),
             }
         } else {
@@ -456,6 +470,22 @@ mod tests {
         }
     }
 
+    struct ShortBatchChecker;
+
+    #[async_trait]
+    impl MaliciousChecker for ShortBatchChecker {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            Ok(Vec::new())
+        }
+
+        async fn check_many(
+            &self,
+            artifacts: &[Artifact],
+        ) -> Result<Vec<Vec<MaliciousHit>>, MaliciousError> {
+            Ok(vec![Vec::new(); artifacts.len().saturating_sub(1)])
+        }
+    }
+
     fn now() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-07-05T12:00:00Z")
             .unwrap()
@@ -592,6 +622,47 @@ mod tests {
         assert_eq!(checker.batch_calls.load(Ordering::SeqCst), 1);
         assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
         assert_eq!(checker.batch_identities(), vec!["npm:demo@1.0.0"]);
+    }
+
+    #[tokio::test]
+    async fn npm_metadata_short_malicious_batch_results_fail_closed() {
+        let config = Config::default();
+        let metadata = json!({
+            "name": "demo",
+            "dist-tags": {
+                "latest": "1.0.1",
+                "stable": "1.0.0"
+            },
+            "time": {
+                "1.0.0": "2026-06-01T00:00:00Z",
+                "1.0.1": "2026-06-01T00:00:00Z"
+            },
+            "versions": {
+                "1.0.0": {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://registry.example/demo/-/demo-1.0.0.tgz"
+                    }
+                },
+                "1.0.1": {
+                    "name": "demo",
+                    "version": "1.0.1",
+                    "dist": {
+                        "tarball": "https://registry.example/demo/-/demo-1.0.1.tgz"
+                    }
+                }
+            }
+        });
+        let upstream = StaticUpstream::new("demo", metadata);
+
+        let response = metadata_response(&config, &upstream, &ShortBatchChecker, "demo", now())
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert!(body["versions"].as_object().unwrap().is_empty());
+        assert_eq!(body["dist-tags"], json!({}));
     }
 
     #[tokio::test]
