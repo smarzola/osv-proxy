@@ -78,6 +78,15 @@ pub async fn metadata_response(
     Ok(NpmResponse::json(200, &filtered)?)
 }
 
+pub async fn lookup_artifact(
+    upstream: &dyn NpmMetadataProvider,
+    package: &str,
+    version: &str,
+) -> Result<Artifact, NpmError> {
+    let metadata = upstream.fetch_package_metadata(package).await?;
+    artifact_from_package_metadata(package, version, &metadata)
+}
+
 pub async fn artifact_response(
     config: &Config,
     upstream: &dyn NpmMetadataProvider,
@@ -249,20 +258,7 @@ fn artifact_from_metadata(
     tarball: &str,
     metadata: &Value,
 ) -> Result<Artifact, NpmError> {
-    let versions = metadata
-        .get("versions")
-        .and_then(Value::as_object)
-        .ok_or_else(|| NpmError::InvalidMetadata("metadata.versions must be an object".into()))?;
-    let version_metadata = versions
-        .get(version)
-        .ok_or_else(|| NpmError::VersionNotFound(package.to_string(), version.to_string()))?;
-    let published_at = metadata
-        .get("time")
-        .and_then(|time| time.get(version))
-        .and_then(Value::as_str)
-        .and_then(parse_npm_time);
-    let mut artifact =
-        artifact_from_version_metadata(package, version, version_metadata, published_at);
+    let mut artifact = artifact_from_package_metadata(package, version, metadata)?;
     let expected_tarball = artifact
         .filename
         .clone()
@@ -276,6 +272,33 @@ fn artifact_from_metadata(
         });
     }
     artifact.filename = Some(tarball.to_string());
+    Ok(artifact)
+}
+
+fn artifact_from_package_metadata(
+    package: &str,
+    version: &str,
+    metadata: &Value,
+) -> Result<Artifact, NpmError> {
+    let versions = metadata
+        .get("versions")
+        .and_then(Value::as_object)
+        .ok_or_else(|| NpmError::InvalidMetadata("metadata.versions must be an object".into()))?;
+    let version_metadata = versions
+        .get(version)
+        .ok_or_else(|| NpmError::VersionNotFound(package.to_string(), version.to_string()))?;
+    let published_at = metadata
+        .get("time")
+        .and_then(|time| time.get(version))
+        .and_then(Value::as_str)
+        .and_then(parse_npm_time);
+    let artifact = artifact_from_version_metadata(package, version, version_metadata, published_at);
+    if artifact.upstream_url.is_none() || artifact.filename.is_none() {
+        return Err(NpmError::MissingTarballUrl(
+            package.to_string(),
+            version.to_string(),
+        ));
+    }
     Ok(artifact)
 }
 
@@ -531,6 +554,41 @@ mod tests {
                 }
             }
         })
+    }
+
+    #[tokio::test]
+    async fn lookup_artifact_returns_registry_metadata_artifact() {
+        let upstream = StaticUpstream::new("demo", metadata_fixture());
+
+        let artifact = lookup_artifact(&upstream, "demo", "1.0.0").await.unwrap();
+
+        assert_eq!(artifact.identity(), "npm:demo@1.0.0");
+        assert_eq!(artifact.filename.as_deref(), Some("demo-1.0.0.tgz"));
+        assert_eq!(
+            artifact.upstream_url.as_deref(),
+            Some("https://registry.example/demo/-/demo-1.0.0.tgz")
+        );
+        assert_eq!(artifact.hashes.integrity.as_deref(), Some("sha512-allowed"));
+        assert_eq!(artifact.hashes.sha512.as_deref(), Some("allowed"));
+        assert_eq!(
+            artifact.published_at,
+            DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+                .into()
+        );
+    }
+
+    #[tokio::test]
+    async fn lookup_artifact_fails_when_version_is_missing() {
+        let upstream = StaticUpstream::new("demo", metadata_fixture());
+
+        let err = lookup_artifact(&upstream, "demo", "9.9.9")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, NpmError::VersionNotFound(package, version)
+            if package == "demo" && version == "9.9.9"));
     }
 
     #[tokio::test]

@@ -64,7 +64,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next milestone.
 
 - [x] Milestone 0: Baseline and command contract
-- [ ] Milestone 1: Adapter artifact lookup APIs
+- [x] Milestone 1: Adapter artifact lookup APIs
 - [ ] Milestone 2: Registry-backed CLI check orchestration
 - [ ] Milestone 3: Tests and docs for truthful check
 - [ ] Milestone 4: Final regression and adversarial audit
@@ -149,6 +149,15 @@ cargo fmt --check
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note, 2026-07-06:
+
+- Added adapter lookup contract: npm exposes one registry-derived tarball artifact for a requested package version; PyPI exposes all registry-derived files for a requested project version and callers must evaluate/report each file rather than collapsing them into one artifact.
+- Verification run:
+  - `cargo test npm`: sandbox run passed 24 matching unit/server tests, then selected `npm_install_uses_proxy_for_allowed_and_blocked_versions` and failed with `Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }`; rerun outside sandbox passed all 24 matching unit/server tests plus the npm e2e test.
+  - `cargo test pypi`: passed, 23 matching tests.
+  - `cargo fmt --check`: passed after `cargo fmt`.
+- Commit: pending.
 
 ## Milestone 2: Registry-Backed CLI Check Orchestration
 

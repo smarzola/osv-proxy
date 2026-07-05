@@ -101,6 +101,17 @@ pub async fn simple_project_response(
     simple_project_response_for_accept(config, upstream, checker, project, now, None).await
 }
 
+pub async fn lookup_artifacts(
+    config: &Config,
+    upstream: &dyn PypiSimpleProvider,
+    project: &str,
+    version: &str,
+) -> Result<Vec<Artifact>, PypiError> {
+    let project = normalize_pypi_name(project);
+    let raw = upstream.fetch_project_json(&project).await?;
+    artifacts_for_version(config, &project, version, &raw)
+}
+
 pub async fn simple_project_response_for_accept(
     config: &Config,
     upstream: &dyn PypiSimpleProvider,
@@ -168,7 +179,9 @@ pub async fn artifact_response(
 
 pub fn error_response(error: &PypiError) -> RegistryResponse {
     let status = match error {
-        PypiError::FileNotFound(_, _, _) | PypiError::InvalidFilename(_) => 404,
+        PypiError::FileNotFound(_, _, _)
+        | PypiError::VersionNotFound(_, _)
+        | PypiError::InvalidFilename(_) => 404,
         PypiError::Upstream(_) => 502,
         PypiError::Json(_) | PypiError::InvalidSimpleJson(_) | PypiError::MissingFileUrl(_) => 500,
     };
@@ -276,6 +289,29 @@ fn artifact_from_file(
     artifact.upstream_url = Some(resolve_simple_href(config, project, &file.url));
     artifact.hashes = hashes_from_file(file);
     Ok(artifact)
+}
+
+fn artifacts_for_version(
+    config: &Config,
+    project: &str,
+    version: &str,
+    simple: &SimpleProject,
+) -> Result<Vec<Artifact>, PypiError> {
+    let artifacts = simple
+        .files
+        .iter()
+        .map(|file| artifact_from_file(config, project, file))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|artifact| artifact.version == version)
+        .collect::<Vec<_>>();
+    if artifacts.is_empty() {
+        return Err(PypiError::VersionNotFound(
+            project.to_string(),
+            version.to_string(),
+        ));
+    }
+    Ok(artifacts)
 }
 
 fn hashes_from_file(file: &SimpleFile) -> ArtifactHashes {
@@ -580,6 +616,8 @@ pub enum PypiError {
     MissingFileUrl(String),
     #[error("PyPI file not found for {0}@{1}: {2}")]
     FileNotFound(String, String, String),
+    #[error("PyPI version not found for {0}@{1}")]
+    VersionNotFound(String, String),
 }
 
 #[cfg(test)]
@@ -733,6 +771,68 @@ mod tests {
                 ),
             ],
         }
+    }
+
+    #[tokio::test]
+    async fn lookup_artifacts_returns_all_registry_files_for_version() {
+        let mut config = Config::default();
+        config.upstreams.pypi.simple_url = "https://pypi.example/simple".to_string();
+        let simple = SimpleProject {
+            meta: BTreeMap::from([("api-version".to_string(), json!("1.1"))]),
+            name: "Demo".to_string(),
+            versions: vec!["1.0.0".to_string()],
+            files: vec![
+                file(
+                    "demo-1.0.0.tar.gz",
+                    "https://files.example/packages/demo-1.0.0.tar.gz",
+                    Some(old_time()),
+                ),
+                file(
+                    "demo-1.0.0-py3-none-any.whl",
+                    "../../packages/demo-1.0.0-py3-none-any.whl",
+                    Some(old_time()),
+                ),
+            ],
+        };
+        let upstream = StaticSimple::new("Demo", simple);
+
+        let artifacts = lookup_artifacts(&config, &upstream, "Demo", "1.0.0")
+            .await
+            .unwrap();
+
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0].identity(), "pypi:demo@1.0.0");
+        assert_eq!(artifacts[0].filename.as_deref(), Some("demo-1.0.0.tar.gz"));
+        assert_eq!(
+            artifacts[0].upstream_url.as_deref(),
+            Some("https://files.example/packages/demo-1.0.0.tar.gz")
+        );
+        assert_eq!(
+            artifacts[0].hashes.sha256.as_deref(),
+            Some("hash-demo-1.0.0.tar.gz")
+        );
+        assert_eq!(
+            artifacts[1].filename.as_deref(),
+            Some("demo-1.0.0-py3-none-any.whl")
+        );
+        assert_eq!(
+            artifacts[1].upstream_url.as_deref(),
+            Some("https://pypi.example/packages/demo-1.0.0-py3-none-any.whl")
+        );
+        assert_eq!(artifacts[1].published_at, Some(old_time()));
+    }
+
+    #[tokio::test]
+    async fn lookup_artifacts_fails_when_version_is_missing() {
+        let config = Config::default();
+        let upstream = StaticSimple::new("Demo", simple_fixture());
+
+        let err = lookup_artifacts(&config, &upstream, "Demo", "9.9.9")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, PypiError::VersionNotFound(project, version)
+            if project == "demo" && version == "9.9.9"));
     }
 
     #[tokio::test]
