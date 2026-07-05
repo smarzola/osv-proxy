@@ -44,7 +44,7 @@ This worker may receive the repo after the core scaffold exists. If core files a
 - [x] PyPI file redirect gate
 - [x] PyPI adapter tests
 
-Status note, 2026-07-05: Implemented phase-one PyPI Simple route dispatch, Simple HTML filtering/link rewriting, and artifact redirect policy gates with mocked upstream tests. Verification commands run: `cargo fmt`; `cargo test pypi`; `cargo test pypi_simple`; `cargo test pypi_artifact`; `cargo test`. Commit: this status note is included in the implementation commit.
+Status note, 2026-07-05: Implemented phase-one PyPI Simple route dispatch, Simple HTML filtering/link rewriting, and artifact redirect policy gates with mocked upstream tests. Verification commands run: `cargo fmt`; `cargo test pypi`; `cargo test pypi_simple`; `cargo test pypi_artifact`; `cargo test`. Commit: 1c6992c.
 
 ## Checkpoint Protocol
 

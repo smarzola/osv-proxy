@@ -425,6 +425,18 @@ artifacts:
     }
 
     #[test]
+    fn rejects_proxy_cache_s3_artifacts() {
+        let err = load(
+            r#"
+artifacts:
+  behavior: proxy_cache_s3
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("artifacts.behavior"));
+    }
+
+    #[test]
     fn rejects_s3_artifact_cache_config() {
         let err = load(
             r#"

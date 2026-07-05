@@ -78,7 +78,16 @@ Example deployment files:
 
 ## Implementation Status
 
-Phase one has a Rust single-crate scaffold with YAML configuration validation, deterministic policy primitives, a trait-backed naive OSV checker, and command routing for:
+Phase one has a Rust single-crate implementation with YAML configuration validation, deterministic policy primitives, a trait-backed naive OSV checker, npm metadata filtering, PyPI Simple metadata filtering, and redirect-only artifact routes. Policy is checked while generating metadata and checked again before npm tarball or PyPI file redirects.
+
+Supported in phase one:
+
+- naive OSV malicious checks
+- npm metadata filtering and tarball redirects
+- PyPI Simple metadata filtering and file redirects
+- redirect artifact behavior only
+- no local malicious storage
+- no metadata cache
 
 ```sh
 osv-proxy serve --config osv-proxy.yaml
@@ -86,4 +95,4 @@ osv-proxy check npm:lodash@4.17.21 --config osv-proxy.yaml
 osv-proxy config validate --config osv-proxy.yaml
 ```
 
-Registry metadata serving, artifact proxying, local malicious storage, metadata caching, and `sync-malicious` are intentionally deferred.
+Local malicious storage, metadata caching, artifact proxying, S3 artifact caching, and `sync-malicious` are intentionally deferred.

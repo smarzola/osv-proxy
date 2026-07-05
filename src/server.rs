@@ -288,6 +288,7 @@ fn percent_decode_segment(segment: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::artifact::{Artifact, Ecosystem};
+    use crate::config::BlocklistEntry;
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::npm::NpmError;
     use serde_json::{json, Value};
@@ -553,6 +554,168 @@ mod tests {
                 "https://files.example/demo-1.0.0.tar.gz".to_string()
             )]
         );
+    }
+
+    #[test]
+    fn e2e_npm_route_filters_metadata_redirects_allowed_and_blocks_direct_artifact() {
+        let mut config = Config::default();
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Npm,
+            name: "demo".to_string(),
+            versions: vec!["1.0.1".to_string()],
+            reason: "known bad".to_string(),
+        });
+        let npm_upstream = StaticUpstream::with(
+            "demo",
+            json!({
+                "name": "demo",
+                "dist-tags": {
+                    "latest": "1.0.1",
+                    "stable": "1.0.0"
+                },
+                "time": {
+                    "1.0.0": "2026-06-01T00:00:00Z",
+                    "1.0.1": "2026-06-01T00:00:00Z"
+                },
+                "versions": {
+                    "1.0.0": {
+                        "name": "demo",
+                        "version": "1.0.0",
+                        "dist": {
+                            "tarball": "https://registry.example/demo/-/demo-1.0.0.tgz"
+                        }
+                    },
+                    "1.0.1": {
+                        "name": "demo",
+                        "version": "1.0.1",
+                        "dist": {
+                            "tarball": "https://registry.example/demo/-/demo-1.0.1.tgz"
+                        }
+                    }
+                }
+            }),
+        );
+
+        let metadata_response = route_request_with_upstream(
+            &config,
+            "GET",
+            "/npm/demo",
+            now(),
+            &CleanChecker,
+            &npm_upstream,
+        );
+        assert_eq!(metadata_response.status, 200);
+        let metadata: Value = serde_json::from_slice(&metadata_response.body).unwrap();
+        assert!(metadata["versions"]
+            .as_object()
+            .unwrap()
+            .contains_key("1.0.0"));
+        assert!(!metadata["versions"]
+            .as_object()
+            .unwrap()
+            .contains_key("1.0.1"));
+        assert_eq!(
+            metadata["versions"]["1.0.0"]["dist"]["tarball"],
+            "http://127.0.0.1:8080/npm/demo/-/demo-1.0.0.tgz"
+        );
+        assert_eq!(metadata["dist-tags"], json!({ "stable": "1.0.0" }));
+
+        let allowed_artifact_response = route_request_with_upstream(
+            &config,
+            "GET",
+            "/npm/demo/-/demo-1.0.0.tgz",
+            now(),
+            &CleanChecker,
+            &npm_upstream,
+        );
+        assert_eq!(allowed_artifact_response.status, 302);
+        assert_eq!(
+            allowed_artifact_response.headers,
+            vec![(
+                "location".to_string(),
+                "https://registry.example/demo/-/demo-1.0.0.tgz".to_string()
+            )]
+        );
+
+        let blocked_artifact_response = route_request_with_upstream(
+            &config,
+            "GET",
+            "/npm/demo/-/demo-1.0.1.tgz",
+            now(),
+            &CleanChecker,
+            &npm_upstream,
+        );
+        let blocked_body: Value = serde_json::from_slice(&blocked_artifact_response.body).unwrap();
+        assert_eq!(blocked_artifact_response.status, 403);
+        assert_eq!(blocked_body["allowed"], false);
+        assert_eq!(blocked_body["package"], "npm:demo@1.0.1");
+    }
+
+    #[test]
+    fn e2e_pypi_route_filters_simple_redirects_allowed_and_blocks_direct_artifact() {
+        let mut config = Config::default();
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Pypi,
+            name: "Demo".to_string(),
+            versions: vec!["1.0.1".to_string()],
+            reason: "known bad".to_string(),
+        });
+        let npm_upstream = StaticUpstream::with("unused", json!({}));
+        let pypi_upstream = StaticPypiUpstream::with(
+            "Demo",
+            r#"<html><body>
+<a href="https://files.example/packages/demo-1.0.0.tar.gz#sha256=abc" data-upload-time="2026-06-01T00:00:00Z">demo-1.0.0.tar.gz</a>
+<a href="https://files.example/packages/demo-1.0.1.tar.gz#sha256=bad" data-upload-time="2026-06-01T00:00:00Z">demo-1.0.1.tar.gz</a>
+</body></html>"#,
+        );
+
+        let simple_response = route_request_with_upstreams(
+            &config,
+            "GET",
+            "/pypi/simple/Demo/",
+            now(),
+            &CleanChecker,
+            &npm_upstream,
+            &pypi_upstream,
+        );
+        assert_eq!(simple_response.status, 200);
+        let simple_body = String::from_utf8(simple_response.body).unwrap();
+        assert!(simple_body.contains(
+            "http://127.0.0.1:8080/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz#sha256=abc"
+        ));
+        assert!(!simple_body.contains("demo-1.0.1.tar.gz"));
+
+        let allowed_artifact_response = route_request_with_upstreams(
+            &config,
+            "GET",
+            "/pypi/packages/demo/1.0.0/demo-1.0.0.tar.gz",
+            now(),
+            &CleanChecker,
+            &npm_upstream,
+            &pypi_upstream,
+        );
+        assert_eq!(allowed_artifact_response.status, 302);
+        assert_eq!(
+            allowed_artifact_response.headers,
+            vec![(
+                "location".to_string(),
+                "https://files.example/packages/demo-1.0.0.tar.gz".to_string()
+            )]
+        );
+
+        let blocked_artifact_response = route_request_with_upstreams(
+            &config,
+            "GET",
+            "/pypi/packages/demo/1.0.1/demo-1.0.1.tar.gz",
+            now(),
+            &CleanChecker,
+            &npm_upstream,
+            &pypi_upstream,
+        );
+        let blocked_body: Value = serde_json::from_slice(&blocked_artifact_response.body).unwrap();
+        assert_eq!(blocked_artifact_response.status, 403);
+        assert_eq!(blocked_body["allowed"], false);
+        assert_eq!(blocked_body["package"], "pypi:demo@1.0.1");
     }
 
     #[test]
