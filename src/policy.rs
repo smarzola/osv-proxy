@@ -47,10 +47,7 @@ impl<'a> PolicyEngine<'a> {
         now: DateTime<Utc>,
         malicious_checker: &dyn MaliciousChecker,
     ) -> Decision {
-        let malicious_result = if self
-            .find_allowlist_entry(artifact)
-            .is_some_and(|entry| entry.bypass_malicious)
-        {
+        let malicious_result = if self.bypasses_malicious(artifact) {
             None
         } else {
             Some(
@@ -63,6 +60,11 @@ impl<'a> PolicyEngine<'a> {
         self.evaluate_with_malicious_result(artifact, now, malicious_result)
     }
 
+    pub fn bypasses_malicious(&self, artifact: &Artifact) -> bool {
+        self.find_allowlist_entry(artifact)
+            .is_some_and(|entry| entry.bypass_malicious)
+    }
+
     pub fn evaluate_with_malicious_result(
         &self,
         artifact: &Artifact,
@@ -71,7 +73,7 @@ impl<'a> PolicyEngine<'a> {
     ) -> Decision {
         let allowlist_entry = self.find_allowlist_entry(artifact);
 
-        if !allowlist_entry.is_some_and(|entry| entry.bypass_malicious) {
+        if !self.bypasses_malicious(artifact) {
             match malicious_result {
                 Some(Ok(hits)) => {
                     if let Some(hit) = self.blocking_malicious_hit(hits) {

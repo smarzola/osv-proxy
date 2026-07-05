@@ -199,16 +199,38 @@ async fn filter_simple_project(
         .iter()
         .map(|file| artifact_from_file(config, project, file))
         .collect::<Result<Vec<_>, _>>()?;
-    let malicious_results = checker
-        .check_many(&artifacts)
-        .await
-        .map_err(|err| err.to_string());
+    let policy = PolicyEngine::new(config);
+    let artifacts_to_check = artifacts
+        .iter()
+        .enumerate()
+        .filter(|(_, artifact)| !policy.bypasses_malicious(artifact))
+        .map(|(index, artifact)| (index, artifact.clone()))
+        .collect::<Vec<_>>();
+    let checked_artifacts = artifacts_to_check
+        .iter()
+        .map(|(_, artifact)| artifact.clone())
+        .collect::<Vec<_>>();
+    let malicious_results = if checked_artifacts.is_empty() {
+        Ok(Vec::new())
+    } else {
+        checker
+            .check_many(&checked_artifacts)
+            .await
+            .map_err(|err| err.to_string())
+    };
 
     for (index, mut file) in simple.files.into_iter().enumerate() {
         let artifact = &artifacts[index];
-        let malicious_result = match &malicious_results {
-            Ok(results) => Some(Ok(results.get(index).cloned().unwrap_or_default())),
-            Err(err) => Some(Err(err.clone())),
+        let malicious_result = if let Some(batch_index) = artifacts_to_check
+            .iter()
+            .position(|(artifact_index, _)| *artifact_index == index)
+        {
+            match &malicious_results {
+                Ok(results) => Some(Ok(results.get(batch_index).cloned().unwrap_or_default())),
+                Err(err) => Some(Err(err.clone())),
+            }
+        } else {
+            None
         };
         let decision = PolicyEngine::new(config).evaluate_with_malicious_result(
             artifact,
@@ -549,13 +571,14 @@ pub enum PypiError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BlocklistEntry, MissingPublishTime};
+    use crate::config::{AllowlistEntry, BlocklistEntry, MissingPublishTime};
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::policy::{Decision, DecisionReason};
     use async_trait::async_trait;
     use chrono::Duration as ChronoDuration;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex;
 
     struct StaticSimple {
         root: String,
@@ -588,6 +611,7 @@ mod tests {
     struct CleanChecker {
         calls: AtomicU32,
         batch_calls: AtomicU32,
+        batch_artifacts: Mutex<Vec<String>>,
     }
 
     impl CleanChecker {
@@ -595,7 +619,12 @@ mod tests {
             Self {
                 calls: AtomicU32::new(0),
                 batch_calls: AtomicU32::new(0),
+                batch_artifacts: Mutex::new(Vec::new()),
             }
+        }
+
+        fn batch_identities(&self) -> Vec<String> {
+            self.batch_artifacts.lock().unwrap().clone()
         }
     }
 
@@ -611,6 +640,10 @@ mod tests {
             artifacts: &[Artifact],
         ) -> Result<Vec<Vec<MaliciousHit>>, MaliciousError> {
             self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            self.batch_artifacts
+                .lock()
+                .unwrap()
+                .extend(artifacts.iter().map(Artifact::identity));
             Ok(vec![Vec::new(); artifacts.len()])
         }
     }
@@ -717,6 +750,58 @@ mod tests {
         assert_eq!(body.files[0].upload_time, Some(old_time()));
         assert_eq!(checker.batch_calls.load(Ordering::SeqCst), 1);
         assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn pypi_simple_json_skips_malicious_batch_for_bypass_allowlist_files() {
+        let mut config = Config::default();
+        config.server.public_base_url = "https://proxy.example".to_string();
+        config.allowlist.push(AllowlistEntry {
+            ecosystem: Ecosystem::Pypi,
+            name: "Demo".to_string(),
+            version: "2.0.0".to_string(),
+            bypass_age_gate: false,
+            bypass_malicious: true,
+            reason: "known false positive".to_string(),
+        });
+        let simple = SimpleProject {
+            meta: BTreeMap::from([("api-version".to_string(), json!("1.1"))]),
+            name: "Demo".to_string(),
+            versions: vec!["1.0.0".to_string(), "2.0.0".to_string()],
+            files: vec![
+                file(
+                    "demo-1.0.0.tar.gz",
+                    "https://files.example/packages/demo-1.0.0.tar.gz",
+                    Some(old_time()),
+                ),
+                file(
+                    "demo-2.0.0-py3-none-any.whl",
+                    "https://files.example/packages/demo-2.0.0-py3-none-any.whl",
+                    Some(new_time()),
+                ),
+            ],
+        };
+        let upstream = StaticSimple::new("Demo", simple);
+        let checker = CleanChecker::new();
+
+        let response = simple_project_response_for_accept(
+            &config,
+            &upstream,
+            &checker,
+            "Demo",
+            now(),
+            Some(SIMPLE_JSON_CONTENT_TYPE),
+        )
+        .await
+        .unwrap();
+        let body: SimpleProject = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(body.versions, vec!["1.0.0"]);
+        assert_eq!(body.files.len(), 1);
+        assert_eq!(body.files[0].filename, "demo-1.0.0.tar.gz");
+        assert_eq!(checker.batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(checker.batch_identities(), vec!["pypi:demo@1.0.0"]);
     }
 
     #[tokio::test]
