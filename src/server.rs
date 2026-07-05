@@ -74,7 +74,7 @@ pub async fn route_request_with_accept(
 ) -> RegistryResponse {
     let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
     let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
-    let checker = OsvHttpClient::new(&config.policy.malicious.osv_api_url);
+    let checker = OsvHttpClient::new(&config.policy.osv.api_url);
     route_request_with_dependencies(
         config,
         method,

@@ -64,11 +64,8 @@ Defaults should be conservative:
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
-  malicious:
-    only_mal_ids: true
-    on_osv_error: "block"
-artifacts:
-  behavior: "redirect"
+  osv:
+    on_error: "block"
 ```
 
 Developer mode can be more permissive, but must be explicit.

@@ -9,24 +9,11 @@ typos do not silently change install behavior.
 server:
   listen: "127.0.0.1:8080"
   public_base_url: "http://127.0.0.1:8080"
-upstreams:
-  npm:
-    registry_url: "https://registry.npmjs.org"
-  pypi:
-    simple_url: "https://pypi.org/simple"
-    files_url: "https://files.pythonhosted.org"
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
-  malicious:
-    mode: "naive"
-    only_mal_ids: true
-    osv_api_url: "https://api.osv.dev"
-    on_osv_error: "block"
-metadata_cache:
-  enabled: false
-artifacts:
-  behavior: "redirect"
+  osv:
+    on_error: "block"
 ```
 
 Validate it with:
@@ -58,14 +45,11 @@ upstreams:
     registry_url: "https://registry.npmjs.org"
   pypi:
     simple_url: "https://pypi.org/simple"
-    files_url: "https://files.pythonhosted.org"
 ```
 
 - `npm.registry_url`: upstream npm registry metadata endpoint.
 - `pypi.simple_url`: upstream PyPI Simple API endpoint. Project pages are
   fetched as Simple JSON for policy evaluation.
-- `pypi.files_url`: reserved for file URL configuration. Current file redirects
-  use URLs from upstream Simple JSON project metadata.
 
 Both upstream values have the public registry defaults shown above, so most
 local configs can omit this section.
@@ -76,26 +60,21 @@ local configs can omit this section.
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
-  malicious:
-    mode: "naive"
-    only_mal_ids: true
-    osv_api_url: "https://api.osv.dev"
-    on_osv_error: "block"
+  osv:
+    on_error: "block"
 ```
 
 - `minimum_age`: minimum age before a package version can be installed. It must
   be a valid duration that fits policy evaluation.
 - `missing_publish_time`: `block` or `allow`.
-- `malicious.mode`: must be `naive` in this phase.
-- `malicious.only_mal_ids`: when true, only OSV records with IDs starting with
-  `MAL-` block package versions.
-- `malicious.osv_api_url`: optional OSV API base URL override. Omit it to use
+- `osv.on_error`: `block` fails closed; `allow` fails open when the OSV check
+  fails or a required OSV result is missing.
+- `osv.api_url`: optional OSV API base URL override. Omit it to use
   `https://api.osv.dev`.
-- `malicious.on_osv_error`: `block` fails closed; `allow` fails open when the
-  OSV check fails or a required OSV result is missing.
 
-CVEs, GHSAs, and other advisory records are not package-malicious decisions in
-`osv-proxy` unless `malicious.only_mal_ids` is explicitly set to false.
+Only OSV records with IDs starting with `MAL-` block package versions. CVEs,
+GHSAs, and other advisory records are not package-malicious decisions in
+`osv-proxy`.
 
 ## Allowlist
 

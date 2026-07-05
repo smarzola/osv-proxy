@@ -126,35 +126,22 @@ cargo run -- eval npm:lodash@4.17.21 \
 
 ## Configuration
 
-The supported phase-one config is:
+The default config is intentionally small:
 
 ```yaml
 server:
   listen: "127.0.0.1:8080"
   public_base_url: "http://127.0.0.1:8080"
-upstreams:
-  npm:
-    registry_url: "https://registry.npmjs.org"
-  pypi:
-    simple_url: "https://pypi.org/simple"
-    files_url: "https://files.pythonhosted.org"
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
-  malicious:
-    mode: "naive"
-    only_mal_ids: true
-    osv_api_url: "https://api.osv.dev"
-    on_osv_error: "block"
-metadata_cache:
-  enabled: false
-artifacts:
-  behavior: "redirect"
+  osv:
+    on_error: "block"
 ```
 
 The npm registry, PyPI Simple API, and OSV API default to their public URLs.
-Set `upstreams` or `policy.malicious.osv_api_url` only when using a mirror,
-fixture, or private gateway.
+Set `upstreams` or `policy.osv.api_url` only when using a mirror, fixture, or
+private gateway.
 
 ## Policy Behavior
 

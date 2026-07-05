@@ -49,7 +49,7 @@ Acceptance tests:
 
 - `MAL-*` result blocks package
 - non-`MAL` advisory does not block package
-- OSV API failure follows `on_osv_error`
+- OSV API failure follows `policy.osv.on_error`
 - `allowlist.bypass_malicious=true` allows exact package version
 
 ## Milestone 3: npm Metadata and Redirect
