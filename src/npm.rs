@@ -1,5 +1,71 @@
-use crate::artifact::{Artifact, Ecosystem};
+use crate::artifact::{Artifact, ArtifactHashes, Ecosystem};
+use crate::config::Config;
+use crate::malicious::MaliciousChecker;
+use crate::policy::PolicyEngine;
 use chrono::{DateTime, Utc};
+use reqwest::blocking::Client;
+use serde_json::{json, Map, Value};
+use thiserror::Error;
+
+#[derive(Debug, Clone)]
+pub struct NpmRegistryClient {
+    registry_url: String,
+    client: Client,
+}
+
+impl NpmRegistryClient {
+    pub fn new(registry_url: impl Into<String>) -> Self {
+        Self {
+            registry_url: registry_url.into().trim_end_matches('/').to_string(),
+            client: Client::new(),
+        }
+    }
+}
+
+pub trait NpmMetadataProvider {
+    fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError>;
+}
+
+impl NpmMetadataProvider for NpmRegistryClient {
+    fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError> {
+        let url = format!(
+            "{}/{}",
+            self.registry_url,
+            encode_package_for_registry(package)
+        );
+        Ok(self
+            .client
+            .get(url)
+            .send()?
+            .error_for_status()?
+            .json::<Value>()?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NpmResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl NpmResponse {
+    pub fn json(status: u16, body: &Value) -> Result<Self, NpmError> {
+        Ok(Self {
+            status,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: serde_json::to_vec(body)?,
+        })
+    }
+
+    pub fn redirect(location: String) -> Self {
+        Self {
+            status: 302,
+            headers: vec![("location".to_string(), location)],
+            body: Vec::new(),
+        }
+    }
+}
 
 pub fn package_artifact(
     name: impl AsRef<str>,
@@ -7,4 +73,538 @@ pub fn package_artifact(
     published_at: Option<DateTime<Utc>>,
 ) -> Artifact {
     Artifact::package(Ecosystem::Npm, name, version, published_at)
+}
+
+pub fn metadata_response(
+    config: &Config,
+    upstream: &dyn NpmMetadataProvider,
+    checker: &dyn MaliciousChecker,
+    package: &str,
+    now: DateTime<Utc>,
+) -> Result<NpmResponse, NpmError> {
+    let raw = upstream.fetch_package_metadata(package)?;
+    let filtered = filter_metadata(config, checker, package, raw, now)?;
+    NpmResponse::json(200, &filtered)
+}
+
+pub fn artifact_response(
+    config: &Config,
+    upstream: &dyn NpmMetadataProvider,
+    checker: &dyn MaliciousChecker,
+    package: &str,
+    tarball: &str,
+    now: DateTime<Utc>,
+) -> Result<NpmResponse, NpmError> {
+    let version = infer_version_from_tarball(package, tarball)
+        .ok_or_else(|| NpmError::InvalidTarballName(tarball.to_string()))?;
+    let metadata = upstream.fetch_package_metadata(package)?;
+    let artifact = artifact_from_metadata(package, &version, tarball, &metadata)?;
+    let decision = PolicyEngine::new(config).evaluate(&artifact, now, checker);
+
+    if decision.allowed {
+        let location = artifact
+            .upstream_url
+            .ok_or_else(|| NpmError::MissingTarballUrl(package.to_string(), version))?;
+        Ok(NpmResponse::redirect(location))
+    } else {
+        let body = serde_json::to_value(decision)?;
+        NpmResponse::json(403, &body)
+    }
+}
+
+pub fn error_response(error: &NpmError) -> NpmResponse {
+    let status = match error {
+        NpmError::VersionNotFound(_, _)
+        | NpmError::MissingTarballUrl(_, _)
+        | NpmError::InvalidTarballName(_) => 404,
+        NpmError::Upstream(_) => 502,
+        NpmError::Json(_) | NpmError::InvalidMetadata(_) => 500,
+    };
+    let body = json!({
+        "allowed": false,
+        "reason": "upstream_error",
+        "message": error.to_string(),
+    });
+    NpmResponse::json(status, &body).expect("static error response should serialize")
+}
+
+fn filter_metadata(
+    config: &Config,
+    checker: &dyn MaliciousChecker,
+    package: &str,
+    mut metadata: Value,
+    now: DateTime<Utc>,
+) -> Result<Value, NpmError> {
+    let mut kept_versions = Vec::new();
+    let time_metadata = metadata.get("time").cloned();
+    let versions = metadata
+        .get_mut("versions")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| NpmError::InvalidMetadata("metadata.versions must be an object".into()))?;
+
+    versions.retain(|version, version_metadata| {
+        let published_at = time_metadata
+            .as_ref()
+            .and_then(|time| time.get(version))
+            .and_then(Value::as_str)
+            .and_then(parse_npm_time);
+        let artifact =
+            artifact_from_version_metadata(package, version, version_metadata, published_at);
+        let decision = PolicyEngine::new(config).evaluate(&artifact, now, checker);
+        if decision.allowed {
+            if let Some(dist) = version_metadata
+                .get_mut("dist")
+                .and_then(Value::as_object_mut)
+            {
+                let tarball = dist
+                    .get("tarball")
+                    .and_then(Value::as_str)
+                    .and_then(tarball_filename)
+                    .unwrap_or_else(|| default_tarball_filename(package, version));
+                dist.insert(
+                    "tarball".to_string(),
+                    Value::String(proxy_tarball_url(config, package, &tarball)),
+                );
+            }
+            kept_versions.push(version.clone());
+            true
+        } else {
+            false
+        }
+    });
+
+    if let Some(dist_tags) = metadata.get_mut("dist-tags").and_then(Value::as_object_mut) {
+        dist_tags.retain(|_, tagged_version| {
+            tagged_version
+                .as_str()
+                .is_some_and(|version| kept_versions.iter().any(|kept| kept == version))
+        });
+    }
+
+    Ok(metadata)
+}
+
+fn artifact_from_metadata(
+    package: &str,
+    version: &str,
+    tarball: &str,
+    metadata: &Value,
+) -> Result<Artifact, NpmError> {
+    let versions = metadata
+        .get("versions")
+        .and_then(Value::as_object)
+        .ok_or_else(|| NpmError::InvalidMetadata("metadata.versions must be an object".into()))?;
+    let version_metadata = versions
+        .get(version)
+        .ok_or_else(|| NpmError::VersionNotFound(package.to_string(), version.to_string()))?;
+    let published_at = metadata
+        .get("time")
+        .and_then(|time| time.get(version))
+        .and_then(Value::as_str)
+        .and_then(parse_npm_time);
+    let mut artifact =
+        artifact_from_version_metadata(package, version, version_metadata, published_at);
+    artifact.filename = Some(tarball.to_string());
+    Ok(artifact)
+}
+
+fn artifact_from_version_metadata(
+    package: &str,
+    version: &str,
+    version_metadata: &Value,
+    published_at: Option<DateTime<Utc>>,
+) -> Artifact {
+    let mut artifact = package_artifact(package, version.to_string(), published_at);
+
+    let dist = version_metadata.get("dist").and_then(Value::as_object);
+    if let Some(dist) = dist {
+        artifact.upstream_url = dist
+            .get("tarball")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        artifact.filename = artifact.upstream_url.as_deref().and_then(tarball_filename);
+        artifact.hashes = hashes_from_dist(dist);
+    }
+
+    artifact
+}
+
+fn hashes_from_dist(dist: &Map<String, Value>) -> ArtifactHashes {
+    let integrity = dist
+        .get("integrity")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let sha512 = integrity
+        .as_deref()
+        .and_then(|value| value.strip_prefix("sha512-"))
+        .map(ToOwned::to_owned);
+
+    ArtifactHashes {
+        sha256: None,
+        sha512,
+        integrity,
+    }
+}
+
+fn parse_npm_time(raw: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn proxy_tarball_url(config: &Config, package: &str, tarball: &str) -> String {
+    format!(
+        "{}/npm/{}/-/{}",
+        config.server.public_base_url.trim_end_matches('/'),
+        package.trim_start_matches('/'),
+        tarball
+    )
+}
+
+fn tarball_filename(url: &str) -> Option<String> {
+    let without_fragment = url.split('#').next().unwrap_or(url);
+    let without_query = without_fragment
+        .split('?')
+        .next()
+        .unwrap_or(without_fragment);
+    without_query
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn default_tarball_filename(package: &str, version: &str) -> String {
+    format!("{}-{version}.tgz", package_file_stem(package))
+}
+
+fn package_file_stem(package: &str) -> &str {
+    package.rsplit('/').next().unwrap_or(package)
+}
+
+fn infer_version_from_tarball(package: &str, tarball: &str) -> Option<String> {
+    let stem = tarball.strip_suffix(".tgz")?;
+    let expected_prefix = format!("{}-", package_file_stem(package));
+    if let Some(version) = stem.strip_prefix(&expected_prefix) {
+        return (!version.is_empty()).then(|| version.to_string());
+    }
+    stem.rsplit_once('-')
+        .and_then(|(_, version)| (!version.is_empty()).then(|| version.to_string()))
+}
+
+fn encode_package_for_registry(package: &str) -> String {
+    if package.starts_with('@') {
+        package.replacen('/', "%2F", 1)
+    } else {
+        package.to_string()
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum NpmError {
+    #[error("npm upstream request failed: {0}")]
+    Upstream(#[from] reqwest::Error),
+    #[error("npm JSON handling failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("invalid npm metadata: {0}")]
+    InvalidMetadata(String),
+    #[error("npm version not found for {0}@{1}")]
+    VersionNotFound(String, String),
+    #[error("npm tarball URL missing for {0}@{1}")]
+    MissingTarballUrl(String, String),
+    #[error("could not infer npm version from tarball name {0}")]
+    InvalidTarballName(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifact::Ecosystem;
+    use crate::config::BlocklistEntry;
+    use crate::malicious::{MaliciousError, MaliciousHit};
+    use crate::policy::Decision;
+    use chrono::Duration as ChronoDuration;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
+    struct StaticUpstream {
+        metadata: HashMap<String, Value>,
+    }
+
+    impl StaticUpstream {
+        fn new(package: &str, metadata: Value) -> Self {
+            Self {
+                metadata: HashMap::from([(package.to_string(), metadata)]),
+            }
+        }
+    }
+
+    impl NpmMetadataProvider for StaticUpstream {
+        fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError> {
+            self.metadata.get(package).cloned().ok_or_else(|| {
+                NpmError::InvalidMetadata(format!("missing static metadata for {package}"))
+            })
+        }
+    }
+
+    struct CleanChecker {
+        calls: Cell<u32>,
+    }
+
+    impl CleanChecker {
+        fn new() -> Self {
+            Self {
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl MaliciousChecker for CleanChecker {
+        fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(Vec::new())
+        }
+    }
+
+    fn now() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-07-05T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn metadata_fixture() -> Value {
+        json!({
+            "name": "demo",
+            "dist-tags": {
+                "latest": "2.0.0",
+                "blocked": "1.0.1",
+                "stable": "1.0.0"
+            },
+            "time": {
+                "1.0.0": "2026-06-01T00:00:00Z",
+                "1.0.1": "2026-06-01T00:00:00Z",
+                "2.0.0": "2026-07-05T00:00:00Z"
+            },
+            "versions": {
+                "1.0.0": {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://registry.example/demo/-/demo-1.0.0.tgz",
+                        "integrity": "sha512-allowed",
+                        "shasum": "abc123"
+                    }
+                },
+                "1.0.1": {
+                    "name": "demo",
+                    "version": "1.0.1",
+                    "dist": {
+                        "tarball": "https://registry.example/demo/-/demo-1.0.1.tgz"
+                    }
+                },
+                "2.0.0": {
+                    "name": "demo",
+                    "version": "2.0.0",
+                    "dist": {
+                        "tarball": "https://registry.example/demo/-/demo-2.0.0.tgz"
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn npm_metadata_filters_versions_rewrites_tarballs_and_dist_tags() {
+        let mut config = Config::default();
+        config.server.public_base_url = "https://proxy.example".to_string();
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Npm,
+            name: "demo".to_string(),
+            versions: vec!["1.0.1".to_string()],
+            reason: "known bad".to_string(),
+        });
+        let upstream = StaticUpstream::new("demo", metadata_fixture());
+        let checker = CleanChecker::new();
+
+        let response = metadata_response(&config, &upstream, &checker, "demo", now()).unwrap();
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        let versions = body["versions"].as_object().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert!(versions.contains_key("1.0.0"));
+        assert_eq!(
+            body["versions"]["1.0.0"]["dist"]["tarball"],
+            "https://proxy.example/npm/demo/-/demo-1.0.0.tgz"
+        );
+        assert_eq!(
+            body["versions"]["1.0.0"]["dist"]["integrity"],
+            "sha512-allowed"
+        );
+        assert_eq!(body["versions"]["1.0.0"]["dist"]["shasum"], "abc123");
+        assert_eq!(body["dist-tags"], json!({ "stable": "1.0.0" }));
+        assert_eq!(checker.calls.get(), 3);
+    }
+
+    #[test]
+    fn npm_metadata_preserves_scoped_package_names_in_proxy_urls() {
+        let mut config = Config::default();
+        config.server.public_base_url = "https://proxy.example/".to_string();
+        let metadata = json!({
+            "name": "@babel/core",
+            "dist-tags": { "latest": "7.24.0" },
+            "time": { "7.24.0": "2026-06-01T00:00:00Z" },
+            "versions": {
+                "7.24.0": {
+                    "name": "@babel/core",
+                    "version": "7.24.0",
+                    "dist": {
+                        "tarball": "https://registry.example/@babel/core/-/core-7.24.0.tgz"
+                    }
+                }
+            }
+        });
+        let upstream = StaticUpstream::new("@babel/core", metadata);
+        let checker = CleanChecker::new();
+
+        let response =
+            metadata_response(&config, &upstream, &checker, "@babel/core", now()).unwrap();
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(
+            body["versions"]["7.24.0"]["dist"]["tarball"],
+            "https://proxy.example/npm/@babel/core/-/core-7.24.0.tgz"
+        );
+    }
+
+    #[test]
+    fn npm_artifact_allowed_tarball_redirects_to_upstream() {
+        let config = Config::default();
+        let metadata = json!({
+            "name": "@babel/core",
+            "time": { "7.24.0": "2026-06-01T00:00:00Z" },
+            "versions": {
+                "7.24.0": {
+                    "name": "@babel/core",
+                    "version": "7.24.0",
+                    "dist": {
+                        "tarball": "https://registry.example/@babel/core/-/core-7.24.0.tgz"
+                    }
+                }
+            }
+        });
+        let upstream = StaticUpstream::new("@babel/core", metadata);
+        let checker = CleanChecker::new();
+
+        let response = artifact_response(
+            &config,
+            &upstream,
+            &checker,
+            "@babel/core",
+            "core-7.24.0.tgz",
+            now(),
+        )
+        .unwrap();
+
+        assert_eq!(response.status, 302);
+        assert_eq!(
+            response.headers,
+            vec![(
+                "location".to_string(),
+                "https://registry.example/@babel/core/-/core-7.24.0.tgz".to_string()
+            )]
+        );
+        assert_eq!(checker.calls.get(), 1);
+    }
+
+    #[test]
+    fn npm_artifact_blocked_tarball_returns_structured_403() {
+        let mut config = Config::default();
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Npm,
+            name: "demo".to_string(),
+            versions: vec!["1.0.0".to_string()],
+            reason: "known bad".to_string(),
+        });
+        let metadata = json!({
+            "name": "demo",
+            "time": { "1.0.0": "2026-06-01T00:00:00Z" },
+            "versions": {
+                "1.0.0": {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://registry.example/demo/-/demo-1.0.0.tgz"
+                    }
+                }
+            }
+        });
+        let upstream = StaticUpstream::new("demo", metadata);
+        let checker = CleanChecker::new();
+
+        let response = artifact_response(
+            &config,
+            &upstream,
+            &checker,
+            "demo",
+            "demo-1.0.0.tgz",
+            now(),
+        )
+        .unwrap();
+        let body: Decision = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status, 403);
+        assert!(!body.allowed);
+        assert_eq!(body.package, "npm:demo@1.0.0");
+    }
+
+    #[test]
+    fn infers_versions_from_unscoped_and_scoped_tarball_names() {
+        assert_eq!(
+            infer_version_from_tarball("lodash", "lodash-4.17.21.tgz"),
+            Some("4.17.21".to_string())
+        );
+        assert_eq!(
+            infer_version_from_tarball("@babel/core", "core-7.24.0.tgz"),
+            Some("7.24.0".to_string())
+        );
+        assert_eq!(
+            infer_version_from_tarball("left-pad", "left-pad-1.3.0-beta.1.tgz"),
+            Some("1.3.0-beta.1".to_string())
+        );
+    }
+
+    #[test]
+    fn encodes_scoped_package_for_registry_metadata_fetch() {
+        assert_eq!(encode_package_for_registry("@babel/core"), "@babel%2Fcore");
+        assert_eq!(encode_package_for_registry("lodash"), "lodash");
+    }
+
+    #[test]
+    fn too_young_metadata_version_is_removed() {
+        let config = Config::default();
+        let checker = CleanChecker::new();
+        let mut metadata = metadata_fixture();
+        metadata["versions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("1.0.1");
+        let upstream = StaticUpstream::new("demo", metadata);
+
+        let response = metadata_response(&config, &upstream, &checker, "demo", now()).unwrap();
+        let body: Value = serde_json::from_slice(&response.body).unwrap();
+
+        assert!(body["versions"].as_object().unwrap().contains_key("1.0.0"));
+        assert!(!body["versions"].as_object().unwrap().contains_key("2.0.0"));
+    }
+
+    #[test]
+    fn package_artifact_uses_npm_ecosystem() {
+        let artifact = package_artifact(
+            "@babel/core",
+            "7.24.0",
+            Some(now() - ChronoDuration::hours(100)),
+        );
+        assert_eq!(artifact.ecosystem, Ecosystem::Npm);
+        assert_eq!(artifact.name, "@babel/core");
+        assert_eq!(artifact.version, "7.24.0");
+    }
 }
