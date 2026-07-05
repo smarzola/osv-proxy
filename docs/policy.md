@@ -131,8 +131,8 @@ Classification:
 - CVEs, GHSAs, and other vulnerabilities: ignored for blocking by default
 
 OSV is checked during policy evaluation. The default OSV API URL is
-`https://api.osv.dev`; override `policy.osv.api_url` only when routing through a
-mirror, fixture, or private gateway.
+`https://api.osv.dev`; override `policy.malicious.osv_api_url` only when
+routing through a mirror, fixture, or private gateway.
 
 ## Manual Blocklist
 

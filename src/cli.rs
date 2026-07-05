@@ -70,7 +70,7 @@ pub async fn execute(cli: Cli) -> anyhow::Result<()> {
         Command::Check { package, config } => {
             let config = Config::load(&config)
                 .with_context(|| format!("config validation failed for {}", config.display()))?;
-            let checker = OsvHttpClient::new(&config.policy.osv.api_url);
+            let checker = OsvHttpClient::new(&config.policy.malicious.osv_api_url);
             let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
             let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
             let output = registry_check(
@@ -97,7 +97,7 @@ pub async fn execute(cli: Cli) -> anyhow::Result<()> {
             let config = Config::load(&config)
                 .with_context(|| format!("config validation failed for {}", config.display()))?;
             let artifact = parse_identity(&package, published_at)?;
-            let checker = OsvHttpClient::new(&config.policy.osv.api_url);
+            let checker = OsvHttpClient::new(&config.policy.malicious.osv_api_url);
             let decision = PolicyEngine::new(&config)
                 .evaluate(&artifact, Utc::now(), &checker)
                 .await;

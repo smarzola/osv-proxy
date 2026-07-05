@@ -205,7 +205,7 @@ Status note, 2026-07-06:
 - Implemented default `check` as registry-backed orchestration: parse package identity without constructing a partial artifact, fetch npm/PyPI metadata through adapter lookup APIs, evaluate each registry-derived artifact, print aggregate JSON with per-artifact decisions, and return non-zero for blocked results.
 - Retained manual artifact evaluation only as `eval`, with synthetic mode in output and command help.
 - PyPI check evaluates every file for the requested version and reports an aggregate allow only when all file decisions allow.
-- Adapted to the current concurrent config shape by using `policy.osv.api_url`, `policy.osv.on_error`, and preserving `policy.osv.only_mal_ids`.
+- Uses the phase-one config shape: `policy.malicious.osv_api_url`, `policy.malicious.on_osv_error`, and `policy.malicious.only_mal_ids`.
 - Verification run:
   - `cargo test cli`: passed, 7 matching tests.
   - `cargo test npm`: sandbox run passed 25 matching unit/server tests, then selected `npm_install_uses_proxy_for_allowed_and_blocked_versions` and failed with `Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }`; rerun outside sandbox passed all 25 matching unit/server tests plus the npm e2e test.
@@ -259,7 +259,7 @@ Commit requirement:
 Status note, 2026-07-06:
 
 - Added mocked registry-backed `check` tests for npm and PyPI old-version allows, npm too-new blocking, PyPI per-file blocking, missing npm/PyPI upstream versions, manual blocklist, and allowlist age/malicious bypass behavior. No live npm, PyPI, or OSV network is used.
-- Updated README, configuration docs, and policy docs so `check` is described as registry-backed and `eval` is described as synthetic/manual. Updated example configs for the current `policy.osv` shape and restored `examples/phase1/osv-proxy.yaml` for final validation.
+- Updated README, configuration docs, and policy docs so `check` is described as registry-backed and `eval` is described as synthetic/manual. Updated example configs for the phase-one `policy.malicious` shape and restored `examples/phase1/osv-proxy.yaml` for final validation.
 - Verification run:
   - `cargo test check`: passed, 13 matching tests.
   - `cargo test cli`: passed, 13 matching tests.
