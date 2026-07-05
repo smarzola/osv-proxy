@@ -1,42 +1,30 @@
 # Configuration
 
-`osv-proxy` uses YAML configuration.
+`osv-proxy` uses YAML configuration. Unknown keys fail validation so policy
+typos do not silently change install behavior.
 
-This page describes the configuration that is supported by the current
-phase-one implementation. Future storage, cache, and proxy modes are documented
-in product planning docs, but they do not validate in the current binary.
-
-## Minimal Supported Config
+## Example
 
 ```yaml
 server:
   listen: "127.0.0.1:8080"
   public_base_url: "http://127.0.0.1:8080"
-upstreams:
-  npm:
-    registry_url: "https://registry.npmjs.org"
-  pypi:
-    simple_url: "https://pypi.org/simple"
-    files_url: "https://files.pythonhosted.org"
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
-  malicious:
-    mode: "naive"
+  osv:
     only_mal_ids: true
-    osv_api_url: "https://api.osv.dev"
-    on_osv_error: "block"
-metadata_cache:
-  enabled: false
-artifacts:
-  behavior: "redirect"
+    on_error: "block"
 ```
 
 Validate it with:
 
 ```sh
-cargo run -- config validate --config examples/phase1/osv-proxy.yaml
+cargo run -- config validate --config examples/basic/osv-proxy.yaml
 ```
+
+The npm registry, PyPI Simple API, and OSV API default to their public URLs.
+Configure them only when routing through a mirror, fixture, or private gateway.
 
 ## Server
 
@@ -58,14 +46,14 @@ upstreams:
     registry_url: "https://registry.npmjs.org"
   pypi:
     simple_url: "https://pypi.org/simple"
-    files_url: "https://files.pythonhosted.org"
 ```
 
 - `npm.registry_url`: upstream npm registry metadata endpoint.
 - `pypi.simple_url`: upstream PyPI Simple API endpoint. Project pages are
   fetched as Simple JSON for policy evaluation.
-- `pypi.files_url`: reserved for file URL configuration. Current file redirects
-  use URLs from upstream Simple JSON project metadata.
+
+Both upstream values have the public registry defaults shown above, so most
+local configs can omit this section.
 
 ## Policy
 
@@ -73,20 +61,23 @@ upstreams:
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
-  malicious:
-    mode: "naive"
+  osv:
     only_mal_ids: true
-    osv_api_url: "https://api.osv.dev"
-    on_osv_error: "block"
+    on_error: "block"
 ```
 
 - `minimum_age`: minimum age before a package version can be installed. It must
   be a valid duration that fits policy evaluation.
 - `missing_publish_time`: `block` or `allow`.
-- `malicious.mode`: must be `naive` in this phase.
-- `malicious.only_mal_ids`: when true, only OSV IDs starting with `MAL-` block.
-- `malicious.osv_api_url`: OSV API base URL.
-- `malicious.on_osv_error`: `block` fails closed; `allow` fails open.
+- `osv.only_mal_ids`: when true, only OSV records with IDs starting with
+  `MAL-` block package versions.
+- `osv.on_error`: `block` fails closed; `allow` fails open when the OSV check
+  fails or a required OSV result is missing.
+- `osv.api_url`: optional OSV API base URL override. Omit it to use
+  `https://api.osv.dev`.
+
+CVEs, GHSAs, and other advisory records are not package-malicious decisions in
+`osv-proxy` unless `osv.only_mal_ids` is explicitly set to false.
 
 ## Allowlist
 
@@ -116,45 +107,4 @@ blocklist:
     reason: "Manually blocked"
 ```
 
-Version ranges such as `<4.17.21` are not supported in this phase.
-
-## Metadata Cache
-
-The only supported cache setting is disabled:
-
-```yaml
-metadata_cache:
-  enabled: false
-```
-
-`metadata_cache.enabled: true` and cache backend settings fail validation.
-
-## Artifact Behavior
-
-The only supported artifact behavior is redirect:
-
-```yaml
-artifacts:
-  behavior: "redirect"
-```
-
-`proxy` and `proxy_cache_s3` fail validation in this phase.
-
-## Unsupported In This Phase
-
-These settings intentionally fail validation:
-
-- `policy.malicious.mode: local`
-- `malicious_store`
-- `metadata_cache.enabled: true`
-- `metadata_cache.backend`
-- `artifacts.behavior: proxy`
-- `artifacts.behavior: proxy_cache_s3`
-- `artifacts.s3`
-
-Unknown YAML keys also fail validation at the top level and inside supported
-sections such as `server`, `upstreams`, `policy`, `metadata_cache`, and
-`artifacts`.
-
-The implementation has no local malicious store, no MongoDB or mongolino sync,
-no cachebox backend, no in-process metadata cache, and no S3 artifact cache.
+Version ranges such as `<4.17.21` are not supported.

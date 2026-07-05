@@ -4,9 +4,7 @@
 
 It sits between package managers and public registries, filters package metadata
 through deterministic policy, and checks the same policy again before redirecting
-artifact downloads upstream. The first implementation is intentionally small:
-naive OSV lookup, redirect-only artifacts, no local storage, and no metadata
-cache.
+artifact downloads upstream.
 
 ## What It Does
 
@@ -52,7 +50,7 @@ cargo build --release
 Run the binary with Cargo during development:
 
 ```sh
-cargo run -- config validate --config examples/phase1/osv-proxy.yaml
+cargo run -- config validate --config examples/basic/osv-proxy.yaml
 ```
 
 ## Quick Start
@@ -60,13 +58,13 @@ cargo run -- config validate --config examples/phase1/osv-proxy.yaml
 Validate the example config:
 
 ```sh
-cargo run -- config validate --config examples/phase1/osv-proxy.yaml
+cargo run -- config validate --config examples/basic/osv-proxy.yaml
 ```
 
 Start the proxy:
 
 ```sh
-cargo run -- serve --config examples/phase1/osv-proxy.yaml
+cargo run -- serve --config examples/basic/osv-proxy.yaml
 ```
 
 Point npm at the proxy:
@@ -89,12 +87,20 @@ uv pip install --index-url http://127.0.0.1:8080/pypi/simple/ requests
 
 ## Check a Package
 
-`check` evaluates one canonical package version and prints the policy decision:
+`check` fetches upstream registry metadata, builds the same canonical artifact
+context used by proxy routes, evaluates policy, and prints structured JSON:
 
 ```sh
 cargo run -- check npm:lodash@4.17.21 \
-  --config examples/phase1/osv-proxy.yaml \
-  --published-at 2026-06-01T00:00:00Z
+  --config examples/basic/osv-proxy.yaml
+```
+
+PyPI checks evaluate every file published for the requested version and allow
+the package only when every file is allowed:
+
+```sh
+cargo run -- check pypi:requests@2.32.3 \
+  --config examples/basic/osv-proxy.yaml
 ```
 
 Package identities use this form:
@@ -105,41 +111,38 @@ npm:@babel/core@7.24.0
 pypi:requests@2.32.3
 ```
 
-The current `check` command does not fetch registry publish time by itself. With
-the default `missing_publish_time: block`, pass `--published-at` when checking a
-package that should be evaluated against the age gate.
+If upstream metadata is missing or malformed, `check` exits non-zero rather than
+evaluating a synthetic artifact.
+
+For manual policy evaluation without registry metadata, use `eval`. It is not
+proxy-equivalent and only evaluates the artifact fields supplied on the command
+line:
+
+```sh
+cargo run -- eval npm:lodash@4.17.21 \
+  --config examples/basic/osv-proxy.yaml \
+  --published-at 2026-06-01T00:00:00Z
+```
 
 ## Configuration
 
-The supported phase-one config is:
+The default config is intentionally small:
 
 ```yaml
 server:
   listen: "127.0.0.1:8080"
   public_base_url: "http://127.0.0.1:8080"
-upstreams:
-  npm:
-    registry_url: "https://registry.npmjs.org"
-  pypi:
-    simple_url: "https://pypi.org/simple"
-    files_url: "https://files.pythonhosted.org"
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
-  malicious:
-    mode: "naive"
+  osv:
     only_mal_ids: true
-    osv_api_url: "https://api.osv.dev"
-    on_osv_error: "block"
-metadata_cache:
-  enabled: false
-artifacts:
-  behavior: "redirect"
+    on_error: "block"
 ```
 
-Unsupported modes fail config validation. In this phase, `policy.malicious.mode`
-must be `naive`, `metadata_cache.enabled` must be `false`, and
-`artifacts.behavior` must be `redirect`.
+The npm registry, PyPI Simple API, and OSV API default to their public URLs.
+Set `upstreams` or `policy.osv.api_url` only when using a mirror, fixture, or
+private gateway.
 
 ## Policy Behavior
 

@@ -188,9 +188,11 @@ fn synthetic_eval_output(artifact: Artifact, decision: Decision) -> CheckOutput 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AllowlistEntry, BlocklistEntry};
+    use crate::policy::DecisionReason;
     use async_trait::async_trait;
     use clap::Parser;
-    use serde_json::{json, Value};
+    use serde_json::{json, Map, Value};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -343,6 +345,79 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn timestamp(raw: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn empty_pypi() -> StaticPypi {
+        StaticPypi {
+            projects: HashMap::new(),
+        }
+    }
+
+    fn empty_npm() -> StaticNpm {
+        StaticNpm {
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn npm_with_versions(versions: &[(&str, &str)]) -> StaticNpm {
+        let mut time = Map::new();
+        let mut version_metadata = Map::new();
+        for (version, published_at) in versions {
+            time.insert((*version).to_string(), json!(published_at));
+            version_metadata.insert(
+                (*version).to_string(),
+                json!({
+                    "dist": {
+                        "tarball": format!("https://registry.example/demo/-/demo-{version}.tgz"),
+                        "integrity": "sha512-allowed"
+                    }
+                }),
+            );
+        }
+        StaticNpm {
+            metadata: HashMap::from([(
+                "demo".to_string(),
+                json!({
+                    "name": "demo",
+                    "time": Value::Object(time),
+                    "versions": Value::Object(version_metadata)
+                }),
+            )]),
+        }
+    }
+
+    fn pypi_file(filename: &str, upload_time: DateTime<Utc>) -> crate::pypi::SimpleFile {
+        crate::pypi::SimpleFile {
+            filename: filename.to_string(),
+            url: format!("https://files.example/{filename}"),
+            hashes: BTreeMap::new(),
+            requires_python: None,
+            dist_info_metadata: None,
+            gpg_sig: None,
+            yanked: None,
+            upload_time: Some(upload_time),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn pypi_with_files(files: Vec<crate::pypi::SimpleFile>) -> StaticPypi {
+        StaticPypi {
+            projects: HashMap::from([(
+                "demo".to_string(),
+                crate::pypi::SimpleProject {
+                    meta: BTreeMap::new(),
+                    name: "demo".to_string(),
+                    versions: vec!["1.0.0".to_string()],
+                    files,
+                },
+            )]),
+        }
+    }
+
     #[tokio::test]
     async fn registry_check_uses_npm_metadata_publish_time() {
         let config = Config::default();
@@ -397,6 +472,185 @@ mod tests {
             )
         );
         assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_check_blocks_too_new_npm_metadata() {
+        let config = Config::default();
+        let npm = npm_with_versions(&[("2.0.0", "2026-07-05T00:00:00Z")]);
+        let pypi = empty_pypi();
+        let checker = CleanChecker {
+            calls: AtomicU32::new(0),
+        };
+
+        let output = registry_check(
+            &config,
+            "npm:demo@2.0.0",
+            fixed_now(),
+            &checker,
+            &npm,
+            &pypi,
+        )
+        .await
+        .unwrap();
+
+        assert!(!output.allowed);
+        assert_eq!(output.artifacts.len(), 1);
+        assert_eq!(
+            output.artifacts[0].decision.reason,
+            DecisionReason::TooYoung
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_check_allows_old_pypi_upload_time() {
+        let mut config = Config::default();
+        config.upstreams.pypi.simple_url = "https://pypi.example/simple".to_string();
+        let pypi = pypi_with_files(vec![pypi_file(
+            "demo-1.0.0.tar.gz",
+            timestamp("2026-06-01T00:00:00Z"),
+        )]);
+        let npm = empty_npm();
+        let checker = CleanChecker {
+            calls: AtomicU32::new(0),
+        };
+
+        let output = registry_check(
+            &config,
+            "pypi:demo@1.0.0",
+            fixed_now(),
+            &checker,
+            &npm,
+            &pypi,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.allowed);
+        assert_eq!(output.artifacts.len(), 1);
+        assert_eq!(output.artifacts[0].decision.reason, DecisionReason::Allowed);
+        assert_eq!(
+            output.artifacts[0].decision.published_at,
+            Some(timestamp("2026-06-01T00:00:00Z"))
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_check_fails_when_npm_version_is_missing() {
+        let config = Config::default();
+        let npm = npm_with_versions(&[("1.0.0", "2026-06-01T00:00:00Z")]);
+        let pypi = empty_pypi();
+        let checker = CleanChecker {
+            calls: AtomicU32::new(0),
+        };
+
+        let err = registry_check(
+            &config,
+            "npm:demo@9.9.9",
+            fixed_now(),
+            &checker,
+            &npm,
+            &pypi,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("npm version not found"));
+    }
+
+    #[tokio::test]
+    async fn registry_check_fails_when_pypi_version_is_missing() {
+        let config = Config::default();
+        let pypi = pypi_with_files(vec![pypi_file(
+            "demo-1.0.0.tar.gz",
+            timestamp("2026-06-01T00:00:00Z"),
+        )]);
+        let npm = empty_npm();
+        let checker = CleanChecker {
+            calls: AtomicU32::new(0),
+        };
+
+        let err = registry_check(
+            &config,
+            "pypi:demo@9.9.9",
+            fixed_now(),
+            &checker,
+            &npm,
+            &pypi,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("PyPI version not found"));
+    }
+
+    #[tokio::test]
+    async fn registry_check_respects_manual_blocklist() {
+        let mut config = Config::default();
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Npm,
+            name: "demo".to_string(),
+            versions: vec!["1.0.0".to_string()],
+            reason: "blocked".to_string(),
+        });
+        let npm = npm_with_versions(&[("1.0.0", "2026-06-01T00:00:00Z")]);
+        let pypi = empty_pypi();
+        let checker = CleanChecker {
+            calls: AtomicU32::new(0),
+        };
+
+        let output = registry_check(
+            &config,
+            "npm:demo@1.0.0",
+            fixed_now(),
+            &checker,
+            &npm,
+            &pypi,
+        )
+        .await
+        .unwrap();
+
+        assert!(!output.allowed);
+        assert_eq!(
+            output.artifacts[0].decision.reason,
+            DecisionReason::ManuallyBlocked
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_check_respects_allowlist_age_bypass() {
+        let mut config = Config::default();
+        config.allowlist.push(AllowlistEntry {
+            ecosystem: Ecosystem::Npm,
+            name: "demo".to_string(),
+            version: "2.0.0".to_string(),
+            bypass_age_gate: true,
+            bypass_malicious: true,
+            reason: "approved exception".to_string(),
+        });
+        let npm = npm_with_versions(&[("2.0.0", "2026-07-05T00:00:00Z")]);
+        let pypi = empty_pypi();
+        let checker = CleanChecker {
+            calls: AtomicU32::new(0),
+        };
+
+        let output = registry_check(
+            &config,
+            "npm:demo@2.0.0",
+            fixed_now(),
+            &checker,
+            &npm,
+            &pypi,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.allowed);
+        assert_eq!(
+            output.artifacts[0].decision.reason,
+            DecisionReason::Allowlisted
+        );
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

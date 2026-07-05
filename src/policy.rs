@@ -499,7 +499,6 @@ mod tests {
             policy: PolicyConfig {
                 minimum_age: Duration::from_secs(72 * 60 * 60),
                 osv: OsvConfig {
-                    only_mal_ids: true,
                     api_url: "https://api.osv.dev".to_string(),
                     on_error: OsvErrorBehavior::Block,
                 },

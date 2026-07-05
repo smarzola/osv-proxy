@@ -66,7 +66,7 @@ Blocked decision:
 11. If publish time is missing, follow `missing_publish_time` config.
 12. Otherwise allow.
 
-Allowlist entries are exact-version only in v1.
+Allowlist entries are exact-version only.
 
 ## Allowlist
 
@@ -82,7 +82,7 @@ allowlist:
     reason: "Known safe old version"
 ```
 
-Not supported in v1:
+Not supported:
 
 ```yaml
 allowlist:
@@ -123,14 +123,16 @@ The age gate applies during metadata filtering and artifact serving.
 
 ## Malicious Package Blocking
 
-For v1, only OSV IDs starting with `MAL-` are considered malicious.
+By default, only OSV IDs starting with `MAL-` are considered malicious.
 
 Classification:
 
 - `MAL-*`: malicious
-- CVEs, GHSAs, and other vulnerabilities: ignored for blocking in v1
+- CVEs, GHSAs, and other vulnerabilities: ignored for blocking by default
 
-Naive mode queries OSV during policy evaluation. Local mode checks a MongoDB-compatible store and must not call OSV during install-request handling.
+OSV is checked during policy evaluation. The default OSV API URL is
+`https://api.osv.dev`; override `policy.osv.api_url` only when routing through a
+mirror, fixture, or private gateway.
 
 ## Manual Blocklist
 
@@ -150,4 +152,4 @@ blocklist:
     reason: "Legacy versions not allowed"
 ```
 
-v1 can start with exact versions and `*`. Version ranges can follow after exact-version behavior is stable.
+Version ranges can follow after exact-version behavior is stable.

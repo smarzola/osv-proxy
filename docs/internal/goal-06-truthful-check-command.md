@@ -66,7 +66,7 @@ When a milestone is complete:
 - [x] Milestone 0: Baseline and command contract
 - [x] Milestone 1: Adapter artifact lookup APIs
 - [x] Milestone 2: Registry-backed CLI check orchestration
-- [ ] Milestone 3: Tests and docs for truthful check
+- [x] Milestone 3: Tests and docs for truthful check
 - [ ] Milestone 4: Final regression and adversarial audit
 
 ## Milestone 0: Baseline and Command Contract
@@ -255,6 +255,16 @@ cargo test
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note, 2026-07-06:
+
+- Added mocked registry-backed `check` tests for npm and PyPI old-version allows, npm too-new blocking, PyPI per-file blocking, missing npm/PyPI upstream versions, manual blocklist, and allowlist age/malicious bypass behavior. No live npm, PyPI, or OSV network is used.
+- Updated README, configuration docs, and policy docs so `check` is described as registry-backed and `eval` is described as synthetic/manual. Updated example configs for the current `policy.osv` shape and restored `examples/phase1/osv-proxy.yaml` for final validation.
+- Verification run:
+  - `cargo test check`: passed, 13 matching tests.
+  - `cargo test cli`: passed, 13 matching tests.
+  - `cargo test`: sandbox run passed 89 library tests then failed `server::tests::idle_connection_does_not_block_unrelated_request` with `Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }`; rerun outside sandbox passed 90 library tests and 2 e2e tests.
+- Commit: pending.
 
 ## Milestone 4: Final Regression and Adversarial Audit
 
