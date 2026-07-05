@@ -36,9 +36,9 @@ impl Config {
                     "allowlist entries must use exact versions".to_string(),
                 ));
             }
-            if entry.bypass_malicious && entry.reason.trim().is_empty() {
+            if entry.bypass_osv && entry.reason.trim().is_empty() {
                 return Err(ConfigError::Invalid(
-                    "allowlist entries with bypass_malicious=true require a reason".to_string(),
+                    "allowlist entries with bypass_osv=true require a reason".to_string(),
                 ));
             }
         }
@@ -63,14 +63,14 @@ impl Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-    pub listen: String,
+    pub bind: String,
     pub public_base_url: String,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen: "127.0.0.1:8080".to_string(),
+            bind: "127.0.0.1:8080".to_string(),
             public_base_url: "http://127.0.0.1:8080".to_string(),
         }
     }
@@ -140,6 +140,7 @@ pub enum MissingPublishTime {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OsvConfig {
+    pub block_malicious: bool,
     pub api_url: String,
     pub on_error: OsvErrorBehavior,
 }
@@ -147,6 +148,7 @@ pub struct OsvConfig {
 impl Default for OsvConfig {
     fn default() -> Self {
         Self {
+            block_malicious: true,
             api_url: "https://api.osv.dev".to_string(),
             on_error: OsvErrorBehavior::Block,
         }
@@ -169,7 +171,7 @@ pub struct AllowlistEntry {
     #[serde(default)]
     pub bypass_age_gate: bool,
     #[serde(default)]
-    pub bypass_malicious: bool,
+    pub bypass_osv: bool,
     #[serde(default)]
     pub reason: String,
 }
@@ -262,6 +264,7 @@ mod tests {
             config.policy.missing_publish_time,
             MissingPublishTime::Block
         );
+        assert!(config.policy.osv.block_malicious);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         config.validate().unwrap();
@@ -272,17 +275,19 @@ mod tests {
         let config = load(
             r#"
 server:
-  listen: "127.0.0.1:8080"
+  bind: "127.0.0.1:8080"
   public_base_url: "http://127.0.0.1:8080"
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
   osv:
+    block_malicious: false
     on_error: "block"
 "#,
         )
         .unwrap();
 
+        assert!(!config.policy.osv.block_malicious);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
     }
@@ -382,7 +387,7 @@ typo: true
         let err = load(
             r#"
 server:
-  listen: "127.0.0.1:8080"
+  bind: "127.0.0.1:8080"
   typo: true
 "#,
         )
@@ -426,6 +431,34 @@ policy:
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field `only_mal_ids`"));
+    }
+
+    #[test]
+    fn rejects_old_server_listen_key() {
+        let err = load(
+            r#"
+server:
+  listen: "127.0.0.1:8080"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `listen`"));
+    }
+
+    #[test]
+    fn rejects_old_allowlist_bypass_malicious_key() {
+        let err = load(
+            r#"
+allowlist:
+  - ecosystem: npm
+    name: lodash
+    version: "4.17.21"
+    bypass_malicious: true
+    reason: "old key"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `bypass_malicious`"));
     }
 
     #[test]

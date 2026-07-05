@@ -19,7 +19,7 @@ const REQUEST_BODY_LIMIT_BYTES: usize = 8192;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn serve(config: Config) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(&config.server.listen).await?;
+    let listener = TcpListener::bind(&config.server.bind).await?;
     println!("serving osv-proxy on {}", listener.local_addr()?);
     serve_listener(listener, config).await
 }

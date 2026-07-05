@@ -55,7 +55,7 @@ Blocked decision:
 
 1. Build canonical `Artifact`.
 2. Check exact-version allowlist.
-3. If allowlist has `bypass_malicious=true`, skip malicious check.
+3. If allowlist has `bypass_osv=true`, skip OSV check.
 4. Otherwise check malicious package source.
 5. If malicious, block.
 6. Check manual local blocklist.
@@ -78,7 +78,7 @@ allowlist:
     name: lodash
     version: "4.17.21"
     bypass_age_gate: true
-    bypass_malicious: false
+    bypass_osv: false
     reason: "Known safe old version"
 ```
 
@@ -91,7 +91,7 @@ allowlist:
     version: "*"
 ```
 
-Bypassing malicious package blocks must be explicit and require a reason.
+Bypassing OSV package blocks must be explicit and require a reason.
 
 ```yaml
 allowlist:
@@ -99,7 +99,7 @@ allowlist:
     name: some-package
     version: "1.2.3"
     bypass_age_gate: true
-    bypass_malicious: true
+    bypass_osv: true
     reason: "False positive confirmed internally"
 ```
 

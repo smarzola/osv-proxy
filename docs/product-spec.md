@@ -65,6 +65,7 @@ policy:
   minimum_age: "72h"
   missing_publish_time: "block"
   osv:
+    block_malicious: true
     on_error: "block"
 ```
 

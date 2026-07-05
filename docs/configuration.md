@@ -7,12 +7,13 @@ typos do not silently change install behavior.
 
 ```yaml
 server:
-  listen: "127.0.0.1:8080"
+  bind: "127.0.0.1:8080"
   public_base_url: "http://127.0.0.1:8080"
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
   osv:
+    block_malicious: true
     on_error: "block"
 ```
 
@@ -29,11 +30,11 @@ Configure them only when routing through a mirror, fixture, or private gateway.
 
 ```yaml
 server:
-  listen: "127.0.0.1:8080"
+  bind: "127.0.0.1:8080"
   public_base_url: "http://127.0.0.1:8080"
 ```
 
-- `listen`: local socket address for the HTTP server.
+- `bind`: local socket address for the HTTP server.
 - `public_base_url`: URL used when rewriting npm tarballs and PyPI file links
   back through `osv-proxy`.
 
@@ -61,12 +62,15 @@ policy:
   minimum_age: "72h"
   missing_publish_time: "block"
   osv:
+    block_malicious: true
     on_error: "block"
 ```
 
 - `minimum_age`: minimum age before a package version can be installed. It must
   be a valid duration that fits policy evaluation.
 - `missing_publish_time`: `block` or `allow`.
+- `osv.block_malicious`: when true, OSV `MAL-*` records block package versions.
+  Defaults to true.
 - `osv.on_error`: `block` fails closed; `allow` fails open when the OSV check
   fails or a required OSV result is missing.
 - `osv.api_url`: optional OSV API base URL override. Omit it to use
@@ -86,11 +90,11 @@ allowlist:
     name: "@company/safe-package"
     version: "1.2.3"
     bypass_age_gate: true
-    bypass_malicious: false
+    bypass_osv: false
     reason: "Internal emergency release"
 ```
 
-`bypass_malicious: true` requires a non-empty `reason`.
+`bypass_osv: true` requires a non-empty `reason`.
 
 ## Blocklist
 

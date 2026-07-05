@@ -47,22 +47,24 @@ impl<'a> PolicyEngine<'a> {
         now: DateTime<Utc>,
         malicious_checker: &dyn MaliciousChecker,
     ) -> Decision {
-        let malicious_result = if self.bypasses_malicious(artifact) {
-            None
-        } else {
+        let malicious_result = if self.should_check_osv(artifact) {
             Some(
                 malicious_checker
                     .check(artifact)
                     .await
                     .map_err(|err| err.to_string()),
             )
+        } else {
+            None
         };
         self.evaluate_with_malicious_result(artifact, now, malicious_result)
     }
 
-    pub fn bypasses_malicious(&self, artifact: &Artifact) -> bool {
-        self.find_allowlist_entry(artifact)
-            .is_some_and(|entry| entry.bypass_malicious)
+    pub fn should_check_osv(&self, artifact: &Artifact) -> bool {
+        self.config.policy.osv.block_malicious
+            && !self
+                .find_allowlist_entry(artifact)
+                .is_some_and(|entry| entry.bypass_osv)
     }
 
     pub fn evaluate_with_malicious_result(
@@ -73,7 +75,7 @@ impl<'a> PolicyEngine<'a> {
     ) -> Decision {
         let allowlist_entry = self.find_allowlist_entry(artifact);
 
-        if !self.bypasses_malicious(artifact) {
+        if self.should_check_osv(artifact) {
             match malicious_result {
                 Some(Ok(hits)) => {
                     if let Some(hit) = self.blocking_malicious_hit(hits) {
@@ -458,14 +460,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allowlist_bypass_malicious_skips_checker() {
+    async fn allowlist_bypass_osv_skips_checker() {
         let mut config = Config::default();
         config.allowlist.push(AllowlistEntry {
             ecosystem: Ecosystem::Npm,
             name: "lodash".to_string(),
             version: "4.17.21".to_string(),
             bypass_age_gate: true,
-            bypass_malicious: true,
+            bypass_osv: true,
             reason: "false positive".to_string(),
         });
         let checker = FakeChecker::with_hit("MAL-2026-000001");
@@ -478,11 +480,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_osv_malicious_blocking_skips_checker() {
+        let mut config = Config::default();
+        config.policy.osv.block_malicious = false;
+        let checker = FakeChecker::with_hit("MAL-2026-000001");
+        let decision = PolicyEngine::new(&config)
+            .evaluate(&old_artifact(), now(), &checker)
+            .await;
+
+        assert!(decision.allowed);
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn allowlist_without_bypasses_still_checks_policy() {
         let mut config = Config {
             policy: PolicyConfig {
                 minimum_age: Duration::from_secs(72 * 60 * 60),
                 osv: OsvConfig {
+                    block_malicious: true,
                     api_url: "https://api.osv.dev".to_string(),
                     on_error: OsvErrorBehavior::Block,
                 },
@@ -495,7 +511,7 @@ mod tests {
             name: "lodash".to_string(),
             version: "4.17.21".to_string(),
             bypass_age_gate: false,
-            bypass_malicious: false,
+            bypass_osv: false,
             reason: "tracked".to_string(),
         });
         let decision = PolicyEngine::new(&config)

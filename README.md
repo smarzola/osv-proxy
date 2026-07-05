@@ -130,12 +130,13 @@ The default config is intentionally small:
 
 ```yaml
 server:
-  listen: "127.0.0.1:8080"
+  bind: "127.0.0.1:8080"
   public_base_url: "http://127.0.0.1:8080"
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
   osv:
+    block_malicious: true
     on_error: "block"
 ```
 

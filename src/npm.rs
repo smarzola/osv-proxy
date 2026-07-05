@@ -163,7 +163,7 @@ async fn filter_metadata(
     let artifacts_to_check = artifacts
         .iter()
         .enumerate()
-        .filter(|(_, artifact)| !policy.bypasses_malicious(artifact))
+        .filter(|(_, artifact)| policy.should_check_osv(artifact))
         .map(|(index, artifact)| (index, artifact.clone()))
         .collect::<Vec<_>>();
     let checked_artifacts = artifacts_to_check
@@ -635,7 +635,7 @@ mod tests {
             name: "demo".to_string(),
             version: "2.0.0".to_string(),
             bypass_age_gate: false,
-            bypass_malicious: true,
+            bypass_osv: true,
             reason: "known false positive".to_string(),
         });
         let metadata = json!({

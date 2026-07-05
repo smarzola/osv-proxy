@@ -625,7 +625,7 @@ mod tests {
             name: "demo".to_string(),
             version: "2.0.0".to_string(),
             bypass_age_gate: true,
-            bypass_malicious: true,
+            bypass_osv: true,
             reason: "approved exception".to_string(),
         });
         let npm = npm_with_versions(&[("2.0.0", "2026-07-05T00:00:00Z")]);
