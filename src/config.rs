@@ -564,8 +564,6 @@ policy:
 "#,
         )
         .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("policy.minimum_age is too large"));
+        assert!(err.to_string().contains("policy.minimum_age is too large"));
     }
 }

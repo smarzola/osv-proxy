@@ -85,18 +85,19 @@ impl<'a> PolicyEngine<'a> {
                         );
                     }
                 }
-                Some(Err(err)) => {
-                    if self.config.policy.malicious.on_osv_error == OsvErrorBehavior::Block {
-                        return blocked(
-                            DecisionReason::Malicious,
-                            artifact,
-                            format!("Blocked because OSV malicious check failed: {err}"),
-                            None,
-                            Some("osv".to_string()),
-                            None,
-                        );
-                    }
+                Some(Err(err))
+                    if self.config.policy.malicious.on_osv_error == OsvErrorBehavior::Block =>
+                {
+                    return blocked(
+                        DecisionReason::Malicious,
+                        artifact,
+                        format!("Blocked because OSV malicious check failed: {err}"),
+                        None,
+                        Some("osv".to_string()),
+                        None,
+                    );
                 }
+                Some(Err(_)) => {}
                 None => {}
             }
         }

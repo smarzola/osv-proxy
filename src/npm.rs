@@ -608,10 +608,7 @@ mod tests {
         .unwrap_or_else(|err| error_response(&err));
 
         assert_eq!(response.status, 404);
-        assert!(response
-            .headers
-            .iter()
-            .all(|(name, _)| name != "location"));
+        assert!(response.headers.iter().all(|(name, _)| name != "location"));
         assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
     }
 
@@ -646,10 +643,7 @@ mod tests {
         .unwrap_or_else(|err| error_response(&err));
 
         assert_eq!(response.status, 404);
-        assert!(response
-            .headers
-            .iter()
-            .all(|(name, _)| name != "location"));
+        assert!(response.headers.iter().all(|(name, _)| name != "location"));
         assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
     }
 

@@ -73,7 +73,7 @@ When a milestone is complete:
 - [x] Milestone 3: npm artifact basename enforcement
 - [x] Milestone 4: Strict config validation
 - [x] Milestone 5: PyPI Simple root compatibility
-- [ ] Milestone 6: Final regression and docs audit
+- [x] Milestone 6: Final regression and docs audit
 
 ## Milestone 0: Baseline and Async Design Lock
 
@@ -352,7 +352,7 @@ Status note - 2026-07-05:
   - `cargo test pypi` passed: 19 filtered tests passed.
   - `cargo test server` passed outside the sandbox: 18 server-filtered tests passed.
   - `cargo test e2e_pypi` passed: 2 PyPI e2e route tests passed.
-- Commit: pending.
+- Commit: `daab70b`.
 
 Problem:
 
@@ -390,6 +390,20 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 6: Final Regression and Docs Audit
+
+Status note - 2026-07-05:
+
+- Full regression passed after the async server/client migration, batch malicious checks, npm basename hardening, strict config validation, and PyPI root rewrite.
+- Documentation audit updated README, registry behavior, and configuration docs during the relevant milestones; Tokio/concurrency behavior is implemented in code and covered by the idle-connection server test.
+- Scope audit confirmed this goal did not add in-process metadata caching, local malicious storage, MongoDB/cachebox/S3 clients, artifact cache implementation, or proxy streaming. The required search command returns existing roadmap/docs/example/config-rejection references, plus config enum/test strings that reject unsupported modes; it does not show added implementation paths for those features.
+- Verification:
+  - `cargo test` passed outside the sandbox: 76 library tests, 0 main tests, 2 package-manager integration tests, and 0 doc tests.
+  - `cargo fmt --check` passed after running `cargo fmt` for formatting-only changes.
+  - `cargo clippy --all-targets --all-features -- -D warnings` passed.
+  - `cargo run -- config validate --config examples/phase1/osv-proxy.yaml` passed and printed `configuration is valid for phase one`.
+  - `rg -n "mongodb|cachebox|S3|proxy_cache_s3|memory cache|HashMap.*cache|artifact cache|proxy streaming" src examples docs` returned only existing docs/examples and config rejection references; no implementation of forbidden storage/cache/proxy features was added.
+  - `git diff --check` passed.
+- Commit: pending.
 
 Problem:
 
