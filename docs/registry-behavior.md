@@ -76,7 +76,10 @@ For metadata requests:
 8. Recompute `dist-tags` so they do not point to filtered versions.
 9. Return filtered metadata.
 
-Tarball requests evaluate policy again before redirecting.
+Tarball requests fetch the version's upstream metadata, require the requested
+tarball basename to exactly match that version's upstream `dist.tarball`
+basename, and then evaluate policy again before redirecting. A basename
+mismatch returns `404` and does not redirect.
 
 ## PyPI Routes
 

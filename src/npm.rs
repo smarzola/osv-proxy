@@ -109,7 +109,8 @@ pub fn error_response(error: &NpmError) -> NpmResponse {
     let status = match error {
         NpmError::VersionNotFound(_, _)
         | NpmError::MissingTarballUrl(_, _)
-        | NpmError::InvalidTarballName(_) => 404,
+        | NpmError::InvalidTarballName(_)
+        | NpmError::TarballBasenameMismatch { .. } => 404,
         NpmError::Upstream(_) => 502,
         NpmError::Json(_) | NpmError::InvalidMetadata(_) => 500,
     };
@@ -226,6 +227,18 @@ fn artifact_from_metadata(
         .and_then(parse_npm_time);
     let mut artifact =
         artifact_from_version_metadata(package, version, version_metadata, published_at);
+    let expected_tarball = artifact
+        .filename
+        .clone()
+        .ok_or_else(|| NpmError::MissingTarballUrl(package.to_string(), version.to_string()))?;
+    if expected_tarball != tarball {
+        return Err(NpmError::TarballBasenameMismatch {
+            package: package.to_string(),
+            version: version.to_string(),
+            requested: tarball.to_string(),
+            expected: expected_tarball,
+        });
+    }
     artifact.filename = Some(tarball.to_string());
     Ok(artifact)
 }
@@ -336,6 +349,15 @@ pub enum NpmError {
     MissingTarballUrl(String, String),
     #[error("could not infer npm version from tarball name {0}")]
     InvalidTarballName(String),
+    #[error(
+        "requested npm tarball {requested} does not match upstream basename {expected} for {package}@{version}"
+    )]
+    TarballBasenameMismatch {
+        package: String,
+        version: String,
+        requested: String,
+        expected: String,
+    },
 }
 
 #[cfg(test)]
@@ -553,6 +575,82 @@ mod tests {
             )]
         );
         assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn npm_artifact_rejects_unscoped_tarball_basename_mismatch() {
+        let config = Config::default();
+        let metadata = json!({
+            "name": "demo",
+            "time": { "1.0.0": "2026-06-01T00:00:00Z" },
+            "versions": {
+                "1.0.0": {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "dist": {
+                        "tarball": "https://registry.example/demo/-/demo-1.0.0.tgz"
+                    }
+                }
+            }
+        });
+        let upstream = StaticUpstream::new("demo", metadata);
+        let checker = CleanChecker::new();
+
+        let response = artifact_response(
+            &config,
+            &upstream,
+            &checker,
+            "demo",
+            "anything-1.0.0.tgz",
+            now(),
+        )
+        .await
+        .unwrap_or_else(|err| error_response(&err));
+
+        assert_eq!(response.status, 404);
+        assert!(response
+            .headers
+            .iter()
+            .all(|(name, _)| name != "location"));
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn npm_artifact_rejects_scoped_tarball_basename_mismatch() {
+        let config = Config::default();
+        let metadata = json!({
+            "name": "@babel/core",
+            "time": { "7.24.0": "2026-06-01T00:00:00Z" },
+            "versions": {
+                "7.24.0": {
+                    "name": "@babel/core",
+                    "version": "7.24.0",
+                    "dist": {
+                        "tarball": "https://registry.example/@babel/core/-/core-7.24.0.tgz"
+                    }
+                }
+            }
+        });
+        let upstream = StaticUpstream::new("@babel/core", metadata);
+        let checker = CleanChecker::new();
+
+        let response = artifact_response(
+            &config,
+            &upstream,
+            &checker,
+            "@babel/core",
+            "anything-7.24.0.tgz",
+            now(),
+        )
+        .await
+        .unwrap_or_else(|err| error_response(&err));
+
+        assert_eq!(response.status, 404);
+        assert!(response
+            .headers
+            .iter()
+            .all(|(name, _)| name != "location"));
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

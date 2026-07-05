@@ -70,7 +70,7 @@ When a milestone is complete:
 - [x] Milestone 0: Baseline and async design lock
 - [x] Milestone 1: Tokio HTTP server and request timeouts
 - [x] Milestone 2: Nonblocking upstream clients and bounded malicious checks
-- [ ] Milestone 3: npm artifact basename enforcement
+- [x] Milestone 3: npm artifact basename enforcement
 - [ ] Milestone 4: Strict config validation
 - [ ] Milestone 5: PyPI Simple root compatibility
 - [ ] Milestone 6: Final regression and docs audit
@@ -197,7 +197,7 @@ Status note - 2026-07-05:
   - `cargo test npm` failed in the sandbox only at the package-manager e2e loopback bind with `Operation not permitted`; `cargo test npm` passed outside the sandbox with 17 library-filtered tests and 1 package-manager integration test.
   - `cargo test pypi` passed: 18 filtered tests passed.
   - `cargo test e2e` passed outside the sandbox: 4 e2e-filtered library tests passed.
-- Commit: pending.
+- Commit: `54d7f39`.
 
 Problem:
 
@@ -242,6 +242,18 @@ Commit requirement:
 - Commit after marking this milestone done and adding the status note.
 
 ## Milestone 3: npm Artifact Basename Enforcement
+
+Status note - 2026-07-05:
+
+- Enforced npm artifact basename matching during direct artifact serving: the requested tarball basename must exactly match the upstream metadata `dist.tarball` basename for the inferred version.
+- Basename mismatches now return `404` through the npm error response path and do not perform the second malicious/policy check or return a redirect.
+- Added unscoped and scoped npm tests for wrong basenames such as `anything-1.0.0.tgz` and `anything-7.24.0.tgz`, and preserved the existing correct-basename redirect test.
+- Updated registry behavior docs to describe the basename guard.
+- Verification:
+  - `cargo test npm` passed outside the sandbox: 19 library-filtered tests and 1 package-manager integration test passed.
+  - `cargo test e2e_npm` passed: 2 e2e npm route tests passed.
+  - `cargo test server` passed outside the sandbox: 17 server-filtered tests passed.
+- Commit: pending.
 
 Problem:
 
