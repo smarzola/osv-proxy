@@ -32,11 +32,9 @@ Implemented now:
 
 Not implemented yet:
 
-- Local malicious-package storage.
-- MongoDB or mongolino-backed sync.
+- Local malicious-package storage and sync.
 - Metadata caching.
 - S3 artifact caching.
-- `sync-malicious`.
 - Authentication, publishing, license policy, vulnerability severity policy, or
   broad package scanning.
 
