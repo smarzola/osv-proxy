@@ -1,5 +1,9 @@
 # Repository Instructions
 
+## Working Agreements
+
+- Treat correctness and performance as first-class requirements. This project sits in the package-install path, so changes should preserve deterministic behavior and avoid unnecessary latency.
+
 ## Releases
 
 - CI runs formatting and tests on every push to `main` and on pull requests.

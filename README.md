@@ -1,10 +1,12 @@
 # osv-proxy
 
-`osv-proxy` is a package-registry policy proxy for npm and PyPI.
+`osv-proxy` is a package-registry security proxy for npm and PyPI that combines
+the [OSV vulnerability database](https://osv.dev/) with local policy.
 
 It sits between package managers and public registries, filters package metadata
-through deterministic policy, and checks the same policy again before delivering
-artifact downloads according to the configured artifact behavior.
+through deterministic policy backed by OSV data and local rules, and checks the
+same policy again before delivering artifact downloads according to the
+configured artifact behavior.
 
 ## What It Does
 
