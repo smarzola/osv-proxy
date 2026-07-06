@@ -11,8 +11,7 @@ configured artifact behavior.
 ## What It Does
 
 - Blocks package versions that are too new for the configured minimum age.
-- Blocks package versions with OSV malicious-package records whose IDs start
-  with `MAL-`.
+- Blocks package versions with OSV malicious-package records.
 - Supports exact-version allowlist exceptions.
 - Supports exact-version and whole-package blocklist entries.
 - Filters npm metadata and PyPI Simple project metadata so blocked versions are
