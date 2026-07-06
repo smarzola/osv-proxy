@@ -12,7 +12,8 @@
 8. `MAL-*` block
 9. exact allowlist
 
-Then add PyPI, local MongoDB-compatible mode, mongolino deployment examples, cachebox, and proxy/S3 artifact modes.
+Then add PyPI, local MongoDB-compatible mode, mongolino deployment examples,
+cachebox, and S3 artifact cache mode.
 
 ## Milestone 1: Config and Policy Engine
 
@@ -138,11 +139,27 @@ Acceptance tests:
 - updated malicious store blocks package even when metadata is cached
 - no memory metadata cache implementation exists
 
-## Milestone 7: Proxy and S3 Artifact Modes
+## Milestone 7: Plain Artifact Proxy Mode
 
 Build:
 
 - proxy artifact streaming
+- `artifacts.behavior: proxy`
+- unsupported `proxy_cache_s3` validation
+
+Acceptance tests:
+
+- proxy mode streams upstream bytes
+- redirect mode remains the default
+- policy is checked before proxying artifacts
+- blocked artifacts return 403 without fetching upstream artifact bytes
+
+Status: implemented.
+
+## Milestone 8: S3 Artifact Cache Mode
+
+Build:
+
 - `proxy_cache_s3`
 - S3-compatible storage
 - cache hit/miss logic
@@ -150,13 +167,14 @@ Build:
 
 Acceptance tests:
 
-- proxy mode streams upstream bytes
 - `proxy_cache_s3` serves cache hits
 - `proxy_cache_s3` writes cache misses
 - policy is checked before serving S3 cached artifact
 - blocked cached artifact returns 403
 
-## Milestone 8: Hardening and Client Compatibility
+Status: future.
+
+## Milestone 9: Hardening and Client Compatibility
 
 Test clients:
 

@@ -1,13 +1,13 @@
 use crate::artifact::{Artifact, ArtifactHashes, Ecosystem};
 use crate::artifacts::{
-    self, ArtifactDeliveryClient, ArtifactDeliveryError, ArtifactDeliveryResponse,
+    self, ArtifactDeliveryClient, ArtifactDeliveryError, ArtifactDeliveryOptions,
+    ArtifactDeliveryResponse,
 };
 use crate::config::Config;
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
 use async_trait::async_trait;
-use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::{json, Map, Value};
@@ -101,27 +101,36 @@ pub async fn artifact_response(
 ) -> Result<NpmResponse, NpmError> {
     let delivery = ArtifactDeliveryClient::new();
     Ok(artifact_delivery_response(
-        config, upstream, checker, package, tarball, now, &delivery, None,
+        config,
+        upstream,
+        checker,
+        NpmArtifactRoute { package, tarball },
+        now,
+        ArtifactDeliveryOptions::new(&delivery),
     )
     .await?
     .into_registry_response()
     .await)
 }
 
+#[derive(Clone, Copy)]
+pub struct NpmArtifactRoute<'a> {
+    pub package: &'a str,
+    pub tarball: &'a str,
+}
+
 pub async fn artifact_delivery_response(
     config: &Config,
     upstream: &dyn NpmMetadataProvider,
     checker: &dyn MaliciousChecker,
-    package: &str,
-    tarball: &str,
+    route: NpmArtifactRoute<'_>,
     now: DateTime<Utc>,
-    delivery: &ArtifactDeliveryClient,
-    request_headers: Option<&HeaderMap>,
+    delivery: ArtifactDeliveryOptions<'_>,
 ) -> Result<ArtifactDeliveryResponse, NpmError> {
-    let version = infer_version_from_tarball(package, tarball)
-        .ok_or_else(|| NpmError::InvalidTarballName(tarball.to_string()))?;
-    let metadata = upstream.fetch_package_metadata(package).await?;
-    let artifact = artifact_from_metadata(package, &version, tarball, &metadata)?;
+    let version = infer_version_from_tarball(route.package, route.tarball)
+        .ok_or_else(|| NpmError::InvalidTarballName(route.tarball.to_string()))?;
+    let metadata = upstream.fetch_package_metadata(route.package).await?;
+    let artifact = artifact_from_metadata(route.package, &version, route.tarball, &metadata)?;
     let decision = PolicyEngine::new(config)
         .evaluate(&artifact, now, checker)
         .await;
@@ -129,8 +138,11 @@ pub async fn artifact_delivery_response(
     if decision.allowed {
         let location = artifact
             .upstream_url
-            .ok_or_else(|| NpmError::MissingTarballUrl(package.to_string(), version))?;
-        Ok(delivery.deliver(config, location, request_headers).await?)
+            .ok_or_else(|| NpmError::MissingTarballUrl(route.package.to_string(), version))?;
+        Ok(delivery
+            .client
+            .deliver(config, location, delivery.request_headers)
+            .await?)
     } else {
         let body = serde_json::to_value(decision)?;
         Ok(ArtifactDeliveryResponse::Buffered(NpmResponse::json(
@@ -457,7 +469,7 @@ mod tests {
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::policy::Decision;
     use async_trait::async_trait;
-    use axum::http::header;
+    use axum::http::{header, HeaderMap};
     use chrono::Duration as ChronoDuration;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -864,11 +876,12 @@ mod tests {
             &config,
             &upstream,
             &checker,
-            "demo",
-            "demo-1.0.0.tgz",
+            NpmArtifactRoute {
+                package: "demo",
+                tarball: "demo-1.0.0.tgz",
+            },
             now(),
-            &delivery,
-            Some(&headers),
+            ArtifactDeliveryOptions::with_request_headers(&delivery, &headers),
         )
         .await
         .unwrap()

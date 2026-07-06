@@ -3,8 +3,8 @@
 `osv-proxy` is a package-registry policy proxy for npm and PyPI.
 
 It sits between package managers and public registries, filters package metadata
-through deterministic policy, and checks the same policy again before redirecting
-artifact downloads upstream.
+through deterministic policy, and checks the same policy again before delivering
+artifact downloads according to the configured artifact behavior.
 
 ## What It Does
 
@@ -15,26 +15,26 @@ artifact downloads upstream.
 - Supports exact-version and whole-package blocklist entries.
 - Filters npm metadata and PyPI Simple project metadata so blocked versions are
   not offered to clients.
-- Rewrites allowed artifact URLs back through `osv-proxy`, then redirects to the
-  upstream registry only after a second policy check.
+- Rewrites allowed artifact URLs back through `osv-proxy`, then either redirects
+  to upstream or streams bytes through the proxy after a second policy check.
 
 ## Current Scope
 
 Implemented now:
 
-- npm metadata filtering and tarball redirects.
-- PyPI Simple JSON-backed filtering, HTML/JSON responses, and file redirects.
+- npm metadata filtering and tarball delivery.
+- PyPI Simple JSON-backed filtering, HTML/JSON responses, and file delivery.
 - YAML config loading and validation.
 - `serve`, `check`, and `config validate` commands.
 - Naive OSV API checks during request handling.
-- Redirect artifact behavior.
+- Redirect artifact behavior and plain artifact proxy behavior.
 
 Not implemented yet:
 
 - Local malicious-package storage.
 - MongoDB or mongolino-backed sync.
 - Metadata caching.
-- Artifact proxying or S3 artifact caching.
+- S3 artifact caching.
 - `sync-malicious`.
 - Authentication, publishing, license policy, vulnerability severity policy, or
   broad package scanning.
@@ -152,6 +152,8 @@ policy:
   osv:
     block_malicious: true
     on_error: "block"
+artifacts:
+  behavior: redirect
 ```
 
 The npm registry, PyPI Simple API, and OSV API default to their public URLs.
@@ -169,7 +171,9 @@ For every package version or file, `osv-proxy` evaluates:
 5. Missing publish time behavior.
 
 Blocked artifact requests return HTTP `403` with a structured JSON decision.
-Allowed artifact requests return HTTP `302` to the upstream tarball or file URL.
+Allowed artifact requests return HTTP `302` to the upstream tarball or file URL
+by default. With `artifacts.behavior: proxy`, allowed artifact requests stream
+the upstream response body and useful artifact headers through `osv-proxy`.
 
 For PyPI project pages, `osv-proxy` fetches upstream Simple JSON and uses
 `files[].upload-time` for the age gate. If a client requests

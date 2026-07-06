@@ -78,8 +78,8 @@ For metadata requests:
 
 Tarball requests fetch the version's upstream metadata, require the requested
 tarball basename to exactly match that version's upstream `dist.tarball`
-basename, and then evaluate policy again before redirecting. A basename
-mismatch returns `404` and does not redirect.
+basename, and then evaluate policy again before artifact delivery. A basename
+mismatch returns `404` and does not fetch or redirect artifact bytes.
 
 ## PyPI Routes
 
@@ -117,7 +117,7 @@ links are not passed through to clients.
     model.
 
 File routes fetch upstream Simple JSON, rebuild the requested artifact, and
-evaluate policy again before redirecting.
+evaluate policy again before artifact delivery.
 
 ## Artifact Modes
 
@@ -131,4 +131,20 @@ if allowed -> 302 redirect to upstream artifact URL
 client -> downloads bytes from upstream registry/CDN
 ```
 
-Proxy mode and S3 cache mode are not implemented in the current phase.
+Plain proxy mode streams allowed artifact bytes through `osv-proxy`:
+
+```text
+client -> osv-proxy artifact URL
+osv-proxy -> policy check
+if blocked -> 403
+if allowed -> fetch verified upstream artifact URL
+osv-proxy -> stream upstream status, body, and useful artifact headers
+```
+
+Proxy mode forwards selected request headers such as `Range`, `If-None-Match`,
+and `If-Modified-Since`. It preserves useful upstream artifact response headers
+such as `Content-Type`, `Content-Length`, `ETag`, `Last-Modified`,
+`Accept-Ranges`, `Content-Range`, `Cache-Control`, and `Expires`.
+
+`proxy_cache_s3` is not implemented. Configurations that select it are rejected
+until a future S3 cache milestone implements cache reads and writes.

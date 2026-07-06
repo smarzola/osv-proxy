@@ -15,6 +15,8 @@ policy:
   osv:
     block_malicious: true
     on_error: "block"
+artifacts:
+  behavior: redirect
 ```
 
 Validate it with:
@@ -54,6 +56,23 @@ upstreams:
 
 Both upstream values have the public registry defaults shown above, so most
 local configs can omit this section.
+
+## Artifacts
+
+```yaml
+artifacts:
+  behavior: redirect
+```
+
+- `behavior`: `redirect` or `proxy`. Defaults to `redirect`.
+- `redirect`: after the second policy check, allowed artifact requests return
+  `302 Location` to the upstream tarball or file URL.
+- `proxy`: after the second policy check, allowed artifact requests fetch the
+  verified upstream artifact URL and stream the upstream response through
+  `osv-proxy`.
+
+`proxy_cache_s3` is reserved for future S3-compatible artifact caching and is
+rejected as unsupported.
 
 ## Policy
 

@@ -1,4 +1,4 @@
-use crate::artifacts::ArtifactDeliveryClient;
+use crate::artifacts::{ArtifactDeliveryClient, ArtifactDeliveryOptions};
 use crate::config::Config;
 use crate::malicious::{MaliciousChecker, OsvHttpClient};
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
@@ -236,11 +236,12 @@ async fn route_http_request_with_accept_and_headers(
             config,
             &npm_upstream,
             &checker,
-            &package,
-            &tarball,
+            npm::NpmArtifactRoute {
+                package: &package,
+                tarball: &tarball,
+            },
             now,
-            &delivery,
-            Some(headers),
+            ArtifactDeliveryOptions::with_request_headers(&delivery, headers),
         )
         .await
         .map(|response| response.into_http_response())
@@ -269,12 +270,13 @@ async fn route_http_request_with_accept_and_headers(
                 config,
                 &pypi_upstream,
                 &checker,
-                &project,
-                &version,
-                &filename,
+                pypi::PypiArtifactRoute {
+                    project: &project,
+                    version: &version,
+                    filename: &filename,
+                },
                 now,
-                &delivery,
-                Some(headers),
+                ArtifactDeliveryOptions::with_request_headers(&delivery, headers),
             )
             .await
             .map(|response| response.into_http_response())

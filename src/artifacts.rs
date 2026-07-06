@@ -92,6 +92,31 @@ impl Default for ArtifactDeliveryClient {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct ArtifactDeliveryOptions<'a> {
+    pub client: &'a ArtifactDeliveryClient,
+    pub request_headers: Option<&'a HeaderMap>,
+}
+
+impl<'a> ArtifactDeliveryOptions<'a> {
+    pub fn new(client: &'a ArtifactDeliveryClient) -> Self {
+        Self {
+            client,
+            request_headers: None,
+        }
+    }
+
+    pub fn with_request_headers(
+        client: &'a ArtifactDeliveryClient,
+        request_headers: &'a HeaderMap,
+    ) -> Self {
+        Self {
+            client,
+            request_headers: Some(request_headers),
+        }
+    }
+}
+
 pub enum ArtifactDeliveryResponse {
     Buffered(RegistryResponse),
     Streaming(reqwest::Response),

@@ -182,18 +182,13 @@ impl Default for ArtifactsConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ArtifactBehavior {
+    #[default]
     Redirect,
     Proxy,
     ProxyCacheS3,
-}
-
-impl Default for ArtifactBehavior {
-    fn default() -> Self {
-        Self::Redirect
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

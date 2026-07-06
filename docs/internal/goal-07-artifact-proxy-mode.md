@@ -115,7 +115,7 @@ When a milestone is complete:
 - [x] Milestone 1: Artifact behavior config
 - [x] Milestone 2: Shared artifact delivery layer
 - [x] Milestone 3: npm and PyPI proxy-mode integration
-- [ ] Milestone 4: Docs and final regression
+- [x] Milestone 4: Docs and final regression
 
 ## Milestone 0: Baseline and Delivery Contract
 
@@ -391,6 +391,21 @@ rg -n "proxy_cache_s3|S3|artifact proxying|proxy mode|artifacts:" README.md docs
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note (2026-07-06):
+
+- Updated README, configuration docs, registry behavior docs, and milestones to
+  document supported plain proxy mode, preserve redirect as the default, and
+  keep `proxy_cache_s3` marked future/unsupported.
+- Verification: `cargo test` passed outside the sandbox with 106 lib tests, 0
+  main tests, 2 package-manager e2e tests, and 0 doctests; `cargo fmt --check`
+  passed; `cargo clippy --all-targets --all-features -- -D warnings` passed;
+  `cargo run -- config validate --config examples/basic/osv-proxy.yaml` passed;
+  `rg -n "proxy_cache_s3|S3|artifact proxying|proxy mode|artifacts:" README.md
+  docs src examples` was reviewed. Search hits show current proxy support and
+  unsupported S3 cache in user-facing docs/source; older internal goal prompts
+  retain historical scope text.
+- Commit: pending.
 
 ## Final Verification
 
