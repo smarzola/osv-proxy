@@ -3,6 +3,22 @@
 All notable changes to `osv-proxy` are tracked here. Release sections are the
 source for GitHub release notes.
 
+## [0.2.0] - 2026-07-06
+
+### Added
+
+- Plain artifact proxy mode with `artifacts.behavior: proxy` for npm tarballs
+  and PyPI files.
+- Configurable artifact delivery behavior while keeping redirect mode as the
+  default.
+- Proxy-mode tests covering streamed upstream bytes, forwarded artifact headers,
+  blocked-artifact short-circuiting, and upstream artifact error handling.
+
+### Changed
+
+- Documented artifact delivery modes in the README, configuration reference,
+  registry behavior guide, and milestone plan.
+
 ## [0.1.0] - 2026-07-06
 
 ### Added
