@@ -3,6 +3,19 @@
 All notable changes to `osv-proxy` are tracked here. Release sections are the
 source for GitHub release notes.
 
+## [0.2.1] - 2026-07-06
+
+### Changed
+
+- Clarified README and repository positioning around OSV data plus local policy.
+- Switched the crate to the Rust 2024 edition.
+
+### Added
+
+- Added Apache-2.0 licensing for `osv-proxy`.
+- Documented that cached, exported, or redistributed advisory data keeps its
+  original source licensing and attribution requirements.
+
 ## [0.2.0] - 2026-07-06
 
 ### Added
