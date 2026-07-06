@@ -168,7 +168,7 @@ Status note (2026-07-06):
   the existing second policy check; blocked artifacts keep returning structured
   `403` responses without fetching artifact bytes; `proxy_cache_s3` remains
   rejected as unsupported for a future milestone.
-- Commit: pending.
+- Commit: `b09737a`.
 
 ## Milestone 1: Artifact Behavior Config
 
@@ -215,7 +215,7 @@ Status note (2026-07-06):
   rejected by config deserialization.
 - Verification: `cargo test config` passed with 22 tests; `cargo fmt --check`
   passed.
-- Commit: pending.
+- Commit: `6d2d9dc`.
 
 ## Milestone 2: Shared Artifact Delivery Layer
 
@@ -279,7 +279,7 @@ Status note (2026-07-06):
 - Verification: `cargo test artifacts` initially required network outside the
   sandbox to resolve the new `reqwest` streaming dependency, then passed with 8
   tests; `cargo test server` passed with 19 tests; `cargo fmt --check` passed.
-- Commit: pending.
+- Commit: `15040ef`.
 
 ## Milestone 3: npm and PyPI Proxy-Mode Integration
 
@@ -344,7 +344,7 @@ Status note (2026-07-06):
   then `cargo test npm`, `cargo test pypi`, `cargo test server`, and `cargo
   test --test package_manager_e2e` all passed outside the sandbox. `cargo fmt
   --check` passed.
-- Commit: pending.
+- Commit: `be1de73`.
 
 ## Milestone 4: Docs and Final Regression
 
@@ -405,7 +405,7 @@ Status note (2026-07-06):
   docs src examples` was reviewed. Search hits show current proxy support and
   unsupported S3 cache in user-facing docs/source; older internal goal prompts
   retain historical scope text.
-- Commit: pending.
+- Commit: `0c56022`.
 
 ## Review Fixes
 
@@ -423,7 +423,7 @@ Status note (2026-07-06):
   0 main tests, 2 package-manager e2e tests, and 0 doctests; `cargo clippy
   --all-targets --all-features -- -D warnings` passed; `cargo run -- config
   validate --config examples/basic/osv-proxy.yaml` passed.
-- Commit: pending.
+- Commit: `4efb25d`.
 
 ## Final Verification
 
