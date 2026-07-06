@@ -1,9 +1,13 @@
 use crate::artifact::{Artifact, ArtifactHashes, Ecosystem};
+use crate::artifacts::{
+    self, ArtifactDeliveryClient, ArtifactDeliveryError, ArtifactDeliveryResponse,
+};
 use crate::config::Config;
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
 use async_trait::async_trait;
+use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::{json, Map, Value};
@@ -95,6 +99,25 @@ pub async fn artifact_response(
     tarball: &str,
     now: DateTime<Utc>,
 ) -> Result<NpmResponse, NpmError> {
+    let delivery = ArtifactDeliveryClient::new();
+    Ok(artifact_delivery_response(
+        config, upstream, checker, package, tarball, now, &delivery, None,
+    )
+    .await?
+    .into_registry_response()
+    .await)
+}
+
+pub async fn artifact_delivery_response(
+    config: &Config,
+    upstream: &dyn NpmMetadataProvider,
+    checker: &dyn MaliciousChecker,
+    package: &str,
+    tarball: &str,
+    now: DateTime<Utc>,
+    delivery: &ArtifactDeliveryClient,
+    request_headers: Option<&HeaderMap>,
+) -> Result<ArtifactDeliveryResponse, NpmError> {
     let version = infer_version_from_tarball(package, tarball)
         .ok_or_else(|| NpmError::InvalidTarballName(tarball.to_string()))?;
     let metadata = upstream.fetch_package_metadata(package).await?;
@@ -107,20 +130,25 @@ pub async fn artifact_response(
         let location = artifact
             .upstream_url
             .ok_or_else(|| NpmError::MissingTarballUrl(package.to_string(), version))?;
-        Ok(NpmResponse::redirect(location))
+        Ok(delivery.deliver(config, location, request_headers).await?)
     } else {
         let body = serde_json::to_value(decision)?;
-        Ok(NpmResponse::json(403, &body)?)
+        Ok(ArtifactDeliveryResponse::Buffered(NpmResponse::json(
+            403, &body,
+        )?))
     }
 }
 
 pub fn error_response(error: &NpmError) -> NpmResponse {
+    if let NpmError::ArtifactDelivery(error) = error {
+        return artifacts::gateway_error_response(error);
+    }
     let status = match error {
         NpmError::VersionNotFound(_, _)
         | NpmError::MissingTarballUrl(_, _)
         | NpmError::InvalidTarballName(_)
         | NpmError::TarballBasenameMismatch { .. } => 404,
-        NpmError::Upstream(_) => 502,
+        NpmError::Upstream(_) | NpmError::ArtifactDelivery(_) => 502,
         NpmError::Json(_) | NpmError::InvalidMetadata(_) => 500,
     };
     let body = json!({
@@ -417,20 +445,26 @@ pub enum NpmError {
         requested: String,
         expected: String,
     },
+    #[error("npm artifact delivery failed: {0}")]
+    ArtifactDelivery(#[from] ArtifactDeliveryError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::artifact::Ecosystem;
-    use crate::config::{AllowlistEntry, BlocklistEntry};
+    use crate::config::{AllowlistEntry, ArtifactBehavior, BlocklistEntry};
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::policy::Decision;
     use async_trait::async_trait;
+    use axum::http::header;
     use chrono::Duration as ChronoDuration;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
 
     struct StaticUpstream {
         metadata: HashMap<String, Value>,
@@ -796,6 +830,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn npm_artifact_proxy_streams_upstream_bytes_and_headers() {
+        let mut config = Config::default();
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        let (tarball_url, request) = serve_artifact_once(
+            "HTTP/1.1 200 OK\r\n\
+             content-type: application/octet-stream\r\n\
+             content-length: 11\r\n\
+             etag: \"npm\"\r\n\
+             connection: close\r\n\
+             \r\n\
+             npm-tarball",
+        )
+        .await;
+        let metadata = json!({
+            "name": "demo",
+            "time": { "1.0.0": "2026-06-01T00:00:00Z" },
+            "versions": {
+                "1.0.0": {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "dist": { "tarball": tarball_url }
+                }
+            }
+        });
+        let upstream = StaticUpstream::new("demo", metadata);
+        let checker = CleanChecker::new();
+        let delivery = ArtifactDeliveryClient::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=0-10".parse().unwrap());
+
+        let response = artifact_delivery_response(
+            &config,
+            &upstream,
+            &checker,
+            "demo",
+            "demo-1.0.0.tgz",
+            now(),
+            &delivery,
+            Some(&headers),
+        )
+        .await
+        .unwrap()
+        .into_registry_response()
+        .await;
+        let upstream_request = request.await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"npm-tarball");
+        assert_header(&response, "content-type", "application/octet-stream");
+        assert_header(&response, "content-length", "11");
+        assert_header(&response, "etag", "\"npm\"");
+        assert!(upstream_request.contains("range: bytes=0-10"));
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn npm_artifact_rejects_unscoped_tarball_basename_mismatch() {
         let config = Config::default();
         let metadata = json!({
@@ -907,6 +997,51 @@ mod tests {
         assert_eq!(body.package, "npm:demo@1.0.0");
     }
 
+    #[tokio::test]
+    async fn npm_artifact_proxy_blocked_tarball_does_not_fetch_upstream_bytes() {
+        let mut config = Config::default();
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Npm,
+            name: "demo".to_string(),
+            versions: vec!["1.0.0".to_string()],
+            reason: "known bad".to_string(),
+        });
+        let (tarball_url, request) = serve_artifact_once(
+            "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nbytes",
+        )
+        .await;
+        let metadata = json!({
+            "name": "demo",
+            "time": { "1.0.0": "2026-06-01T00:00:00Z" },
+            "versions": {
+                "1.0.0": {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "dist": { "tarball": tarball_url }
+                }
+            }
+        });
+        let upstream = StaticUpstream::new("demo", metadata);
+        let checker = CleanChecker::new();
+
+        let response = artifact_response(
+            &config,
+            &upstream,
+            &checker,
+            "demo",
+            "demo-1.0.0.tgz",
+            now(),
+        )
+        .await
+        .unwrap();
+        let body: Decision = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status, 403);
+        assert!(!body.allowed);
+        assert!(timeout(Duration::from_millis(100), request).await.is_err());
+    }
+
     #[test]
     fn infers_versions_from_unscoped_and_scoped_tarball_names() {
         assert_eq!(
@@ -920,6 +1055,32 @@ mod tests {
         assert_eq!(
             infer_version_from_tarball("left-pad", "left-pad-1.3.0-beta.1.tgz"),
             Some("1.3.0-beta.1".to_string())
+        );
+    }
+
+    async fn serve_artifact_once(
+        response: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let bytes = stream.read(&mut buffer).await.unwrap();
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buffer[..bytes]).to_ascii_lowercase()
+        });
+        (format!("http://{address}/demo/-/demo-1.0.0.tgz"), handle)
+    }
+
+    fn assert_header(response: &RegistryResponse, name: &str, expected: &str) {
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(header, _)| header.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str()),
+            Some(expected)
         );
     }
 

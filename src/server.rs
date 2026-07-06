@@ -1,3 +1,4 @@
+use crate::artifacts::ArtifactDeliveryClient;
 use crate::config::Config;
 use crate::malicious::{MaliciousChecker, OsvHttpClient};
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
@@ -57,9 +58,8 @@ async fn registry_handler(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    let response = route_request_with_accept(&config, &method, &path, accept.as_deref()).await;
-
-    registry_response_into_http(response)
+    route_http_request_with_accept_and_headers(&config, &method, &path, accept.as_deref(), &headers)
+        .await
 }
 
 pub async fn route_request(config: &Config, method: &str, path: &str) -> RegistryResponse {
@@ -208,8 +208,80 @@ async fn route_request_with_dependencies(
     }
 }
 
-fn registry_response_into_http(response: RegistryResponse) -> Response<Body> {
-    response.into_http_response()
+async fn route_http_request_with_accept_and_headers(
+    config: &Config,
+    method: &str,
+    path: &str,
+    accept: Option<&str>,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    if method != "GET" {
+        return simple_response(405, "method not allowed").into_http_response();
+    }
+
+    let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
+    let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
+    let checker = OsvHttpClient::new(&config.policy.osv.api_url);
+    let delivery = ArtifactDeliveryClient::new();
+    let now = Utc::now();
+
+    match parse_npm_route(path) {
+        Some(NpmRoute::Metadata { package }) => {
+            npm::metadata_response(config, &npm_upstream, &checker, &package, now)
+                .await
+                .unwrap_or_else(|err| npm::error_response(&err))
+                .into_http_response()
+        }
+        Some(NpmRoute::Artifact { package, tarball }) => npm::artifact_delivery_response(
+            config,
+            &npm_upstream,
+            &checker,
+            &package,
+            &tarball,
+            now,
+            &delivery,
+            Some(headers),
+        )
+        .await
+        .map(|response| response.into_http_response())
+        .unwrap_or_else(|err| npm::error_response(&err).into_http_response()),
+        None => match parse_pypi_route(path) {
+            Some(PypiRoute::SimpleRoot) => pypi::simple_root_response(config, &pypi_upstream)
+                .await
+                .unwrap_or_else(|err| pypi::error_response(&err))
+                .into_http_response(),
+            Some(PypiRoute::SimpleProject { project }) => pypi::simple_project_response_for_accept(
+                config,
+                &pypi_upstream,
+                &checker,
+                &project,
+                now,
+                accept,
+            )
+            .await
+            .unwrap_or_else(|err| pypi::error_response(&err))
+            .into_http_response(),
+            Some(PypiRoute::Artifact {
+                project,
+                version,
+                filename,
+            }) => pypi::artifact_delivery_response(
+                config,
+                &pypi_upstream,
+                &checker,
+                &project,
+                &version,
+                &filename,
+                now,
+                &delivery,
+                Some(headers),
+            )
+            .await
+            .map(|response| response.into_http_response())
+            .unwrap_or_else(|err| pypi::error_response(&err).into_http_response()),
+            None => simple_response(404, "not found").into_http_response(),
+        },
+    }
 }
 
 fn simple_response(status: u16, message: &str) -> RegistryResponse {
@@ -363,7 +435,7 @@ fn percent_decode_segment(segment: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::artifact::{Artifact, Ecosystem};
-    use crate::config::BlocklistEntry;
+    use crate::config::{ArtifactBehavior, BlocklistEntry};
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::npm::NpmError;
     use crate::pypi::{SimpleFile, SimpleProject};
@@ -1084,6 +1156,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_streams_npm_artifact_proxy_response() {
+        let (artifact_base_url, artifact_request) = serve_http_once(
+            "HTTP/1.1 200 OK\r\n\
+             content-type: application/octet-stream\r\n\
+             content-length: 15\r\n\
+             etag: \"router-npm\"\r\n\
+             connection: close\r\n\
+             \r\n\
+             router-artifact"
+                .to_string(),
+        )
+        .await;
+        let artifact_url = format!("{artifact_base_url}/demo/-/demo-1.0.0.tgz");
+        let metadata_body = json!({
+            "name": "demo",
+            "time": { "1.0.0": "2026-06-01T00:00:00Z" },
+            "versions": {
+                "1.0.0": {
+                    "name": "demo",
+                    "version": "1.0.0",
+                    "dist": { "tarball": artifact_url }
+                }
+            }
+        })
+        .to_string();
+        let (registry_url, metadata_request) = serve_http_once(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            metadata_body.len(),
+            metadata_body
+        ))
+        .await;
+        let mut config = Config::default();
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.upstreams.npm.registry_url = registry_url;
+
+        let response = router(config)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/npm/demo/-/demo-1.0.0.tgz")
+                    .header(header::RANGE, "bytes=0-14")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some("\"router-npm\"")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metadata_request = metadata_request.await.unwrap();
+        let artifact_request = artifact_request.await.unwrap();
+
+        assert_eq!(&body[..], b"router-artifact");
+        assert!(metadata_request.starts_with("get /demo "));
+        assert!(artifact_request.contains("range: bytes=0-14"));
+    }
+
+    #[tokio::test]
     async fn idle_connection_does_not_block_unrelated_request() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1108,6 +1254,19 @@ mod tests {
         server.abort();
         let response = String::from_utf8(response).unwrap();
         assert!(response.starts_with("HTTP/1.1 404 Not Found"));
+    }
+
+    async fn serve_http_once(response: String) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let bytes = stream.read(&mut buffer).await.unwrap();
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buffer[..bytes]).to_ascii_lowercase()
+        });
+        (format!("http://{address}"), handle)
     }
 
     #[tokio::test]

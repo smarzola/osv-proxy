@@ -114,7 +114,7 @@ When a milestone is complete:
 - [x] Milestone 0: Baseline and delivery contract
 - [x] Milestone 1: Artifact behavior config
 - [x] Milestone 2: Shared artifact delivery layer
-- [ ] Milestone 3: npm and PyPI proxy-mode integration
+- [x] Milestone 3: npm and PyPI proxy-mode integration
 - [ ] Milestone 4: Docs and final regression
 
 ## Milestone 0: Baseline and Delivery Contract
@@ -331,6 +331,20 @@ cargo fmt --check
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note (2026-07-06):
+
+- Integrated npm and PyPI artifact routes with the shared delivery layer after
+  the existing second policy check. Redirect mode still returns `302 Location`.
+  Proxy mode streams allowed upstream artifact responses through the live Axum
+  path, while helper paths can buffer proxied responses for tests. Blocked npm
+  and PyPI artifacts return structured `403` responses without contacting the
+  artifact byte upstream.
+- Verification: sandboxed listener tests failed with `Operation not permitted`,
+  then `cargo test npm`, `cargo test pypi`, `cargo test server`, and `cargo
+  test --test package_manager_e2e` all passed outside the sandbox. `cargo fmt
+  --check` passed.
+- Commit: pending.
 
 ## Milestone 4: Docs and Final Regression
 

@@ -1,9 +1,13 @@
 use crate::artifact::{normalize_pypi_name, Artifact, ArtifactHashes, Ecosystem};
+use crate::artifacts::{
+    self, ArtifactDeliveryClient, ArtifactDeliveryError, ArtifactDeliveryResponse,
+};
 use crate::config::Config;
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
 use async_trait::async_trait;
+use axum::http::HeaderMap;
 use chrono::{DateTime, Utc};
 use reqwest::header::ACCEPT;
 use reqwest::Client;
@@ -144,6 +148,26 @@ pub async fn artifact_response(
     filename: &str,
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, PypiError> {
+    let delivery = ArtifactDeliveryClient::new();
+    Ok(artifact_delivery_response(
+        config, upstream, checker, project, version, filename, now, &delivery, None,
+    )
+    .await?
+    .into_registry_response()
+    .await)
+}
+
+pub async fn artifact_delivery_response(
+    config: &Config,
+    upstream: &dyn PypiSimpleProvider,
+    checker: &dyn MaliciousChecker,
+    project: &str,
+    version: &str,
+    filename: &str,
+    now: DateTime<Utc>,
+    delivery: &ArtifactDeliveryClient,
+    request_headers: Option<&HeaderMap>,
+) -> Result<ArtifactDeliveryResponse, PypiError> {
     let project = normalize_pypi_name(project);
     let raw = upstream.fetch_project_json(&project).await?;
     let file = raw
@@ -166,23 +190,27 @@ pub async fn artifact_response(
         .evaluate(&artifact, now, checker)
         .await;
     if decision.allowed {
-        Ok(RegistryResponse::redirect(
-            artifact
-                .upstream_url
-                .ok_or_else(|| PypiError::MissingFileUrl(filename.to_string()))?,
-        ))
+        let location = artifact
+            .upstream_url
+            .ok_or_else(|| PypiError::MissingFileUrl(filename.to_string()))?;
+        Ok(delivery.deliver(config, location, request_headers).await?)
     } else {
         let body = serde_json::to_value(decision)?;
-        Ok(RegistryResponse::json(403, &body)?)
+        Ok(ArtifactDeliveryResponse::Buffered(RegistryResponse::json(
+            403, &body,
+        )?))
     }
 }
 
 pub fn error_response(error: &PypiError) -> RegistryResponse {
+    if let PypiError::ArtifactDelivery(error) = error {
+        return artifacts::gateway_error_response(error);
+    }
     let status = match error {
         PypiError::FileNotFound(_, _, _)
         | PypiError::VersionNotFound(_, _)
         | PypiError::InvalidFilename(_) => 404,
-        PypiError::Upstream(_) => 502,
+        PypiError::Upstream(_) | PypiError::ArtifactDelivery(_) => 502,
         PypiError::Json(_) | PypiError::InvalidSimpleJson(_) | PypiError::MissingFileUrl(_) => 500,
     };
     let body = json!({
@@ -618,19 +646,25 @@ pub enum PypiError {
     FileNotFound(String, String, String),
     #[error("PyPI version not found for {0}@{1}")]
     VersionNotFound(String, String),
+    #[error("PyPI artifact delivery failed: {0}")]
+    ArtifactDelivery(#[from] ArtifactDeliveryError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AllowlistEntry, BlocklistEntry, MissingPublishTime};
+    use crate::config::{AllowlistEntry, ArtifactBehavior, BlocklistEntry, MissingPublishTime};
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::policy::{Decision, DecisionReason};
     use async_trait::async_trait;
+    use axum::http::header;
     use chrono::Duration as ChronoDuration;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
 
     struct StaticSimple {
         root: String,
@@ -1088,6 +1122,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pypi_artifact_proxy_streams_upstream_bytes_and_headers() {
+        let mut config = Config::default();
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        let (file_url, request) = serve_artifact_once(
+            "HTTP/1.1 200 OK\r\n\
+             content-type: application/octet-stream\r\n\
+             content-length: 9\r\n\
+             etag: \"pypi\"\r\n\
+             connection: close\r\n\
+             \r\n\
+             pypi-file",
+        )
+        .await;
+        let mut simple = simple_fixture();
+        simple.files = vec![file("demo-1.0.0.tar.gz", &file_url, Some(old_time()))];
+        simple.versions = vec!["1.0.0".to_string()];
+        let upstream = StaticSimple::new("demo", simple);
+        let checker = CleanChecker::new();
+        let delivery = ArtifactDeliveryClient::new();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=0-8".parse().unwrap());
+
+        let response = artifact_delivery_response(
+            &config,
+            &upstream,
+            &checker,
+            "demo",
+            "1.0.0",
+            "demo-1.0.0.tar.gz",
+            now(),
+            &delivery,
+            Some(&headers),
+        )
+        .await
+        .unwrap()
+        .into_registry_response()
+        .await;
+        let upstream_request = request.await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"pypi-file");
+        assert_header(&response, "content-type", "application/octet-stream");
+        assert_header(&response, "content-length", "9");
+        assert_header(&response, "etag", "\"pypi\"");
+        assert!(upstream_request.contains("range: bytes=0-8"));
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn pypi_artifact_blocked_file_returns_structured_403() {
         let mut config = Config::default();
         config.blocklist.push(BlocklistEntry {
@@ -1116,6 +1199,44 @@ mod tests {
         assert!(!body.allowed);
         assert_eq!(body.reason, DecisionReason::ManuallyBlocked);
         assert_eq!(body.package, "pypi:demo@1.0.0");
+    }
+
+    #[tokio::test]
+    async fn pypi_artifact_proxy_blocked_file_does_not_fetch_upstream_bytes() {
+        let mut config = Config::default();
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Pypi,
+            name: "demo".to_string(),
+            versions: vec!["1.0.0".to_string()],
+            reason: "known bad".to_string(),
+        });
+        let (file_url, request) = serve_artifact_once(
+            "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nbytes",
+        )
+        .await;
+        let mut simple = simple_fixture();
+        simple.files = vec![file("demo-1.0.0.tar.gz", &file_url, Some(old_time()))];
+        simple.versions = vec!["1.0.0".to_string()];
+        let upstream = StaticSimple::new("demo", simple);
+        let checker = CleanChecker::new();
+
+        let response = artifact_response(
+            &config,
+            &upstream,
+            &checker,
+            "Demo",
+            "1.0.0",
+            "demo-1.0.0.tar.gz",
+            now(),
+        )
+        .await
+        .unwrap();
+        let body: Decision = serde_json::from_slice(&response.body).unwrap();
+
+        assert_eq!(response.status, 403);
+        assert!(!body.allowed);
+        assert!(timeout(Duration::from_millis(100), request).await.is_err());
     }
 
     #[tokio::test]
@@ -1198,6 +1319,35 @@ mod tests {
         assert_eq!(
             resolve_simple_href(&config, "demo", "../../packages/demo-1.0.0.tar.gz"),
             "https://pypi.example/packages/demo-1.0.0.tar.gz"
+        );
+    }
+
+    async fn serve_artifact_once(
+        response: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let bytes = stream.read(&mut buffer).await.unwrap();
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buffer[..bytes]).to_ascii_lowercase()
+        });
+        (
+            format!("http://{address}/packages/demo-1.0.0.tar.gz"),
+            handle,
+        )
+    }
+
+    fn assert_header(response: &RegistryResponse, name: &str, expected: &str) {
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(header, _)| header.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str()),
+            Some(expected)
         );
     }
 }
