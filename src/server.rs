@@ -7,17 +7,14 @@ use crate::response::RegistryResponse;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header, HeaderMap, Method, Response, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Method, Response, Uri};
 use axum::routing::any;
 use axum::Router;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::TcpListener;
-use tower_http::timeout::TimeoutLayer;
 
 const REQUEST_BODY_LIMIT_BYTES: usize = 8192;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.server.bind).await?;
@@ -35,10 +32,6 @@ pub fn router(config: Config) -> Router {
         .fallback(any(registry_handler))
         .with_state(Arc::new(config))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
-        .layer(TimeoutLayer::with_status_code(
-            StatusCode::REQUEST_TIMEOUT,
-            REQUEST_TIMEOUT,
-        ))
 }
 
 async fn registry_handler(
@@ -441,10 +434,12 @@ mod tests {
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::npm::NpmError;
     use crate::pypi::{SimpleFile, SimpleProject};
+    use axum::http::StatusCode;
     use chrono::Duration as ChronoDuration;
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
     use std::collections::HashMap;
+    use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 

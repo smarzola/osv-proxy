@@ -407,6 +407,24 @@ Status note (2026-07-06):
   retain historical scope text.
 - Commit: pending.
 
+## Review Fixes
+
+Status note (2026-07-06):
+
+- Addressed adversarial review findings: removed the global Axum
+  `TimeoutLayer` so streamed proxy artifact bodies are not cut off by a
+  whole-response 15s timeout; changed artifact fetching from a total reqwest
+  timeout to connect plus read timeout semantics; mapped upstream artifact
+  HTTP 4xx/5xx responses to structured `502 artifact_upstream_error` JSON
+  instead of streaming raw upstream error bodies.
+- Verification: `cargo test artifacts` passed with 9 tests outside the sandbox;
+  `cargo test server` passed with 20 tests outside the sandbox; `cargo fmt
+  --check` passed; `cargo test` passed outside the sandbox with 107 lib tests,
+  0 main tests, 2 package-manager e2e tests, and 0 doctests; `cargo clippy
+  --all-targets --all-features -- -D warnings` passed; `cargo run -- config
+  validate --config examples/basic/osv-proxy.yaml` passed.
+- Commit: pending.
+
 ## Final Verification
 
 Before reporting the implementation complete, run:

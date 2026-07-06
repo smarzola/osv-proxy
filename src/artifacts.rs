@@ -8,7 +8,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 const FORWARDED_REQUEST_HEADERS: &[&str] = &[
     "range",
@@ -39,7 +39,7 @@ impl ArtifactDeliveryClient {
         Self {
             client: Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(REQUEST_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
                 .build()
                 .expect("artifact HTTP client should build with static timeout configuration"),
         }
@@ -65,6 +65,11 @@ impl ArtifactDeliveryClient {
                     }
                 }
                 let response = request.send().await?;
+                if response.status().is_client_error() || response.status().is_server_error() {
+                    return Err(ArtifactDeliveryError::UpstreamStatus(
+                        response.status().as_u16(),
+                    ));
+                }
                 Ok(ArtifactDeliveryResponse::Streaming(response))
             }
             ArtifactBehavior::ProxyCacheS3 => Err(ArtifactDeliveryError::Unsupported(
@@ -147,6 +152,8 @@ pub enum ArtifactDeliveryError {
     Unsupported(String),
     #[error("failed to fetch upstream artifact: {0}")]
     Upstream(#[from] reqwest::Error),
+    #[error("upstream artifact returned HTTP status {0}")]
+    UpstreamStatus(u16),
 }
 
 pub fn gateway_error_response(error: &ArtifactDeliveryError) -> RegistryResponse {
@@ -294,6 +301,41 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["allowed"], false);
         assert_eq!(body["reason"], "artifact_upstream_error");
+    }
+
+    #[tokio::test]
+    async fn proxy_upstream_http_error_returns_gateway_response() {
+        let mut config = Config::default();
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        let (url, request) = serve_once(
+            "HTTP/1.1 404 Not Found\r\n\
+             content-type: text/plain\r\n\
+             content-length: 9\r\n\
+             connection: close\r\n\
+             \r\n\
+             not found",
+        )
+        .await;
+
+        let response = ArtifactDeliveryClient::new()
+            .deliver_registry_response(&config, url, None)
+            .await;
+        let upstream_request = request.await.unwrap();
+
+        assert_eq!(response.status, 502);
+        assert_header(&response, "content-type", "application/json");
+        assert!(!response
+            .body
+            .windows(b"not found".len())
+            .any(|window| window == b"not found"));
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["allowed"], false);
+        assert_eq!(body["reason"], "artifact_upstream_error");
+        assert!(body["message"]
+            .as_str()
+            .unwrap()
+            .contains("HTTP status 404"));
+        assert!(upstream_request.starts_with("get /artifact.tgz "));
     }
 
     async fn serve_once(response: &'static str) -> (String, tokio::task::JoinHandle<String>) {
