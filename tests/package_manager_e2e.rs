@@ -47,11 +47,13 @@ fn npm_install_uses_proxy_for_allowed_and_blocked_versions() {
         .output()
         .unwrap();
     assert_success("npm install allowed package", &allowed);
-    assert!(allowed_project
-        .join("node_modules")
-        .join(NPM_PACKAGE)
-        .join("package.json")
-        .exists());
+    assert!(
+        allowed_project
+            .join("node_modules")
+            .join(NPM_PACKAGE)
+            .join("package.json")
+            .exists()
+    );
 
     let blocked_project = workspace.child("npm-blocked");
     fs::create_dir_all(&blocked_project).unwrap();
@@ -74,10 +76,12 @@ fn npm_install_uses_proxy_for_allowed_and_blocked_versions() {
         .output()
         .unwrap();
     assert_failure("npm install blocked package", &blocked);
-    assert!(!blocked_project
-        .join("node_modules")
-        .join(NPM_PACKAGE)
-        .exists());
+    assert!(
+        !blocked_project
+            .join("node_modules")
+            .join(NPM_PACKAGE)
+            .exists()
+    );
 }
 
 #[test]
@@ -104,10 +108,12 @@ fn uv_pip_install_uses_proxy_for_allowed_and_blocked_versions() {
         .output()
         .unwrap();
     assert_success("uv pip install allowed package", &allowed);
-    assert!(allowed_target
-        .join(PYPI_MODULE)
-        .join("__init__.py")
-        .exists());
+    assert!(
+        allowed_target
+            .join(PYPI_MODULE)
+            .join("__init__.py")
+            .exists()
+    );
 
     let blocked_target = workspace.child("uv-blocked-target");
     let blocked = Command::new("uv")
@@ -226,10 +232,10 @@ fn fixture_response(
     }
 
     if request.method == "GET" {
-        if let Some(filename) = path.strip_prefix("/npm-files/") {
-            if let Some(body) = fixture.npm_tarballs.get(filename) {
-                return binary_response("application/octet-stream", body.clone());
-            }
+        if let Some(filename) = path.strip_prefix("/npm-files/")
+            && let Some(body) = fixture.npm_tarballs.get(filename)
+        {
+            return binary_response("application/octet-stream", body.clone());
         }
 
         if path == format!("/simple/{PYPI_PACKAGE}/") {
@@ -248,10 +254,10 @@ fn fixture_response(
             .unwrap();
         }
 
-        if let Some(filename) = path.strip_prefix("/pypi-files/") {
-            if let Some(body) = fixture.pypi_wheels.get(filename) {
-                return binary_response("application/octet-stream", body.clone());
-            }
+        if let Some(filename) = path.strip_prefix("/pypi-files/")
+            && let Some(body) = fixture.pypi_wheels.get(filename)
+        {
+            return binary_response("application/octet-stream", body.clone());
         }
     }
 

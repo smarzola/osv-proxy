@@ -1,4 +1,4 @@
-use crate::artifact::{normalize_pypi_name, Artifact, ArtifactHashes, Ecosystem};
+use crate::artifact::{Artifact, ArtifactHashes, Ecosystem, normalize_pypi_name};
 use crate::artifacts::{
     self, ArtifactDeliveryClient, ArtifactDeliveryError, ArtifactDeliveryOptions,
     ArtifactDeliveryResponse,
@@ -9,10 +9,10 @@ use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use reqwest::header::ACCEPT;
 use reqwest::Client;
+use reqwest::header::ACCEPT;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use thiserror::Error;
@@ -149,7 +149,7 @@ pub async fn artifact_response(
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, PypiError> {
     let delivery = ArtifactDeliveryClient::new();
-    Ok(artifact_delivery_response(
+    let response = artifact_delivery_response(
         config,
         upstream,
         checker,
@@ -161,9 +161,8 @@ pub async fn artifact_response(
         now,
         ArtifactDeliveryOptions::new(&delivery),
     )
-    .await?
-    .into_registry_response()
-    .await)
+    .await?;
+    Ok(response.into_registry_response().await)
 }
 
 #[derive(Clone, Copy)]
@@ -493,10 +492,10 @@ fn project_from_root_href(config: &Config, href: &str) -> Option<String> {
 }
 
 fn url_with_hash_fragment(file: &SimpleFile) -> String {
-    if let Some(hash) = file.hashes.get("sha256") {
-        if !file.url.contains('#') {
-            return format!("{}#sha256={hash}", file.url);
-        }
+    if let Some(hash) = file.hashes.get("sha256")
+        && !file.url.contains('#')
+    {
+        return format!("{}#sha256={hash}", file.url);
     }
     file.url.clone()
 }
@@ -553,10 +552,10 @@ fn resolve_simple_href(config: &Config, project: &str, href_without_fragment: &s
     }
 
     let simple_url = config.upstreams.pypi.simple_url.trim_end_matches('/');
-    if href_without_fragment.starts_with('/') {
-        if let Some(origin) = origin(simple_url) {
-            return format!("{origin}{href_without_fragment}");
-        }
+    if href_without_fragment.starts_with('/')
+        && let Some(origin) = origin(simple_url)
+    {
+        return format!("{origin}{href_without_fragment}");
     }
 
     normalize_url_path(&format!("{simple_url}/{project}/{href_without_fragment}"))
@@ -677,11 +676,11 @@ mod tests {
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::policy::{Decision, DecisionReason};
     use async_trait::async_trait;
-    use axum::http::{header, HeaderMap};
+    use axum::http::{HeaderMap, header};
     use chrono::Duration as ChronoDuration;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::timeout;

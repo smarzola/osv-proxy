@@ -10,7 +10,7 @@ use crate::response::RegistryResponse;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -100,7 +100,7 @@ pub async fn artifact_response(
     now: DateTime<Utc>,
 ) -> Result<NpmResponse, NpmError> {
     let delivery = ArtifactDeliveryClient::new();
-    Ok(artifact_delivery_response(
+    let response = artifact_delivery_response(
         config,
         upstream,
         checker,
@@ -108,9 +108,8 @@ pub async fn artifact_response(
         now,
         ArtifactDeliveryOptions::new(&delivery),
     )
-    .await?
-    .into_registry_response()
-    .await)
+    .await?;
+    Ok(response.into_registry_response().await)
 }
 
 #[derive(Clone, Copy)]
@@ -469,11 +468,11 @@ mod tests {
     use crate::malicious::{MaliciousError, MaliciousHit};
     use crate::policy::Decision;
     use async_trait::async_trait;
-    use axum::http::{header, HeaderMap};
+    use axum::http::{HeaderMap, header};
     use chrono::Duration as ChronoDuration;
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::time::timeout;

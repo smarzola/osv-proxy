@@ -324,17 +324,21 @@ mod tests {
 
         assert_eq!(response.status, 502);
         assert_header(&response, "content-type", "application/json");
-        assert!(!response
-            .body
-            .windows(b"not found".len())
-            .any(|window| window == b"not found"));
+        assert!(
+            !response
+                .body
+                .windows(b"not found".len())
+                .any(|window| window == b"not found")
+        );
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["allowed"], false);
         assert_eq!(body["reason"], "artifact_upstream_error");
-        assert!(body["message"]
-            .as_str()
-            .unwrap()
-            .contains("HTTP status 404"));
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap()
+                .contains("HTTP status 404")
+        );
         assert!(upstream_request.starts_with("get /artifact.tgz "));
     }
 

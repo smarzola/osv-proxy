@@ -1,4 +1,4 @@
-use crate::artifact::{normalize_pypi_name, Ecosystem};
+use crate::artifact::{Ecosystem, normalize_pypi_name};
 use chrono::Duration as ChronoDuration;
 use serde::{Deserialize, Serialize};
 use std::fs;

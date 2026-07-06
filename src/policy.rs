@@ -444,9 +444,11 @@ mod tests {
 
         assert!(!decision.allowed);
         assert_eq!(decision.reason, DecisionReason::Malicious);
-        assert!(decision
-            .message
-            .contains("malicious check result was missing"));
+        assert!(
+            decision
+                .message
+                .contains("malicious check result was missing")
+        );
     }
 
     #[tokio::test]

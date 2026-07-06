@@ -1,4 +1,4 @@
-use crate::artifact::{parse_identity, parse_package_identity, Artifact, Ecosystem};
+use crate::artifact::{Artifact, Ecosystem, parse_identity, parse_package_identity};
 use crate::config::Config;
 use crate::malicious::{MaliciousChecker, OsvHttpClient};
 use crate::npm::{NpmMetadataProvider, NpmRegistryClient};
@@ -192,7 +192,7 @@ mod tests {
     use crate::policy::DecisionReason;
     use async_trait::async_trait;
     use clap::Parser;
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -715,10 +715,12 @@ mod tests {
         assert_eq!(output.package, "pypi:demo@1.0.0");
         assert!(!output.allowed);
         assert_eq!(output.artifacts.len(), 2);
-        assert!(output
-            .artifacts
-            .iter()
-            .all(|artifact| !artifact.decision.allowed));
+        assert!(
+            output
+                .artifacts
+                .iter()
+                .all(|artifact| !artifact.decision.allowed)
+        );
         assert_eq!(checker.calls.load(Ordering::SeqCst), 2);
     }
 }

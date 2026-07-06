@@ -54,12 +54,13 @@ impl RegistryResponse {
             .headers_mut()
             .expect("headers are available before response body is built");
         for (name, value) in self.headers {
-            if let (Ok(name), Ok(value)) = (
-                HeaderName::from_bytes(name.as_bytes()),
-                HeaderValue::from_str(&value),
-            ) {
-                headers.insert(name, value);
-            }
+            let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            let Ok(value) = HeaderValue::from_str(&value) else {
+                continue;
+            };
+            headers.insert(name, value);
         }
         builder
             .body(Body::from(self.body))

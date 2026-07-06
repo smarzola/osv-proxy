@@ -5,11 +5,11 @@ use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
 use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
 use crate::response::RegistryResponse;
 use async_trait::async_trait;
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header, HeaderMap, Method, Response, Uri};
+use axum::http::{HeaderMap, Method, Response, Uri, header};
 use axum::routing::any;
-use axum::Router;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -68,7 +68,7 @@ pub async fn route_request_with_accept(
     let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
     let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
     let checker = OsvHttpClient::new(&config.policy.osv.api_url);
-    route_request_with_dependencies(
+    return route_request_with_dependencies(
         config,
         method,
         path,
@@ -80,7 +80,7 @@ pub async fn route_request_with_accept(
             accept,
         },
     )
-    .await
+    .await;
 }
 
 pub async fn route_request_with_upstream(
@@ -436,7 +436,7 @@ mod tests {
     use crate::pypi::{SimpleFile, SimpleProject};
     use axum::http::StatusCode;
     use chrono::Duration as ChronoDuration;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -885,14 +885,18 @@ mod tests {
         .await;
         assert_eq!(metadata_response.status, 200);
         let metadata: Value = serde_json::from_slice(&metadata_response.body).unwrap();
-        assert!(metadata["versions"]
-            .as_object()
-            .unwrap()
-            .contains_key("1.0.0"));
-        assert!(!metadata["versions"]
-            .as_object()
-            .unwrap()
-            .contains_key("1.0.1"));
+        assert!(
+            metadata["versions"]
+                .as_object()
+                .unwrap()
+                .contains_key("1.0.0")
+        );
+        assert!(
+            !metadata["versions"]
+                .as_object()
+                .unwrap()
+                .contains_key("1.0.1")
+        );
         assert_eq!(
             metadata["versions"]["1.0.0"]["dist"]["tarball"],
             "http://127.0.0.1:8080/npm/demo/-/demo-1.0.0.tgz"
@@ -976,14 +980,18 @@ mod tests {
         let metadata: Value = serde_json::from_slice(&metadata_response.body).unwrap();
 
         assert_eq!(metadata_response.status, 200);
-        assert!(metadata["versions"]
-            .as_object()
-            .unwrap()
-            .contains_key("1.0.0"));
-        assert!(!metadata["versions"]
-            .as_object()
-            .unwrap()
-            .contains_key("1.0.1"));
+        assert!(
+            metadata["versions"]
+                .as_object()
+                .unwrap()
+                .contains_key("1.0.0")
+        );
+        assert!(
+            !metadata["versions"]
+                .as_object()
+                .unwrap()
+                .contains_key("1.0.1")
+        );
         assert_eq!(metadata["dist-tags"], json!({ "stable": "1.0.0" }));
 
         let blocked_artifact_response = route_request_with_upstream(
@@ -1092,9 +1100,11 @@ mod tests {
         assert_eq!(simple_body["versions"], json!(["1.0.0"]));
         assert_eq!(simple_body["files"].as_array().unwrap().len(), 1);
         assert!(!simple_body.to_string().contains("demo-1.0.1.tar.gz"));
-        assert!(!simple_body
-            .to_string()
-            .contains("demo-2.0.0-py3-none-any.whl"));
+        assert!(
+            !simple_body
+                .to_string()
+                .contains("demo-2.0.0-py3-none-any.whl")
+        );
 
         let blocked_artifact_response = route_request_with_upstreams(
             &config,
