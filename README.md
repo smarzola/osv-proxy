@@ -66,6 +66,12 @@ Run the binary:
 osv-proxy config validate --config examples/basic/osv-proxy.yaml
 ```
 
+## License
+
+`osv-proxy` is licensed under the Apache License, Version 2.0. OSV advisory
+data and upstream vulnerability records retain their original source licenses
+and attribution requirements when cached, exported, or redistributed.
+
 ## Quick Start
 
 Validate the example config:
