@@ -112,7 +112,7 @@ When a milestone is complete:
    milestone.
 
 - [x] Milestone 0: Baseline and delivery contract
-- [ ] Milestone 1: Artifact behavior config
+- [x] Milestone 1: Artifact behavior config
 - [ ] Milestone 2: Shared artifact delivery layer
 - [ ] Milestone 3: npm and PyPI proxy-mode integration
 - [ ] Milestone 4: Docs and final regression
@@ -207,6 +207,15 @@ cargo fmt --check
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note (2026-07-06):
+
+- Implemented `artifacts.behavior` with default `redirect`, supported `redirect`
+  and `proxy`, unsupported `proxy_cache_s3`, and unknown nested artifact keys
+  rejected by config deserialization.
+- Verification: `cargo test config` passed with 22 tests; `cargo fmt --check`
+  passed.
+- Commit: pending.
 
 ## Milestone 2: Shared Artifact Delivery Layer
 

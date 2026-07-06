@@ -12,6 +12,7 @@ pub struct Config {
     pub server: ServerConfig,
     pub upstreams: UpstreamsConfig,
     pub policy: PolicyConfig,
+    pub artifacts: ArtifactsConfig,
     pub allowlist: Vec<AllowlistEntry>,
     pub blocklist: Vec<BlocklistEntry>,
 }
@@ -30,6 +31,11 @@ impl Config {
                 "policy.minimum_age is too large for policy evaluation".to_string(),
             )
         })?;
+        if self.artifacts.behavior == ArtifactBehavior::ProxyCacheS3 {
+            return Err(ConfigError::Unsupported(
+                "artifacts.behavior=proxy_cache_s3 is not supported yet".to_string(),
+            ));
+        }
         for entry in &self.allowlist {
             if entry.version == "*" {
                 return Err(ConfigError::Unsupported(
@@ -163,6 +169,34 @@ pub enum OsvErrorBehavior {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ArtifactsConfig {
+    pub behavior: ArtifactBehavior,
+}
+
+impl Default for ArtifactsConfig {
+    fn default() -> Self {
+        Self {
+            behavior: ArtifactBehavior::Redirect,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactBehavior {
+    Redirect,
+    Proxy,
+    ProxyCacheS3,
+}
+
+impl Default for ArtifactBehavior {
+    fn default() -> Self {
+        Self::Redirect
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AllowlistEntry {
     pub ecosystem: Ecosystem,
@@ -267,6 +301,7 @@ mod tests {
         assert!(config.policy.osv.block_malicious);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
+        assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
         config.validate().unwrap();
     }
 
@@ -290,6 +325,58 @@ policy:
         assert!(!config.policy.osv.block_malicious);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
+        assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
+    }
+
+    #[test]
+    fn artifact_redirect_behavior_validates() {
+        let config = load(
+            r#"
+artifacts:
+  behavior: redirect
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
+    }
+
+    #[test]
+    fn artifact_proxy_behavior_validates() {
+        let config = load(
+            r#"
+artifacts:
+  behavior: proxy
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.artifacts.behavior, ArtifactBehavior::Proxy);
+    }
+
+    #[test]
+    fn rejects_unsupported_artifact_proxy_cache_s3_behavior() {
+        let err = load(
+            r#"
+artifacts:
+  behavior: proxy_cache_s3
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("proxy_cache_s3 is not supported"));
+    }
+
+    #[test]
+    fn rejects_unknown_artifacts_config_key() {
+        let err = load(
+            r#"
+artifacts:
+  behavior: proxy
+  typo: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
     }
 
     #[test]
@@ -316,18 +403,6 @@ metadata_cache:
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field `metadata_cache`"));
-    }
-
-    #[test]
-    fn rejects_artifacts_config() {
-        let err = load(
-            r#"
-artifacts:
-  behavior: proxy
-"#,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("unknown field `artifacts`"));
     }
 
     #[test]
