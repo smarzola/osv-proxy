@@ -1,4 +1,5 @@
 pub mod artifact;
+pub mod artifacts;
 pub mod cli;
 pub mod config;
 pub mod malicious;

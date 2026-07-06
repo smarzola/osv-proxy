@@ -113,7 +113,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Baseline and delivery contract
 - [x] Milestone 1: Artifact behavior config
-- [ ] Milestone 2: Shared artifact delivery layer
+- [x] Milestone 2: Shared artifact delivery layer
 - [ ] Milestone 3: npm and PyPI proxy-mode integration
 - [ ] Milestone 4: Docs and final regression
 
@@ -268,6 +268,18 @@ cargo fmt --check
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note (2026-07-06):
+
+- Added a shared artifact delivery module with redirect and proxy delivery,
+  selected request-header forwarding, selected upstream response-header
+  forwarding, gateway-style fetch errors, buffered helper conversion for tests,
+  and streaming Axum HTTP conversion for live responses. Enabled the `reqwest`
+  `stream` feature and updated `Cargo.lock`.
+- Verification: `cargo test artifacts` initially required network outside the
+  sandbox to resolve the new `reqwest` streaming dependency, then passed with 8
+  tests; `cargo test server` passed with 19 tests; `cargo fmt --check` passed.
+- Commit: pending.
 
 ## Milestone 3: npm and PyPI Proxy-Mode Integration
 

@@ -6,7 +6,7 @@ use crate::response::RegistryResponse;
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri};
+use axum::http::{header, HeaderMap, Method, Response, StatusCode, Uri};
 use axum::routing::any;
 use axum::Router;
 use chrono::{DateTime, Utc};
@@ -209,22 +209,7 @@ async fn route_request_with_dependencies(
 }
 
 fn registry_response_into_http(response: RegistryResponse) -> Response<Body> {
-    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
-    let mut builder = Response::builder().status(status);
-    let headers = builder
-        .headers_mut()
-        .expect("headers are available before response body is built");
-    for (name, value) in response.headers {
-        if let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(name.as_bytes()),
-            HeaderValue::from_str(&value),
-        ) {
-            headers.insert(name, value);
-        }
-    }
-    builder
-        .body(Body::from(response.body))
-        .expect("registry response should convert to HTTP response")
+    response.into_http_response()
 }
 
 fn simple_response(status: u16, message: &str) -> RegistryResponse {
