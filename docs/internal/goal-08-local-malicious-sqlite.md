@@ -466,7 +466,7 @@ Status note 2026-07-08:
   SQLite transaction. Commands run after fixup: `cargo test malicious` passed
   with 34 tests; `cargo test cli` passed with 14 tests; `cargo fmt --check`
   passed.
-- Commit: da84b4d; fixup commit: this commit.
+- Commit: da84b4d; fixup commit: a20c7c4.
 
 ## Milestone 4: Request-Path Local Mode Integration
 
