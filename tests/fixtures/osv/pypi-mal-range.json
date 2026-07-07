@@ -1,0 +1,32 @@
+{
+  "schema_version": "1.7.3",
+  "id": "MAL-2022-7421",
+  "published": "2022-08-30T19:36:58Z",
+  "modified": "2023-11-08T04:20:11.996296Z",
+  "aliases": [
+    "GHSA-hqmv-64pp-q4xw"
+  ],
+  "summary": "Malicious code in ascii2text (PyPI)",
+  "affected": [
+    {
+      "package": {
+        "name": "ascii2text",
+        "ecosystem": "PyPI",
+        "purl": "pkg:pypi/ascii2text"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/ossf/malicious-packages/blob/main/osv/malicious/pypi/ascii2text/MAL-2022-7421.json"
+      }
+    }
+  ]
+}

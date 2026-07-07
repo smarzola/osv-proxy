@@ -1,0 +1,29 @@
+{
+  "schema_version": "1.7.3",
+  "id": "MAL-2021-1",
+  "published": "2021-12-27T00:00:00Z",
+  "modified": "2023-09-01T20:12:58Z",
+  "summary": "Malicious code in cxp-jquery (npm)",
+  "affected": [
+    {
+      "package": {
+        "name": "cxp-jquery",
+        "ecosystem": "npm",
+        "purl": "pkg:npm/cxp-jquery"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            {
+              "introduced": "0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "source": "https://github.com/ossf/malicious-packages/blob/main/osv/malicious/npm/cxp-jquery/MAL-2021-1.json"
+      }
+    }
+  ]
+}

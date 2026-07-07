@@ -182,7 +182,7 @@ When a milestone is complete:
 5. Report the commit hash in the goal-loop status before starting the next
    milestone.
 
-- [ ] Milestone 0: Baseline and real OSV data shape
+- [x] Milestone 0: Baseline and real OSV data shape
 - [ ] Milestone 1: SQLite schema, config, and local checker
 - [ ] Milestone 2: npm/PyPI version range evaluation
 - [ ] Milestone 3: Explicit OSV dump sync command
@@ -233,6 +233,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note 2026-07-07:
+
+- Inspected OSV data dump docs and OSV schema docs, plus current GCS artifacts
+  from `ecosystems.txt`, npm/PyPI `modified_id.csv`, and npm/PyPI `all.zip`.
+- Captured tiny fixtures from real current dump records:
+  `MAL-2022-1122`, `MAL-2021-1`, `MAL-2023-10`, and `MAL-2022-7421`.
+  Current dumps include MAL range records for npm (`SEMVER`) and PyPI
+  (`ECOSYSTEM`), so no synthetic range derivative was needed.
+- Commands run: `cargo test` in sandbox failed only on local socket binding with
+  `Operation not permitted`; `cargo test` outside sandbox passed; `cargo fmt
+  --check` passed; `cargo clippy --all-targets --all-features -- -D warnings`
+  passed; OSV sampling used `curl -fsSL` for the listed GCS artifacts,
+  `unzip -Z1`, `unzip -p`, and a read-only `python3` zip/JSON scan.
+- Commit: pending.
 
 ## Milestone 1: SQLite Schema, Config, and Local Checker
 
