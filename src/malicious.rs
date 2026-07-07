@@ -347,7 +347,15 @@ pub async fn sync_malicious(
     let mut connection = open_read_write_connection(&config.sqlite_path)?;
     let mut ecosystems = Vec::new();
     for ecosystem in [Ecosystem::Npm, Ecosystem::Pypi] {
-        ecosystems.push(sync_ecosystem(&mut connection, client, ecosystem).await?);
+        ecosystems.push(
+            sync_ecosystem(
+                &mut connection,
+                client,
+                ecosystem,
+                config.retain_raw_advisories,
+            )
+            .await?,
+        );
     }
     Ok(MaliciousSyncReport { ecosystems })
 }
@@ -356,15 +364,30 @@ async fn sync_ecosystem(
     connection: &mut Connection,
     client: &dyn OsvDumpClient,
     ecosystem: Ecosystem,
+    retain_raw_advisories: bool,
 ) -> Result<MaliciousSyncEcosystemReport, MaliciousError> {
     let attempted_at = Utc::now();
     let result = if sync_state(connection, ecosystem.osv_name())?
         .and_then(|state| state.last_success_at)
         .is_some()
     {
-        sync_incremental(connection, client, ecosystem, attempted_at).await
+        sync_incremental(
+            connection,
+            client,
+            ecosystem,
+            attempted_at,
+            retain_raw_advisories,
+        )
+        .await
     } else {
-        sync_bootstrap(connection, client, ecosystem, attempted_at).await
+        sync_bootstrap(
+            connection,
+            client,
+            ecosystem,
+            attempted_at,
+            retain_raw_advisories,
+        )
+        .await
     };
 
     match result {
@@ -381,9 +404,10 @@ async fn sync_bootstrap(
     client: &dyn OsvDumpClient,
     ecosystem: Ecosystem,
     attempted_at: DateTime<Utc>,
+    retain_raw_advisories: bool,
 ) -> Result<MaliciousSyncEcosystemReport, MaliciousError> {
     let bytes = client.fetch_bytes(&all_zip_url(ecosystem)).await?;
-    let advisories = advisories_from_zip(&bytes)?;
+    let advisories = advisories_from_zip(&bytes, retain_raw_advisories)?;
     let stats = import_advisories_and_record_success(
         connection,
         ecosystem,
@@ -406,6 +430,7 @@ async fn sync_incremental(
     client: &dyn OsvDumpClient,
     ecosystem: Ecosystem,
     attempted_at: DateTime<Utc>,
+    retain_raw_advisories: bool,
 ) -> Result<MaliciousSyncEcosystemReport, MaliciousError> {
     let previous_high_watermark =
         sync_state(connection, ecosystem.osv_name())?.and_then(|state| state.high_watermark);
@@ -419,7 +444,7 @@ async fn sync_incremental(
         let bytes = client
             .fetch_bytes(&advisory_json_url(ecosystem, &row.osv_id))
             .await?;
-        advisories.push(parse_osv_advisory_bytes(&bytes)?);
+        advisories.push(parse_osv_advisory_bytes(&bytes, retain_raw_advisories)?);
     }
     let high_watermark = rows
         .iter()
@@ -465,7 +490,10 @@ fn advisory_json_url(ecosystem: Ecosystem, osv_id: &str) -> String {
     )
 }
 
-fn advisories_from_zip(bytes: &[u8]) -> Result<Vec<OsvDumpAdvisory>, MaliciousError> {
+fn advisories_from_zip(
+    bytes: &[u8],
+    retain_raw_advisories: bool,
+) -> Result<Vec<OsvDumpAdvisory>, MaliciousError> {
     let reader = Cursor::new(bytes);
     let mut archive = ZipArchive::new(reader)
         .map_err(|err| MaliciousError::Sync(format!("invalid OSV all.zip: {err}")))?;
@@ -480,18 +508,24 @@ fn advisories_from_zip(bytes: &[u8]) -> Result<Vec<OsvDumpAdvisory>, MaliciousEr
         let mut raw = Vec::new();
         file.read_to_end(&mut raw)
             .map_err(|err| MaliciousError::Sync(format!("failed to read OSV zip entry: {err}")))?;
-        advisories.push(parse_osv_advisory_bytes(&raw)?);
+        advisories.push(parse_osv_advisory_bytes(&raw, retain_raw_advisories)?);
     }
     Ok(advisories)
 }
 
-fn parse_osv_advisory_bytes(bytes: &[u8]) -> Result<OsvDumpAdvisory, MaliciousError> {
-    let raw_json = std::str::from_utf8(bytes)
-        .map_err(|err| MaliciousError::Sync(format!("invalid OSV advisory JSON UTF-8: {err}")))?
-        .to_string();
+fn parse_osv_advisory_bytes(
+    bytes: &[u8],
+    retain_raw_advisories: bool,
+) -> Result<OsvDumpAdvisory, MaliciousError> {
     let mut advisory: OsvDumpAdvisory = serde_json::from_slice(bytes)
         .map_err(|err| MaliciousError::Sync(format!("invalid OSV advisory JSON: {err}")))?;
-    advisory.raw_json = raw_json;
+    advisory.raw_json = if retain_raw_advisories {
+        std::str::from_utf8(bytes)
+            .map_err(|err| MaliciousError::Sync(format!("invalid OSV advisory JSON UTF-8: {err}")))?
+            .to_string()
+    } else {
+        "{}".to_string()
+    };
     Ok(advisory)
 }
 
@@ -1852,6 +1886,35 @@ INSERT INTO advisories (
                 |row| row.get(0),
             )
             .unwrap();
+        assert_eq!(raw_json, "{}");
+    }
+
+    #[tokio::test]
+    async fn sync_retains_raw_advisory_json_when_configured() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("malicious.sqlite");
+        let mut config = local_config_for(&db);
+        config.retain_raw_advisories = true;
+        let npm_exact_and_range =
+            include_bytes!("../tests/fixtures/osv/npm-mal-exact-and-range.json");
+        let client = FixtureDumpClient::new([
+            (
+                all_zip_url(Ecosystem::Npm),
+                zip_bytes([("MAL-2022-1122.json", npm_exact_and_range.as_slice())]),
+            ),
+            (all_zip_url(Ecosystem::Pypi), zip_bytes([])),
+        ]);
+
+        sync_malicious(&config, &client).await.unwrap();
+
+        let connection = Connection::open(&db).unwrap();
+        let raw_json: String = connection
+            .query_row(
+                "SELECT raw_json FROM advisories WHERE osv_id = 'MAL-2022-1122'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(raw_json.contains("arpan-package"));
     }
 
@@ -2097,6 +2160,7 @@ INSERT INTO advisories (
             sqlite_path: path.to_path_buf(),
             max_staleness: Duration::from_secs(24 * 60 * 60),
             on_stale: LocalOsvStaleBehavior::Block,
+            retain_raw_advisories: false,
             background_sync: false,
             sync_interval: Duration::from_secs(60 * 60),
         }

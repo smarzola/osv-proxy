@@ -14,8 +14,9 @@ Live mode remains available with `policy.osv.source: live`.
 - If MongoDB-compatible storage is added later, use one store interface for
   mongolino and MongoDB.
 - Keep package policy independent of the storage server behind that interface.
-- Preserve the current SQLite semantics: raw advisories plus normalized affected
-  packages, exact versions, range events, and sync state.
+- Preserve the current SQLite semantics: advisory metadata, optional raw
+  advisory JSON retention, normalized affected packages, exact versions, range
+  events, and sync state.
 - Store only OSV `MAL-*` records as blocking inputs.
 - Preserve the invariant that metadata generation and artifact serving both
   evaluate current policy.

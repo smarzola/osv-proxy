@@ -29,13 +29,16 @@ when `policy.osv.local.background_sync: true`.
 
 ## SQLite Storage
 
-The local store keeps raw advisories and normalized affected clauses. It does
-not pre-expand ranges into every concrete npm or PyPI version.
+The local store keeps advisory metadata and normalized affected clauses. It does
+not pre-expand ranges into every concrete npm or PyPI version. Full raw OSV
+advisory JSON is optional and disabled by default with
+`policy.osv.local.retain_raw_advisories: false`.
 
 Tables:
 
 - `advisories`: OSV ID, modified/published/withdrawn timestamps, summary,
-  source, raw JSON, and import timestamp.
+  source, import timestamp, and optional raw JSON. When raw retention is
+  disabled, the compatibility column stores a compact empty JSON object.
 - `affected_packages`: one row per affected advisory package, indexed by
   ecosystem and normalized package name.
 - `affected_versions`: exact OSV `affected[].versions` entries.
@@ -45,8 +48,8 @@ Tables:
 - `sync_state`: ecosystem, source, high-water mark, last successful sync, last
   attempted sync, health status, and error summary.
 
-Withdrawn advisories remain represented as raw advisory records but do not keep
-blocking affected rows.
+Withdrawn advisories remain represented as advisory metadata records but do not
+keep blocking affected rows.
 
 ## Evaluation
 

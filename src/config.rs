@@ -197,6 +197,7 @@ pub struct LocalOsvConfig {
     #[serde(with = "duration_format")]
     pub max_staleness: Duration,
     pub on_stale: LocalOsvStaleBehavior,
+    pub retain_raw_advisories: bool,
     pub background_sync: bool,
     #[serde(with = "duration_format")]
     pub sync_interval: Duration,
@@ -208,6 +209,7 @@ impl Default for LocalOsvConfig {
             sqlite_path: PathBuf::from("osv-malicious.sqlite"),
             max_staleness: Duration::from_secs(24 * 60 * 60),
             on_stale: LocalOsvStaleBehavior::Block,
+            retain_raw_advisories: false,
             background_sync: false,
             sync_interval: Duration::from_secs(6 * 60 * 60),
         }
@@ -394,6 +396,7 @@ mod tests {
             config.policy.osv.local.on_stale,
             LocalOsvStaleBehavior::Block
         );
+        assert!(!config.policy.osv.local.retain_raw_advisories);
         assert!(!config.policy.osv.local.background_sync);
         assert_eq!(
             config.policy.osv.local.sync_interval,
@@ -438,6 +441,7 @@ policy:
       sqlite_path: "./data/osv-malicious.sqlite"
       max_staleness: "12h"
       on_stale: block
+      retain_raw_advisories: true
       background_sync: true
       sync_interval: "30m"
 "#,
@@ -457,6 +461,7 @@ policy:
             config.policy.osv.local.on_stale,
             LocalOsvStaleBehavior::Block
         );
+        assert!(config.policy.osv.local.retain_raw_advisories);
         assert!(config.policy.osv.local.background_sync);
         assert_eq!(
             config.policy.osv.local.sync_interval,

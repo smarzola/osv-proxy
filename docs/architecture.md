@@ -142,10 +142,11 @@ Use traits for external services:
 The policy engine should not know whether malicious data comes from OSV live
 calls or the local store.
 
-The implemented local malicious store is SQLite. It stores raw OSV advisories,
+The implemented local malicious store is SQLite. It stores advisory metadata,
 normalized affected packages, exact affected versions, range events, and sync
-state. Request handling performs indexed SQLite reads and evaluates exact
-versions and ranges in memory without OSV network calls.
+state. Full raw OSV advisory JSON retention is optional. Request handling
+performs indexed SQLite reads and evaluates exact versions and ranges in memory
+without OSV network calls.
 
 MongoDB-compatible storage may be added later if needed. If it is, mongolino
 should remain MongoDB-compatible infrastructure behind that future store

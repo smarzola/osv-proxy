@@ -129,6 +129,7 @@ policy:
       sqlite_path: "./osv-malicious.sqlite"
       max_staleness: "24h"
       on_stale: block
+      retain_raw_advisories: false
       background_sync: false
       sync_interval: "6h"
 ```
@@ -139,6 +140,9 @@ policy:
   local data is stale. Defaults to `24h`.
 - `local.on_stale`: `block` fails closed when local data is stale; `allow`
   fails open. Defaults to `block`.
+- `local.retain_raw_advisories`: when true, sync stores the full source OSV
+  advisory JSON in SQLite. Defaults to false so the local DB keeps only compact
+  normalized lookup data plus advisory metadata needed for policy decisions.
 - `local.background_sync`: when true, `serve` starts a background sync task.
   The first sync runs immediately on startup, then repeats after
   `sync_interval`.

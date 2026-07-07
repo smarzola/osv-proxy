@@ -3,6 +3,15 @@
 All notable changes to `osv-proxy` are tracked here. Release sections are the
 source for GitHub release notes.
 
+## [0.3.1] - 2026-07-08
+
+### Changed
+
+- Local malicious SQLite sync no longer stores full raw OSV advisory JSON by
+  default, substantially reducing new local database size.
+- Added `policy.osv.local.retain_raw_advisories` for operators who need raw OSV
+  advisory JSON retained for audit or debugging.
+
 ## [0.3.0] - 2026-07-08
 
 ### Added

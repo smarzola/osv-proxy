@@ -194,6 +194,7 @@ policy:
       sqlite_path: "./osv-malicious.sqlite"
       max_staleness: "24h"
       on_stale: block
+      retain_raw_advisories: false
       background_sync: true
       sync_interval: "6h"
 ```
@@ -203,6 +204,9 @@ corrupt, unhealthy, or stale local data blocks malicious checks instead of
 silently allowing installs. `background_sync: true` makes `serve` run one sync
 immediately on startup and then repeat after `sync_interval`; failed background
 syncs record health state and keep serving against the last usable snapshot.
+`retain_raw_advisories` defaults to false so the SQLite database stores compact
+normalized lookup data by default; set it to true only when you need raw OSV
+advisory JSON for audit or debugging.
 
 ## Policy Behavior
 

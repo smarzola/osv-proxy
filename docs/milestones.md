@@ -110,8 +110,9 @@ Build:
 
 - local SQLite malicious checker behind the existing `MaliciousChecker`
   boundary
-- SQLite sync engine storing raw OSV advisories plus normalized affected
-  packages, exact versions, ranges, range events, and sync state
+- SQLite sync engine storing advisory metadata, optional raw advisory JSON,
+  normalized affected packages, exact versions, ranges, range events, and sync
+  state
 - explicit `osv-proxy malicious sync --config <path>` command
 - background OSV `MAL-*` sync in `serve`
 - local lookup
