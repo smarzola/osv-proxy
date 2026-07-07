@@ -312,11 +312,11 @@ Status note 2026-07-08:
 - Added `SqliteMaliciousChecker` for exact-version local hits, stale/missing or
   unhealthy store errors, range-row explicit errors pending Milestone 2, and
   order-preserving `check_many`.
-- Commands run: `cargo test config` passed with 27 tests; `cargo test
-  malicious` passed with 21 tests; `cargo fmt --check` passed. The first
+- Commands run: `cargo test config` passed with 28 tests; `cargo test
+  malicious` passed with 22 tests; `cargo fmt --check` passed. The first
   sandboxed `cargo test config` attempt failed to resolve `index.crates.io`;
   reran with approved Cargo network access to resolve new dependencies.
-- Commit: pending.
+- Commit: `5c88d22`; fixup commit: this commit.
 
 ## Milestone 2: npm/PyPI Version Range Evaluation
 

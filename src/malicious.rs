@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Client;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -188,6 +189,59 @@ impl SqliteMaliciousChecker {
         }
         Ok(Vec::new())
     }
+
+    fn check_many_with_connection(
+        &self,
+        connection: &Connection,
+        artifacts: &[Artifact],
+    ) -> Result<Vec<Vec<MaliciousHit>>, MaliciousError> {
+        let ecosystems = artifacts
+            .iter()
+            .map(|artifact| artifact.ecosystem.osv_name())
+            .collect::<BTreeSet<_>>();
+        for ecosystem in ecosystems {
+            ensure_store_healthy(connection, ecosystem, self)?;
+        }
+
+        let mut grouped = BTreeMap::<(String, String, String), Vec<usize>>::new();
+        for (index, artifact) in artifacts.iter().enumerate() {
+            grouped
+                .entry((
+                    artifact.ecosystem.osv_name().to_string(),
+                    artifact.name.clone(),
+                    artifact.version.clone(),
+                ))
+                .or_default()
+                .push(index);
+        }
+
+        let mut range_counts = BTreeMap::<(String, String), u32>::new();
+        let mut results = vec![Vec::new(); artifacts.len()];
+        for (_, indexes) in grouped {
+            let artifact = &artifacts[indexes[0]];
+            let hits = exact_hits(connection, artifact)?;
+            if hits.is_empty() {
+                let package_key = (
+                    artifact.ecosystem.osv_name().to_string(),
+                    artifact.name.clone(),
+                );
+                let range_count = if let Some(count) = range_counts.get(&package_key) {
+                    *count
+                } else {
+                    let count = range_count(connection, artifact)?;
+                    range_counts.insert(package_key, count);
+                    count
+                };
+                if range_count > 0 {
+                    return Err(MaliciousError::UnsupportedRange(artifact.identity()));
+                }
+            }
+            for index in indexes {
+                results[index] = hits.clone();
+            }
+        }
+        Ok(results)
+    }
 }
 
 #[async_trait]
@@ -205,11 +259,7 @@ impl MaliciousChecker for SqliteMaliciousChecker {
             return Ok(Vec::new());
         }
         let connection = self.open_read_only()?;
-        let mut results = Vec::with_capacity(artifacts.len());
-        for artifact in artifacts {
-            results.push(self.check_with_connection(&connection, artifact)?);
-        }
-        Ok(results)
+        self.check_many_with_connection(&connection, artifacts)
     }
 }
 
@@ -592,6 +642,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_checker_allows_stale_database_when_configured() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_sync_state(&connection, "npm", "healthy", "2020-01-01T00:00:00Z");
+        insert_exact_advisory(
+            &connection,
+            "MAL-2026-000001",
+            "npm",
+            "demo",
+            "1.2.3",
+            Some("stale but allowed"),
+        );
+        let checker = checker_for_with_stale_behavior(&db, LocalOsvStaleBehavior::Allow);
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None);
+
+        let hits = checker.check(&artifact).await.unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].osv_id, "MAL-2026-000001");
+    }
+
+    #[tokio::test]
     async fn sqlite_checker_errors_for_unhealthy_sync_state() {
         let dir = tempdir().unwrap();
         let db = initialized_db(dir.path());
@@ -633,6 +706,8 @@ mod tests {
             Artifact::package(Ecosystem::Npm, "clean", "1.0.0", None),
             Artifact::package(Ecosystem::Pypi, "Requests", "2.32.3", None),
             Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None),
+            Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None),
+            Artifact::package(Ecosystem::Pypi, "requests", "2.32.3", None),
         ];
 
         let results = checker.check_many(&artifacts).await.unwrap();
@@ -640,6 +715,8 @@ mod tests {
         assert!(results[0].is_empty());
         assert_eq!(results[1][0].osv_id, "MAL-2026-000002");
         assert_eq!(results[2][0].osv_id, "MAL-2026-000001");
+        assert_eq!(results[3], results[2]);
+        assert_eq!(results[4], results[1]);
     }
 
     #[tokio::test]
@@ -664,10 +741,17 @@ mod tests {
     }
 
     fn checker_for(path: &Path) -> SqliteMaliciousChecker {
+        checker_for_with_stale_behavior(path, LocalOsvStaleBehavior::Block)
+    }
+
+    fn checker_for_with_stale_behavior(
+        path: &Path,
+        on_stale: LocalOsvStaleBehavior,
+    ) -> SqliteMaliciousChecker {
         SqliteMaliciousChecker::new(&LocalOsvConfig {
             sqlite_path: path.to_path_buf(),
             max_staleness: Duration::from_secs(24 * 60 * 60),
-            on_stale: LocalOsvStaleBehavior::Block,
+            on_stale,
             background_sync: false,
             sync_interval: Duration::from_secs(60 * 60),
         })
