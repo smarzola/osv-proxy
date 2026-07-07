@@ -1350,6 +1350,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_request_path_reads_sqlite_while_write_transaction_is_active() {
+        let dir = tempdir().unwrap();
+        let mut config = local_malicious_config(dir.path().join("malicious.sqlite"));
+        insert_local_malicious_version(&config, Ecosystem::Npm, "demo", "1.0.1", "MAL-2026-000001");
+        let mut writer = Connection::open(&config.policy.osv.local.sqlite_path).unwrap();
+        let transaction = writer.transaction().unwrap();
+        transaction
+            .execute(
+                r#"
+INSERT INTO advisories (
+    osv_id,
+    summary,
+    modified,
+    published,
+    withdrawn,
+    raw_json,
+    source,
+    imported_at
+) VALUES (
+    'MAL-2026-000002',
+    'uncommitted advisory',
+    '2026-07-01T00:00:00Z',
+    NULL,
+    NULL,
+    '{}',
+    'test',
+    '2026-07-01T00:00:00Z'
+)
+"#,
+                [],
+            )
+            .unwrap();
+        let metadata_body = npm_demo_metadata().to_string();
+        let (registry_url, metadata_request) = serve_http_once(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            metadata_body.len(),
+            metadata_body
+        ))
+        .await;
+        config.upstreams.npm.registry_url = registry_url;
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            route_request(&config, "GET", "/npm/demo"),
+        )
+        .await
+        .unwrap();
+
+        let metadata: Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(response.status, 200);
+        assert!(
+            metadata["versions"]
+                .as_object()
+                .unwrap()
+                .contains_key("1.0.0")
+        );
+        assert!(
+            !metadata["versions"]
+                .as_object()
+                .unwrap()
+                .contains_key("1.0.1")
+        );
+        assert!(metadata_request.await.unwrap().starts_with("get /demo "));
+        drop(transaction);
+    }
+
+    #[tokio::test]
     async fn local_mode_filters_pypi_metadata_and_blocks_artifact_without_osv_http() {
         let dir = tempdir().unwrap();
         let mut config = local_malicious_config(dir.path().join("malicious.sqlite"));

@@ -600,14 +600,15 @@ Status note 2026-07-08:
   health/error state and do not crash the server.
 - `sync_interval` is bounded to 60s through 7d by config validation.
 - Added tests for immediate background sync, failed first-sync health recording,
-  and SQLite reads completing against the existing WAL snapshot while a write
-  transaction is active.
+  request-path local mode completing while a SQLite write transaction is active,
+  and SQLite checker reads completing against the existing WAL snapshot while a
+  write transaction is active.
 - Commands run: `cargo test server` in sandbox failed only on local socket
-  binding with `Operation not permitted`; `cargo test server` outside sandbox
-  passed with 25 tests; `cargo test malicious` in sandbox failed only on local
-  socket binding from matching server coverage; `cargo test malicious` outside
-  sandbox passed with 39 tests; `cargo fmt --check` passed.
-- Commit: pending at note time; final commit hash reported in status.
+  binding with `Operation not permitted`, then passed outside sandbox with 26
+  tests; `cargo test malicious` in sandbox failed only on local socket binding
+  from matching server coverage, then passed outside sandbox with 39 tests;
+  `cargo fmt --check` passed.
+- Commit: `b4a88c7`.
 
 ## Milestone 6: Docs, Final Regression, and Release Readiness
 
