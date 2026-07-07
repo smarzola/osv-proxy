@@ -1,6 +1,9 @@
 use crate::artifacts::{ArtifactDeliveryClient, ArtifactDeliveryOptions};
-use crate::config::Config;
-use crate::malicious::{MaliciousChecker, configured_malicious_checker};
+use crate::config::{Config, LocalOsvConfig, OsvSource};
+use crate::malicious::{
+    HttpOsvDumpClient, MaliciousChecker, OsvDumpClient, configured_malicious_checker,
+    sync_malicious,
+};
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
 use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
 use crate::response::RegistryResponse;
@@ -13,6 +16,7 @@ use axum::routing::any;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
 
 const REQUEST_BODY_LIMIT_BYTES: usize = 8192;
 
@@ -23,6 +27,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 }
 
 pub async fn serve_listener(listener: TcpListener, config: Config) -> anyhow::Result<()> {
+    let _background_sync = start_background_malicious_sync_if_enabled(&config);
     axum::serve(listener, router(config)).await?;
     Ok(())
 }
@@ -38,6 +43,45 @@ pub fn router(config: Config) -> Router {
 struct AppState {
     config: Config,
     checker: Arc<dyn MaliciousChecker>,
+}
+
+struct BackgroundSyncTask {
+    handle: JoinHandle<()>,
+}
+
+impl Drop for BackgroundSyncTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+fn start_background_malicious_sync_if_enabled(config: &Config) -> Option<BackgroundSyncTask> {
+    if config.policy.osv.source != OsvSource::Local || !config.policy.osv.local.background_sync {
+        return None;
+    }
+    Some(spawn_background_malicious_sync(
+        config.policy.osv.local.clone(),
+        Arc::new(HttpOsvDumpClient::new()),
+    ))
+}
+
+fn spawn_background_malicious_sync(
+    local_config: LocalOsvConfig,
+    client: Arc<dyn OsvDumpClient>,
+) -> BackgroundSyncTask {
+    let handle = tokio::spawn(async move {
+        loop {
+            match sync_malicious(&local_config, client.as_ref()).await {
+                Ok(report) => println!(
+                    "local malicious background sync completed for {} ecosystems",
+                    report.ecosystems.len()
+                ),
+                Err(err) => eprintln!("local malicious background sync failed: {err}"),
+            }
+            tokio::time::sleep(local_config.sync_interval).await;
+        }
+    });
+    BackgroundSyncTask { handle }
 }
 
 async fn registry_handler(
@@ -443,8 +487,10 @@ fn percent_decode_segment(segment: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::artifact::{Artifact, Ecosystem};
-    use crate::config::{AllowlistEntry, ArtifactBehavior, BlocklistEntry, OsvSource};
-    use crate::malicious::{MaliciousError, MaliciousHit, SqliteMaliciousChecker};
+    use crate::config::{
+        AllowlistEntry, ArtifactBehavior, BlocklistEntry, LocalOsvConfig, OsvSource,
+    };
+    use crate::malicious::{MaliciousError, MaliciousHit, OsvDumpClient, SqliteMaliciousChecker};
     use crate::npm::NpmError;
     use crate::pypi::{SimpleFile, SimpleProject};
     use axum::http::StatusCode;
@@ -453,10 +499,12 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::collections::HashMap;
+    use std::io::{Cursor, Write};
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
+    use zip::{ZipWriter, write::SimpleFileOptions};
 
     struct StaticUpstream {
         metadata: HashMap<String, Value>,
@@ -545,6 +593,64 @@ mod tests {
                 Ok(Vec::new())
             }
         }
+    }
+
+    struct FixtureDumpClient {
+        responses: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl FixtureDumpClient {
+        fn new<const N: usize>(responses: [(String, Vec<u8>); N]) -> Self {
+            Self {
+                responses: responses.into_iter().collect(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl OsvDumpClient for FixtureDumpClient {
+        async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, MaliciousError> {
+            self.responses
+                .get(url)
+                .cloned()
+                .ok_or_else(|| MaliciousError::Sync(format!("missing fixture response for {url}")))
+        }
+    }
+
+    const OSV_DUMP_BASE_URL: &str = "https://storage.googleapis.com/osv-vulnerabilities";
+
+    fn all_zip_url(ecosystem: &str) -> String {
+        format!("{OSV_DUMP_BASE_URL}/{ecosystem}/all.zip")
+    }
+
+    fn zip_bytes<const N: usize>(entries: [(&str, &[u8]); N]) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(cursor);
+        for (name, bytes) in entries {
+            writer
+                .start_file(name, SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(bytes).unwrap();
+        }
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn advisory_json(id: &str, ecosystem: &str, name: &str, version: &str) -> Vec<u8> {
+        format!(
+            r#"{{
+                "schema_version": "1.7.3",
+                "id": "{id}",
+                "published": "2026-07-01T00:00:00Z",
+                "modified": "2026-07-02T00:00:00Z",
+                "summary": "Malicious code in {name}",
+                "affected": [{{
+                    "package": {{ "name": "{name}", "ecosystem": "{ecosystem}" }},
+                    "versions": ["{version}"],
+                    "ranges": []
+                }}]
+            }}"#
+        )
+        .into_bytes()
     }
 
     fn now() -> DateTime<Utc> {
@@ -1139,6 +1245,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_malicious_sync_runs_immediately_for_local_config() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("malicious.sqlite");
+        let npm_advisory = advisory_json("MAL-2026-000001", "npm", "demo", "1.0.1");
+        let client = FixtureDumpClient::new([
+            (
+                all_zip_url("npm"),
+                zip_bytes([("MAL-2026-000001.json", npm_advisory.as_slice())]),
+            ),
+            (all_zip_url("PyPI"), zip_bytes([])),
+        ]);
+        let local_config = LocalOsvConfig {
+            sqlite_path: db.clone(),
+            background_sync: true,
+            sync_interval: Duration::from_secs(60 * 60),
+            ..LocalOsvConfig::default()
+        };
+
+        let _task = spawn_background_malicious_sync(local_config.clone(), Arc::new(client));
+
+        wait_for_sync_status(&db, "PyPI", "healthy").await;
+        let checker = SqliteMaliciousChecker::new(&local_config);
+        let hits = checker
+            .check(&Artifact::package(Ecosystem::Npm, "demo", "1.0.1", None))
+            .await
+            .unwrap();
+        assert_eq!(hits[0].osv_id, "MAL-2026-000001");
+    }
+
+    #[tokio::test]
+    async fn background_malicious_sync_records_failed_first_sync() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("malicious.sqlite");
+        let client = FixtureDumpClient::new([]);
+        let local_config = LocalOsvConfig {
+            sqlite_path: db.clone(),
+            background_sync: true,
+            sync_interval: Duration::from_secs(60 * 60),
+            ..LocalOsvConfig::default()
+        };
+
+        let _task = spawn_background_malicious_sync(local_config, Arc::new(client));
+
+        wait_for_sync_status(&db, "npm", "failed").await;
+        let connection = Connection::open(&db).unwrap();
+        let error_summary: String = connection
+            .query_row(
+                "SELECT error_summary FROM sync_state WHERE ecosystem = 'npm'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(error_summary.contains("missing fixture response"));
+    }
+
+    #[tokio::test]
     async fn local_mode_filters_npm_metadata_and_blocks_artifact_without_osv_http() {
         let dir = tempdir().unwrap();
         let mut config = local_malicious_config(dir.path().join("malicious.sqlite"));
@@ -1440,6 +1602,25 @@ mod tests {
             String::from_utf8_lossy(&buffer[..bytes]).to_ascii_lowercase()
         });
         (format!("http://{address}"), handle)
+    }
+
+    async fn wait_for_sync_status(db: &std::path::Path, ecosystem: &str, expected_status: &str) {
+        for _ in 0..50 {
+            let status = Connection::open(db).ok().and_then(|connection| {
+                connection
+                    .query_row(
+                        "SELECT status FROM sync_state WHERE ecosystem = ?1",
+                        [ecosystem],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+            });
+            if status.as_deref() == Some(expected_status) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("timed out waiting for {ecosystem} sync status {expected_status}");
     }
 
     fn npm_demo_metadata() -> Value {

@@ -1516,6 +1516,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_checker_reads_existing_snapshot_during_active_write_transaction() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_exact_advisory(
+            &connection,
+            "MAL-2026-000001",
+            "npm",
+            "demo",
+            "1.2.3",
+            Some("existing snapshot hit"),
+        );
+        let mut writer = open_read_write_connection(&db).unwrap();
+        let transaction = writer.transaction().unwrap();
+        transaction
+            .execute(
+                r#"
+INSERT INTO advisories (
+    osv_id,
+    summary,
+    modified,
+    published,
+    withdrawn,
+    raw_json,
+    source,
+    imported_at
+) VALUES (
+    'MAL-2026-000002',
+    'uncommitted advisory',
+    '2026-07-01T00:00:00Z',
+    NULL,
+    NULL,
+    '{}',
+    'test',
+    '2026-07-01T00:00:00Z'
+)
+"#,
+                [],
+            )
+            .unwrap();
+        let checker = checker_for(&db);
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None);
+
+        let hits = tokio::time::timeout(Duration::from_millis(500), checker.check(&artifact))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].osv_id, "MAL-2026-000001");
+        drop(transaction);
+    }
+
+    #[tokio::test]
     async fn sqlite_checker_matches_npm_introduced_zero_range() {
         let dir = tempdir().unwrap();
         let db = initialized_db(dir.path());

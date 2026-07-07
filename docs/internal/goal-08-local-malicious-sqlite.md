@@ -187,7 +187,7 @@ When a milestone is complete:
 - [x] Milestone 2: npm/PyPI version range evaluation
 - [x] Milestone 3: Explicit OSV dump sync command
 - [x] Milestone 4: Request-path local mode integration
-- [ ] Milestone 5: Background sync in serve
+- [x] Milestone 5: Background sync in serve
 - [ ] Milestone 6: Docs, final regression, and release readiness
 
 ## Milestone 0: Baseline and Real OSV Data Shape
@@ -587,6 +587,27 @@ cargo fmt --check
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note 2026-07-08:
+
+- Added server-managed local malicious background sync for `serve` when
+  `policy.osv.source: local` and `policy.osv.local.background_sync: true`.
+- The first background sync runs immediately on startup, then subsequent syncs
+  wait for `sync_interval`; missing, stale, corrupt, or unhealthy local data
+  continues to fail closed through the request-path SQLite checker.
+- Background sync uses the same `sync_malicious` engine and `HttpOsvDumpClient`
+  as `osv-proxy malicious sync`; failed sync attempts record `sync_state`
+  health/error state and do not crash the server.
+- `sync_interval` is bounded to 60s through 7d by config validation.
+- Added tests for immediate background sync, failed first-sync health recording,
+  and SQLite reads completing against the existing WAL snapshot while a write
+  transaction is active.
+- Commands run: `cargo test server` in sandbox failed only on local socket
+  binding with `Operation not permitted`; `cargo test server` outside sandbox
+  passed with 25 tests; `cargo test malicious` in sandbox failed only on local
+  socket binding from matching server coverage; `cargo test malicious` outside
+  sandbox passed with 39 tests; `cargo fmt --check` passed.
+- Commit: pending at note time; final commit hash reported in status.
 
 ## Milestone 6: Docs, Final Regression, and Release Readiness
 

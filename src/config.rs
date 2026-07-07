@@ -6,6 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
+const LOCAL_OSV_SYNC_INTERVAL_MIN: Duration = Duration::from_secs(60);
+const LOCAL_OSV_SYNC_INTERVAL_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -226,6 +229,16 @@ impl LocalOsvConfig {
         if self.sync_interval.is_zero() {
             return Err(ConfigError::Invalid(
                 "policy.osv.local.sync_interval must be greater than zero".to_string(),
+            ));
+        }
+        if self.sync_interval < LOCAL_OSV_SYNC_INTERVAL_MIN {
+            return Err(ConfigError::Invalid(
+                "policy.osv.local.sync_interval must be at least 60s".to_string(),
+            ));
+        }
+        if self.sync_interval > LOCAL_OSV_SYNC_INTERVAL_MAX {
+            return Err(ConfigError::Invalid(
+                "policy.osv.local.sync_interval must be at most 7d".to_string(),
             ));
         }
         Ok(())
@@ -505,6 +518,34 @@ policy:
         )
         .unwrap_err();
         assert!(err.to_string().contains("sync_interval must be greater"));
+    }
+
+    #[test]
+    fn rejects_too_short_local_osv_sync_interval() {
+        let err = load(
+            r#"
+policy:
+  osv:
+    local:
+      sync_interval: "59s"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sync_interval must be at least"));
+    }
+
+    #[test]
+    fn rejects_too_long_local_osv_sync_interval() {
+        let err = load(
+            r#"
+policy:
+  osv:
+    local:
+      sync_interval: "8d"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sync_interval must be at most"));
     }
 
     #[test]
