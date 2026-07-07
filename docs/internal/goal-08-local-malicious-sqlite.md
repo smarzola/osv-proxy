@@ -185,7 +185,7 @@ When a milestone is complete:
 - [x] Milestone 0: Baseline and real OSV data shape
 - [x] Milestone 1: SQLite schema, config, and local checker
 - [x] Milestone 2: npm/PyPI version range evaluation
-- [ ] Milestone 3: Explicit OSV dump sync command
+- [x] Milestone 3: Explicit OSV dump sync command
 - [ ] Milestone 4: Request-path local mode integration
 - [ ] Milestone 5: Background sync in serve
 - [ ] Milestone 6: Docs, final regression, and release readiness
@@ -434,6 +434,34 @@ cargo fmt --check
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note 2026-07-08:
+
+- Added explicit `osv-proxy malicious sync --config <path>` for local SQLite
+  malicious data.
+- Sync bootstraps npm and PyPI from per-ecosystem `all.zip` when no prior
+  successful sync exists, then uses per-ecosystem `modified_id.csv` and
+  individual advisory JSON URLs for incremental updates.
+- Imports only `MAL-*` advisories into affected tables, stores the source raw
+  advisory JSON for imported `MAL-*` records, normalizes exact versions and
+  range events into the existing SQLite schema, and keeps withdrawn records
+  non-blocking by replacing them without affected rows.
+- Advisory replacement is transactional. `sync_state` advances after successful
+  imports only; failed refreshes preserve any previous good snapshot while
+  recording `last_attempted_at` and `error_summary`.
+- Tests use in-memory local fixture ZIP/CSV/advisory bytes and do not require
+  live OSV network access.
+- Manual upstream shape checks: `curl -fsSLI
+  https://storage.googleapis.com/osv-vulnerabilities/npm/all.zip` returned
+  `content-type: application/zip`; `curl -fsSL
+  https://storage.googleapis.com/osv-vulnerabilities/npm/modified_id.csv | sed
+  -n '1,5p'` showed per-ecosystem rows shaped as `timestamp,id`, including both
+  `GHSA-*` and `MAL-*` IDs.
+- Commands run: first sandboxed `cargo test malicious` and `cargo test cli`
+  failed to resolve `index.crates.io` while adding the `zip` dependency; reran
+  with approved Cargo network access and `cargo test malicious` passed with 33
+  tests, `cargo test cli` passed with 14 tests, and `cargo fmt --check` passed.
+- Commit: pending.
 
 ## Milestone 4: Request-Path Local Mode Integration
 

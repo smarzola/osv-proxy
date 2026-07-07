@@ -1,6 +1,6 @@
 use crate::artifact::{Artifact, Ecosystem, parse_identity, parse_package_identity};
 use crate::config::Config;
-use crate::malicious::{MaliciousChecker, OsvHttpClient};
+use crate::malicious::{HttpOsvDumpClient, MaliciousChecker, OsvHttpClient, sync_malicious};
 use crate::npm::{NpmMetadataProvider, NpmRegistryClient};
 use crate::policy::{Decision, PolicyEngine};
 use crate::pypi::{PypiSimpleClient, PypiSimpleProvider};
@@ -46,11 +46,24 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    Malicious {
+        #[command(subcommand)]
+        command: MaliciousCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCommand {
     Validate {
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MaliciousCommand {
+    #[command(about = "Synchronize local malicious package data from OSV GCS dumps")]
+    Sync {
         #[arg(long)]
         config: PathBuf,
     },
@@ -115,6 +128,16 @@ pub async fn execute(cli: Cli) -> anyhow::Result<()> {
             Config::load(&config)
                 .with_context(|| format!("config validation failed for {}", config.display()))?;
             println!("configuration is valid");
+            Ok(())
+        }
+        Command::Malicious {
+            command: MaliciousCommand::Sync { config },
+        } => {
+            let config = Config::load(&config)
+                .with_context(|| format!("config validation failed for {}", config.display()))?;
+            let client = HttpOsvDumpClient::new();
+            let report = sync_malicious(&config.policy.osv.local, &client).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
     }
@@ -284,6 +307,24 @@ mod tests {
                 command: ConfigCommand::Validate { .. }
             }
         ));
+    }
+
+    #[test]
+    fn parses_malicious_sync() {
+        let cli = Cli::try_parse_from([
+            "osv-proxy",
+            "malicious",
+            "sync",
+            "--config",
+            "osv-proxy.yaml",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Malicious {
+                command: MaliciousCommand::Sync { config },
+            } => assert_eq!(config, PathBuf::from("osv-proxy.yaml")),
+            other => panic!("unexpected command: {other:?}"),
+        }
     }
 
     struct StaticNpm {
