@@ -186,7 +186,7 @@ When a milestone is complete:
 - [x] Milestone 1: SQLite schema, config, and local checker
 - [x] Milestone 2: npm/PyPI version range evaluation
 - [x] Milestone 3: Explicit OSV dump sync command
-- [ ] Milestone 4: Request-path local mode integration
+- [x] Milestone 4: Request-path local mode integration
 - [ ] Milestone 5: Background sync in serve
 - [ ] Milestone 6: Docs, final regression, and release readiness
 
@@ -517,6 +517,29 @@ cargo fmt --check
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note 2026-07-08:
+
+- Added a configured malicious-checker factory. `source: live` builds the
+  existing `OsvHttpClient`; `source: local` builds `SqliteMaliciousChecker`.
+- `serve` now builds the configured checker into router state once, and request
+  handling passes that checker through npm/PyPI metadata and artifact paths.
+- `check` and `eval` now use the same configured checker factory.
+- Added request-path tests proving local SQLite mode filters npm and PyPI
+  metadata, blocks direct artifact requests from SQLite data, and keeps
+  allowlisted `bypass_osv` versions without using live OSV.
+- Added direct factory coverage proving `source: local` selects the SQLite
+  checker instead of the live OSV client.
+- Commands run: `cargo test server` first failed in the sandbox on loopback
+  listener permission, then passed outside the sandbox with 23 tests; `cargo
+  test cli` passed with 14 tests; `cargo test npm` first failed in the sandbox
+  on loopback listener permission, then passed outside the sandbox with 33 unit
+  tests plus 1 package-manager e2e test; `cargo test pypi` first failed in the
+  sandbox on loopback listener permission, then passed outside the sandbox with
+  31 tests; `cargo test malicious` first failed in the sandbox on loopback
+  listener permission from server coverage, then passed outside the sandbox with
+  36 tests; `cargo fmt --check` passed.
+- Commit: pending.
 
 ## Milestone 5: Background Sync In Serve
 

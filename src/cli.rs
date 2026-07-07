@@ -1,6 +1,8 @@
 use crate::artifact::{Artifact, Ecosystem, parse_identity, parse_package_identity};
 use crate::config::Config;
-use crate::malicious::{HttpOsvDumpClient, MaliciousChecker, OsvHttpClient, sync_malicious};
+use crate::malicious::{
+    HttpOsvDumpClient, MaliciousChecker, configured_malicious_checker, sync_malicious,
+};
 use crate::npm::{NpmMetadataProvider, NpmRegistryClient};
 use crate::policy::{Decision, PolicyEngine};
 use crate::pypi::{PypiSimpleClient, PypiSimpleProvider};
@@ -83,14 +85,14 @@ pub async fn execute(cli: Cli) -> anyhow::Result<()> {
         Command::Check { package, config } => {
             let config = Config::load(&config)
                 .with_context(|| format!("config validation failed for {}", config.display()))?;
-            let checker = OsvHttpClient::new(&config.policy.osv.api_url);
+            let checker = configured_malicious_checker(&config);
             let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
             let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
             let output = registry_check(
                 &config,
                 &package,
                 Utc::now(),
-                &checker,
+                checker.as_ref(),
                 &npm_upstream,
                 &pypi_upstream,
             )
@@ -110,9 +112,9 @@ pub async fn execute(cli: Cli) -> anyhow::Result<()> {
             let config = Config::load(&config)
                 .with_context(|| format!("config validation failed for {}", config.display()))?;
             let artifact = parse_identity(&package, published_at)?;
-            let checker = OsvHttpClient::new(&config.policy.osv.api_url);
+            let checker = configured_malicious_checker(&config);
             let decision = PolicyEngine::new(&config)
-                .evaluate(&artifact, Utc::now(), &checker)
+                .evaluate(&artifact, Utc::now(), checker.as_ref())
                 .await;
             let output = synthetic_eval_output(artifact, decision);
             println!("{}", serde_json::to_string_pretty(&output)?);

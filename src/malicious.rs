@@ -1,5 +1,5 @@
 use crate::artifact::{Artifact, Ecosystem};
-use crate::config::{LocalOsvConfig, LocalOsvStaleBehavior};
+use crate::config::{Config, LocalOsvConfig, LocalOsvStaleBehavior, OsvSource};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use node_semver as npm_semver;
@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use zip::ZipArchive;
@@ -34,6 +35,13 @@ pub trait MaliciousChecker: Send + Sync {
             results.push(self.check(artifact).await?);
         }
         Ok(results)
+    }
+}
+
+pub fn configured_malicious_checker(config: &Config) -> Arc<dyn MaliciousChecker> {
+    match config.policy.osv.source {
+        OsvSource::Live => Arc::new(OsvHttpClient::new(&config.policy.osv.api_url)),
+        OsvSource::Local => Arc::new(SqliteMaliciousChecker::new(&config.policy.osv.local)),
     }
 }
 
@@ -1286,7 +1294,7 @@ struct OsvVulnerability {
 mod tests {
     use super::*;
     use crate::artifact::{Artifact, Ecosystem};
-    use crate::config::{LocalOsvConfig, LocalOsvStaleBehavior};
+    use crate::config::{Config, LocalOsvConfig, LocalOsvStaleBehavior, OsvSource};
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::Path;
@@ -1435,6 +1443,35 @@ mod tests {
         let err = checker.check(&artifact).await.unwrap_err();
 
         assert!(err.to_string().contains("is failed"));
+    }
+
+    #[tokio::test]
+    async fn configured_checker_uses_sqlite_for_local_source() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_exact_advisory(
+            &connection,
+            "MAL-2026-000099",
+            "npm",
+            "demo",
+            "1.2.3",
+            Some("local factory hit"),
+        );
+        let mut config = Config::default();
+        config.policy.osv.source = OsvSource::Local;
+        config.policy.osv.api_url = "http://127.0.0.1:9".to_string();
+        config.policy.osv.local.sqlite_path = db;
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None);
+
+        let hits = configured_malicious_checker(&config)
+            .check(&artifact)
+            .await
+            .unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].osv_id, "MAL-2026-000099");
     }
 
     #[tokio::test]
