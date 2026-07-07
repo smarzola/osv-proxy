@@ -316,7 +316,7 @@ Status note 2026-07-08:
   malicious` passed with 22 tests; `cargo fmt --check` passed. The first
   sandboxed `cargo test config` attempt failed to resolve `index.crates.io`;
   reran with approved Cargo network access to resolve new dependencies.
-- Commit: `5c88d22`; fixup commit: this commit.
+- Commit: `5c88d22`; fixup commit: `083756b`.
 
 ## Milestone 2: npm/PyPI Version Range Evaluation
 
