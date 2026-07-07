@@ -461,7 +461,12 @@ Status note 2026-07-08:
   failed to resolve `index.crates.io` while adding the `zip` dependency; reran
   with approved Cargo network access and `cargo test malicious` passed with 33
   tests, `cargo test cli` passed with 14 tests, and `cargo fmt --check` passed.
-- Commit: pending.
+- Fixup: parsed `modified_id.csv` timestamps before high-watermark comparison
+  and moved per-ecosystem advisory import plus success-state update into one
+  SQLite transaction. Commands run after fixup: `cargo test malicious` passed
+  with 34 tests; `cargo test cli` passed with 14 tests; `cargo fmt --check`
+  passed.
+- Commit: da84b4d; fixup commit: this commit.
 
 ## Milestone 4: Request-Path Local Mode Integration
 

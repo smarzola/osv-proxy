@@ -1,7 +1,7 @@
 use crate::artifact::{Artifact, Ecosystem};
 use crate::config::{LocalOsvConfig, LocalOsvStaleBehavior};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use node_semver as npm_semver;
 use pep440_rs as pep440;
 use reqwest::Client;
@@ -376,12 +376,13 @@ async fn sync_bootstrap(
 ) -> Result<MaliciousSyncEcosystemReport, MaliciousError> {
     let bytes = client.fetch_bytes(&all_zip_url(ecosystem)).await?;
     let advisories = advisories_from_zip(&bytes)?;
-    let stats = import_advisories(connection, ecosystem, &advisories, attempted_at)?;
-    record_sync_success(
+    let stats = import_advisories_and_record_success(
         connection,
-        ecosystem.osv_name(),
+        ecosystem,
+        &advisories,
         attempted_at,
-        Some(attempted_at.to_rfc3339()),
+        ecosystem.osv_name(),
+        Some(serialize_high_watermark(attempted_at)),
     )?;
     Ok(MaliciousSyncEcosystemReport {
         ecosystem: ecosystem.osv_name().to_string(),
@@ -412,17 +413,18 @@ async fn sync_incremental(
             .await?;
         advisories.push(parse_osv_advisory_bytes(&bytes)?);
     }
-    let stats = import_advisories(connection, ecosystem, &advisories, attempted_at)?;
     let high_watermark = rows
         .iter()
-        .map(|row| row.modified_at.as_str())
+        .map(|row| row.modified_at)
         .max()
-        .map(ToOwned::to_owned)
+        .map(serialize_high_watermark)
         .or(previous_high_watermark);
-    record_sync_success(
+    let stats = import_advisories_and_record_success(
         connection,
-        ecosystem.osv_name(),
+        ecosystem,
+        &advisories,
         attempted_at,
+        ecosystem.osv_name(),
         high_watermark,
     )?;
     Ok(MaliciousSyncEcosystemReport {
@@ -487,7 +489,7 @@ fn parse_osv_advisory_bytes(bytes: &[u8]) -> Result<OsvDumpAdvisory, MaliciousEr
 
 #[derive(Debug, Clone)]
 struct ModifiedIdRow {
-    modified_at: String,
+    modified_at: DateTime<Utc>,
     osv_id: String,
 }
 
@@ -497,6 +499,9 @@ fn parse_modified_id_csv(
 ) -> Result<Vec<ModifiedIdRow>, MaliciousError> {
     let raw = std::str::from_utf8(bytes)
         .map_err(|err| MaliciousError::Sync(format!("invalid modified_id.csv UTF-8: {err}")))?;
+    let previous_high_watermark = previous_high_watermark
+        .map(parse_modified_timestamp)
+        .transpose()?;
     let mut rows = Vec::new();
     for line in raw.lines() {
         let line = line.trim();
@@ -514,16 +519,29 @@ fn parse_modified_id_csv(
                 "invalid modified_id.csv row: {line}"
             )));
         }
+        let modified_at = parse_modified_timestamp(modified_at)?;
         if previous_high_watermark.is_some_and(|previous| modified_at <= previous) {
             continue;
         }
         let osv_id = id.rsplit('/').next().unwrap_or(id).to_string();
         rows.push(ModifiedIdRow {
-            modified_at: modified_at.to_string(),
+            modified_at,
             osv_id,
         });
     }
     Ok(rows)
+}
+
+fn parse_modified_timestamp(value: &str) -> Result<DateTime<Utc>, MaliciousError> {
+    DateTime::parse_from_rfc3339(value)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|err| {
+            MaliciousError::Sync(format!("invalid modified_id.csv timestamp {value}: {err}"))
+        })
+}
+
+fn serialize_high_watermark(timestamp: DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -569,27 +587,40 @@ struct ImportStats {
     skipped_non_malicious: usize,
 }
 
-fn import_advisories(
+fn import_advisories_and_record_success(
     connection: &mut Connection,
     ecosystem: Ecosystem,
     advisories: &[OsvDumpAdvisory],
     imported_at: DateTime<Utc>,
+    state_ecosystem: &str,
+    high_watermark: Option<String>,
 ) -> Result<ImportStats, MaliciousError> {
     let transaction = connection.transaction().map_err(sqlite_error)?;
+    let stats = import_advisories(&transaction, ecosystem, advisories, imported_at)?;
+    record_sync_success(&transaction, state_ecosystem, imported_at, high_watermark)?;
+    transaction.commit().map_err(sqlite_error)?;
+    Ok(stats)
+}
+
+fn import_advisories(
+    transaction: &rusqlite::Transaction<'_>,
+    ecosystem: Ecosystem,
+    advisories: &[OsvDumpAdvisory],
+    imported_at: DateTime<Utc>,
+) -> Result<ImportStats, MaliciousError> {
     let mut stats = ImportStats::default();
     for advisory in advisories {
         if !advisory.id.starts_with("MAL-") {
             stats.skipped_non_malicious += 1;
             continue;
         }
-        replace_advisory(&transaction, ecosystem, advisory, imported_at)?;
+        replace_advisory(transaction, ecosystem, advisory, imported_at)?;
         if advisory.withdrawn.is_some() {
             stats.withdrawn += 1;
         } else {
             stats.imported += 1;
         }
     }
-    transaction.commit().map_err(sqlite_error)?;
     Ok(stats)
 }
 
@@ -711,12 +742,12 @@ fn sync_state(
 }
 
 fn record_sync_success(
-    connection: &Connection,
+    transaction: &rusqlite::Transaction<'_>,
     ecosystem: &str,
     attempted_at: DateTime<Utc>,
     high_watermark: Option<String>,
 ) -> Result<(), MaliciousError> {
-    connection
+    transaction
         .execute(
             r#"
 INSERT INTO sync_state (
@@ -1884,6 +1915,22 @@ mod tests {
             .unwrap();
         assert_eq!(status, "healthy");
         assert!(error_summary.unwrap().contains("missing fixture response"));
+    }
+
+    #[test]
+    fn modified_id_csv_compares_fractional_timestamps_chronologically() {
+        let rows = parse_modified_id_csv(
+            b"2026-07-07T17:16:49Z,MAL-2026-000001\n2026-07-07T17:16:49.1Z,MAL-2026-000002\n",
+            Some("2026-07-07T17:16:49Z"),
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].osv_id, "MAL-2026-000002");
+        assert_eq!(
+            serialize_high_watermark(rows[0].modified_at),
+            "2026-07-07T17:16:49.100000000Z"
+        );
     }
 
     struct FixtureDumpClient {
