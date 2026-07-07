@@ -2,7 +2,7 @@ use crate::artifact::{Ecosystem, normalize_pypi_name};
 use chrono::Duration as ChronoDuration;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -36,6 +36,7 @@ impl Config {
                 "artifacts.behavior=proxy_cache_s3 is not supported yet".to_string(),
             ));
         }
+        self.policy.osv.validate()?;
         for entry in &self.allowlist {
             if entry.version == "*" {
                 return Err(ConfigError::Unsupported(
@@ -147,23 +148,94 @@ pub enum MissingPublishTime {
 #[serde(default, deny_unknown_fields)]
 pub struct OsvConfig {
     pub block_malicious: bool,
+    pub source: OsvSource,
     pub api_url: String,
     pub on_error: OsvErrorBehavior,
+    pub local: LocalOsvConfig,
 }
 
 impl Default for OsvConfig {
     fn default() -> Self {
         Self {
             block_malicious: true,
+            source: OsvSource::Live,
             api_url: "https://api.osv.dev".to_string(),
             on_error: OsvErrorBehavior::Block,
+            local: LocalOsvConfig::default(),
         }
     }
+}
+
+impl OsvConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        self.local.validate()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OsvSource {
+    #[default]
+    Live,
+    Local,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OsvErrorBehavior {
+    Block,
+    Allow,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalOsvConfig {
+    pub sqlite_path: PathBuf,
+    #[serde(with = "duration_format")]
+    pub max_staleness: Duration,
+    pub on_stale: LocalOsvStaleBehavior,
+    pub background_sync: bool,
+    #[serde(with = "duration_format")]
+    pub sync_interval: Duration,
+}
+
+impl Default for LocalOsvConfig {
+    fn default() -> Self {
+        Self {
+            sqlite_path: PathBuf::from("osv-malicious.sqlite"),
+            max_staleness: Duration::from_secs(24 * 60 * 60),
+            on_stale: LocalOsvStaleBehavior::Block,
+            background_sync: false,
+            sync_interval: Duration::from_secs(6 * 60 * 60),
+        }
+    }
+}
+
+impl LocalOsvConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.sqlite_path.as_os_str().is_empty() {
+            return Err(ConfigError::Invalid(
+                "policy.osv.local.sqlite_path must not be empty".to_string(),
+            ));
+        }
+        if self.max_staleness.is_zero() {
+            return Err(ConfigError::Invalid(
+                "policy.osv.local.max_staleness must be greater than zero".to_string(),
+            ));
+        }
+        if self.sync_interval.is_zero() {
+            return Err(ConfigError::Invalid(
+                "policy.osv.local.sync_interval must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalOsvStaleBehavior {
+    #[default]
     Block,
     Allow,
 }
@@ -294,8 +366,26 @@ mod tests {
             MissingPublishTime::Block
         );
         assert!(config.policy.osv.block_malicious);
+        assert_eq!(config.policy.osv.source, OsvSource::Live);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
+        assert_eq!(
+            config.policy.osv.local.sqlite_path,
+            PathBuf::from("osv-malicious.sqlite")
+        );
+        assert_eq!(
+            config.policy.osv.local.max_staleness,
+            Duration::from_secs(24 * 60 * 60)
+        );
+        assert_eq!(
+            config.policy.osv.local.on_stale,
+            LocalOsvStaleBehavior::Block
+        );
+        assert!(!config.policy.osv.local.background_sync);
+        assert_eq!(
+            config.policy.osv.local.sync_interval,
+            Duration::from_secs(6 * 60 * 60)
+        );
         assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
         config.validate().unwrap();
     }
@@ -318,9 +408,103 @@ policy:
         .unwrap();
 
         assert!(!config.policy.osv.block_malicious);
+        assert_eq!(config.policy.osv.source, OsvSource::Live);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
+    }
+
+    #[test]
+    fn local_osv_config_validates() {
+        let config = load(
+            r#"
+policy:
+  osv:
+    source: local
+    local:
+      sqlite_path: "./data/osv-malicious.sqlite"
+      max_staleness: "12h"
+      on_stale: block
+      background_sync: true
+      sync_interval: "30m"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.policy.osv.source, OsvSource::Local);
+        assert_eq!(
+            config.policy.osv.local.sqlite_path,
+            PathBuf::from("./data/osv-malicious.sqlite")
+        );
+        assert_eq!(
+            config.policy.osv.local.max_staleness,
+            Duration::from_secs(12 * 60 * 60)
+        );
+        assert_eq!(
+            config.policy.osv.local.on_stale,
+            LocalOsvStaleBehavior::Block
+        );
+        assert!(config.policy.osv.local.background_sync);
+        assert_eq!(
+            config.policy.osv.local.sync_interval,
+            Duration::from_secs(30 * 60)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_local_osv_config_key() {
+        let err = load(
+            r#"
+policy:
+  osv:
+    local:
+      typo: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rejects_empty_local_osv_sqlite_path() {
+        let err = load(
+            r#"
+policy:
+  osv:
+    local:
+      sqlite_path: ""
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sqlite_path must not be empty"));
+    }
+
+    #[test]
+    fn rejects_zero_local_osv_staleness() {
+        let err = load(
+            r#"
+policy:
+  osv:
+    local:
+      max_staleness: "0s"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("max_staleness must be greater"));
+    }
+
+    #[test]
+    fn rejects_zero_local_osv_sync_interval() {
+        let err = load(
+            r#"
+policy:
+  osv:
+    local:
+      sync_interval: "0s"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sync_interval must be greater"));
     }
 
     #[test]

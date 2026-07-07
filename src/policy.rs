@@ -503,6 +503,7 @@ mod tests {
                     block_malicious: true,
                     api_url: "https://api.osv.dev".to_string(),
                     on_error: OsvErrorBehavior::Block,
+                    ..OsvConfig::default()
                 },
                 ..PolicyConfig::default()
             },

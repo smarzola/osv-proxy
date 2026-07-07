@@ -183,7 +183,7 @@ When a milestone is complete:
    milestone.
 
 - [x] Milestone 0: Baseline and real OSV data shape
-- [ ] Milestone 1: SQLite schema, config, and local checker
+- [x] Milestone 1: SQLite schema, config, and local checker
 - [ ] Milestone 2: npm/PyPI version range evaluation
 - [ ] Milestone 3: Explicit OSV dump sync command
 - [ ] Milestone 4: Request-path local mode integration
@@ -300,6 +300,23 @@ cargo fmt --check
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note 2026-07-08:
+
+- Added explicit `policy.osv.source` config with `live` default and local
+  SQLite settings for path, max staleness, stale behavior, background sync flag,
+  and sync interval.
+- Added idempotent SQLite schema initialization for raw advisories, affected
+  packages, exact versions, ranges/events, and sync state. Connections configure
+  WAL during initialization and a 5s busy timeout for local store access.
+- Added `SqliteMaliciousChecker` for exact-version local hits, stale/missing or
+  unhealthy store errors, range-row explicit errors pending Milestone 2, and
+  order-preserving `check_many`.
+- Commands run: `cargo test config` passed with 27 tests; `cargo test
+  malicious` passed with 21 tests; `cargo fmt --check` passed. The first
+  sandboxed `cargo test config` attempt failed to resolve `index.crates.io`;
+  reran with approved Cargo network access to resolve new dependencies.
+- Commit: pending.
 
 ## Milestone 2: npm/PyPI Version Range Evaluation
 
