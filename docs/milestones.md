@@ -108,8 +108,9 @@ Acceptance tests:
 
 Build:
 
-- `MaliciousPackageStore` trait
-- SQLite implementation storing raw OSV advisories plus normalized affected
+- local SQLite malicious checker behind the existing `MaliciousChecker`
+  boundary
+- SQLite sync engine storing raw OSV advisories plus normalized affected
   packages, exact versions, ranges, range events, and sync state
 - explicit `osv-proxy malicious sync --config <path>` command
 - background OSV `MAL-*` sync in `serve`

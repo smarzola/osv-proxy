@@ -690,8 +690,7 @@ Status note 2026-07-08:
   -- check npm:arpan-package@2.0.5 --config <temp-config>` exited 2 with
   `allowed: false`, reason `malicious`, and source `osv`; no OSV API endpoint
   was configured or required.
-- Commit: pending in this release-readiness commit; final hash reported in the
-  worker response.
+- Commit: `93865cc`.
 
 ## Final Verification
 
