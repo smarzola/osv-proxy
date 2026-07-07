@@ -383,7 +383,7 @@ Status note 2026-07-08:
   passed with 3 matching tests; `cargo fmt --check` passed. The first sandboxed
   test attempt failed to resolve `index.crates.io`; reran with approved Cargo
   network access to resolve new dependencies.
-- Commit: this commit.
+- Commit: fc03649.
 
 ## Milestone 3: Explicit OSV Dump Sync Command
 
