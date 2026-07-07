@@ -14,6 +14,7 @@ policy:
   missing_publish_time: "block"
   osv:
     block_malicious: true
+    source: live
     on_error: "block"
 artifacts:
   behavior: redirect
@@ -82,6 +83,7 @@ policy:
   missing_publish_time: "block"
   osv:
     block_malicious: true
+    source: live
     on_error: "block"
 ```
 
@@ -90,14 +92,69 @@ policy:
 - `missing_publish_time`: `block` or `allow`.
 - `osv.block_malicious`: when true, OSV `MAL-*` records block package versions.
   Defaults to true.
+- `osv.source`: `live` or `local`. Defaults to `live`.
 - `osv.on_error`: `block` fails closed; `allow` fails open when the OSV check
   fails or a required OSV result is missing.
 - `osv.api_url`: optional OSV API base URL override. Omit it to use
-  `https://api.osv.dev`.
+  `https://api.osv.dev`. Used only by live checks.
 
 Only OSV records with IDs starting with `MAL-` block package versions. CVEs,
 GHSAs, and other advisory records are not package-malicious decisions in
 `osv-proxy`.
+
+### Live OSV Mode
+
+Live mode is the default and calls the OSV API while handling install requests:
+
+```yaml
+policy:
+  osv:
+    source: live
+    api_url: "https://api.osv.dev"
+    on_error: block
+```
+
+### Local SQLite OSV Mode
+
+Local mode evaluates synchronized SQLite data and makes no OSV network calls
+during install request handling:
+
+```yaml
+policy:
+  osv:
+    block_malicious: true
+    source: local
+    on_error: block
+    local:
+      sqlite_path: "./osv-malicious.sqlite"
+      max_staleness: "24h"
+      on_stale: block
+      background_sync: false
+      sync_interval: "6h"
+```
+
+- `local.sqlite_path`: SQLite database path for synchronized OSV malicious
+  records. Defaults to `osv-malicious.sqlite`.
+- `local.max_staleness`: maximum age since the last successful sync before the
+  local data is stale. Defaults to `24h`.
+- `local.on_stale`: `block` fails closed when local data is stale; `allow`
+  fails open. Defaults to `block`.
+- `local.background_sync`: when true, `serve` starts a background sync task.
+  The first sync runs immediately on startup, then repeats after
+  `sync_interval`.
+- `local.sync_interval`: background sync interval. It must be between `60s` and
+  `7d`; defaults to `6h`.
+
+Populate or refresh the SQLite database explicitly with:
+
+```sh
+osv-proxy malicious sync --config /path/to/osv-proxy.yaml
+```
+
+The sync command downloads npm and PyPI OSV GCS dumps, stores `MAL-*`
+advisories locally, and updates sync health state. Missing, corrupt,
+unhealthy, or stale local data fails closed by default through `on_error:
+block` and `local.on_stale: block`.
 
 ## Allowlist
 

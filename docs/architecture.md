@@ -64,7 +64,7 @@ osv-proxy
     exact-version allowlist
   malicious
     naive OSV API client
-    local MongoDB-compatible store
+    local SQLite store
     background OSV sync
   metadata_cache
     disabled/no-op
@@ -139,6 +139,14 @@ Use traits for external services:
 - artifact backend
 - audit sink
 
-The policy engine should not know whether malicious data comes from OSV live calls or the local store.
+The policy engine should not know whether malicious data comes from OSV live
+calls or the local store.
 
-The local malicious store should have one MongoDB-compatible implementation using the MongoDB wire protocol. mongolino is not a separate backend inside `osv-proxy`; it is a single-binary MongoDB-compatible server that can satisfy the same `mongodb.uri` config as MongoDB.
+The implemented local malicious store is SQLite. It stores raw OSV advisories,
+normalized affected packages, exact affected versions, range events, and sync
+state. Request handling performs indexed SQLite reads and evaluates exact
+versions and ranges in memory without OSV network calls.
+
+MongoDB-compatible storage may be added later if needed. If it is, mongolino
+should remain MongoDB-compatible infrastructure behind that future store
+interface, not a separate active backend or config shape.

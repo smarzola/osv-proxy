@@ -26,13 +26,15 @@ Implemented now:
 - npm metadata filtering and tarball delivery.
 - PyPI Simple JSON-backed filtering, HTML/JSON responses, and file delivery.
 - YAML config loading and validation.
-- `serve`, `check`, and `config validate` commands.
-- Naive OSV API checks during request handling.
+- `serve`, `check`, `eval`, `config validate`, and `malicious sync`
+  commands.
+- Live OSV API checks during request handling.
+- Local SQLite malicious-package checks with explicit and background OSV dump
+  sync.
 - Redirect artifact behavior and plain artifact proxy behavior.
 
 Not implemented yet:
 
-- Local malicious-package storage and sync.
 - Metadata caching.
 - S3 artifact caching.
 - Authentication, publishing, license policy, vulnerability severity policy, or
@@ -156,6 +158,7 @@ policy:
   missing_publish_time: "block"
   osv:
     block_malicious: true
+    source: live
     on_error: "block"
 artifacts:
   behavior: redirect
@@ -164,6 +167,42 @@ artifacts:
 The npm registry, PyPI Simple API, and OSV API default to their public URLs.
 Set `upstreams` or `policy.osv.api_url` only when using a mirror, fixture, or
 private gateway.
+
+### Malicious Data Source
+
+`policy.osv.source: live` is the default. Live mode calls the OSV API during
+metadata filtering, artifact serving, `check`, and `eval`.
+
+`policy.osv.source: local` reads synchronized malicious-package data from
+SQLite instead. In local mode, install request handling performs indexed SQLite
+reads plus in-memory exact-version and range evaluation; it does not call OSV.
+Populate or refresh the local database with:
+
+```sh
+osv-proxy malicious sync --config /path/to/osv-proxy.yaml
+```
+
+Local mode configuration:
+
+```yaml
+policy:
+  osv:
+    block_malicious: true
+    source: local
+    on_error: block
+    local:
+      sqlite_path: "./osv-malicious.sqlite"
+      max_staleness: "24h"
+      on_stale: block
+      background_sync: true
+      sync_interval: "6h"
+```
+
+`on_error: block` and `on_stale: block` fail closed by default. Missing,
+corrupt, unhealthy, or stale local data blocks malicious checks instead of
+silently allowing installs. `background_sync: true` makes `serve` run one sync
+immediately on startup and then repeat after `sync_interval`; failed background
+syncs record health state and keep serving against the last usable snapshot.
 
 ## Policy Behavior
 

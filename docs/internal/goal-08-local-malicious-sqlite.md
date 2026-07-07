@@ -188,7 +188,7 @@ When a milestone is complete:
 - [x] Milestone 3: Explicit OSV dump sync command
 - [x] Milestone 4: Request-path local mode integration
 - [x] Milestone 5: Background sync in serve
-- [ ] Milestone 6: Docs, final regression, and release readiness
+- [x] Milestone 6: Docs, final regression, and release readiness
 
 ## Milestone 0: Baseline and Real OSV Data Shape
 
@@ -661,6 +661,37 @@ cargo run -- config validate --config examples/basic/osv-proxy.yaml
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note 2026-07-08:
+
+- Updated README and docs for live vs local malicious mode, explicit
+  `osv-proxy malicious sync --config <path>`, background sync, staleness and
+  fail-closed behavior, and no OSV network calls during local install request
+  handling.
+- Updated `docs/malicious-data.md` for SQLite raw advisory storage, normalized
+  affected package/exact/range/sync-state tables, exact/range evaluation,
+  WAL/busy-timeout behavior, explicit sync, and background sync.
+- Updated mongolino, architecture, product-spec, and milestone docs so SQLite
+  is the active local malicious store and MongoDB-compatible/mongolino storage
+  remains future if still desired.
+- Updated `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md` for release version
+  `0.3.0` dated 2026-07-08. Kept `examples/basic/osv-proxy.yaml` unchanged and
+  valid.
+- Commands run: `cargo fmt --check` passed; `cargo run -- config validate
+  --config examples/basic/osv-proxy.yaml` passed; `cargo test` in sandbox
+  failed only on local listener setup with `Operation not permitted` after 130
+  passed and 12 failed, then the same `cargo test` outside sandbox passed with
+  142 unit tests, 2 package-manager e2e tests, and doctests; `cargo clippy
+  --all-targets --all-features -- -D warnings` passed.
+- Functional local-mode smoke: a temporary SQLite malicious DB was populated
+  from fixture advisory data, a temporary local npm registry served clean and
+  malicious versions, `cargo run --quiet -- check npm:arpan-package@1.0.0
+  --config <temp-config>` exited 0 with `allowed: true`, and `cargo run --quiet
+  -- check npm:arpan-package@2.0.5 --config <temp-config>` exited 2 with
+  `allowed: false`, reason `malicious`, and source `osv`; no OSV API endpoint
+  was configured or required.
+- Commit: pending in this release-readiness commit; final hash reported in the
+  worker response.
 
 ## Final Verification
 

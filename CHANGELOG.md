@@ -3,6 +3,24 @@
 All notable changes to `osv-proxy` are tracked here. Release sections are the
 source for GitHub release notes.
 
+## [0.3.0] - 2026-07-08
+
+### Added
+
+- Added local SQLite malicious-package mode with `policy.osv.source: local`.
+- Added `osv-proxy malicious sync --config <path>` to bootstrap and
+  incrementally update npm and PyPI `MAL-*` records from OSV GCS dumps.
+- Added server-managed background malicious-data sync for local mode.
+- Added local evaluation for OSV exact affected versions and npm/PyPI range
+  events without OSV network calls during install request handling.
+
+### Changed
+
+- Documented local SQLite malicious storage, sync operations, staleness
+  behavior, and fail-closed defaults.
+- Clarified that MongoDB-compatible and mongolino storage remain possible
+  future backends rather than the active local store.
+
 ## [0.2.1] - 2026-07-06
 
 ### Changed

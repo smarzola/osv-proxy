@@ -49,7 +49,7 @@ Recommended stack:
 - `tracing` for structured logs
 - `tower` for middleware
 - `chrono` for time handling
-- `mongodb` for MongoDB-compatible storage
+- `rusqlite` for local malicious storage
 - `object_store` or `aws-sdk-s3` for S3-compatible artifact cache
 - `semver` for npm version helpers
 - `pep440_rs` for PyPI version helpers, if useful
@@ -79,7 +79,7 @@ Developer mode can be more permissive, but must be explicit.
 - Cached artifacts never bypass current policy.
 - Allowlist bypasses are exact-version only.
 - Malicious bypass requires explicit config and a reason.
-- Naive OSV mode may call OSV during request handling.
+- Live OSV mode may call OSV during request handling.
 - Local malicious mode must not call OSV during install-request handling.
 - Metadata cache is either disabled or cachebox-backed.
 - There is no memory metadata cache.
@@ -97,9 +97,9 @@ It provides:
 - manual blocklist
 - metadata filtering
 - artifact redirect, proxy, and S3-cache modes
-- naive OSV API mode
-- local MongoDB-compatible malicious store mode
-- mongolino integration examples for single-file local deployments
+- live OSV API mode
+- local SQLite malicious store mode
+- possible future MongoDB-compatible malicious storage
 - cachebox support for metadata caching
 - YAML configuration
 - structured audit logs
