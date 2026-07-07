@@ -2,11 +2,15 @@ use crate::artifact::Artifact;
 use crate::config::{LocalOsvConfig, LocalOsvStaleBehavior};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use node_semver as npm_semver;
+use pep440_rs as pep440;
 use reqwest::Client;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -46,8 +50,8 @@ pub enum MaliciousError {
     InvalidBatchResponse { expected: usize, actual: usize },
     #[error("local malicious store failed: {0}")]
     LocalStore(String),
-    #[error("local malicious store has range records that are not evaluated yet for {0}")]
-    UnsupportedRange(String),
+    #[error("local malicious store could not evaluate range for {package}: {message}")]
+    RangeEvaluation { package: String, message: String },
 }
 
 #[derive(Debug, Clone)]
@@ -183,11 +187,7 @@ impl SqliteMaliciousChecker {
         if !hits.is_empty() {
             return Ok(hits);
         }
-        let range_count = range_count(connection, artifact)?;
-        if range_count > 0 {
-            return Err(MaliciousError::UnsupportedRange(artifact.identity()));
-        }
-        Ok(Vec::new())
+        range_hits(connection, artifact)
     }
 
     fn check_many_with_connection(
@@ -215,29 +215,31 @@ impl SqliteMaliciousChecker {
                 .push(index);
         }
 
-        let mut range_counts = BTreeMap::<(String, String), u32>::new();
+        let mut range_results = BTreeMap::<(String, String, String), Vec<MaliciousHit>>::new();
         let mut results = vec![Vec::new(); artifacts.len()];
         for (_, indexes) in grouped {
             let artifact = &artifacts[indexes[0]];
             let hits = exact_hits(connection, artifact)?;
             if hits.is_empty() {
-                let package_key = (
+                let range_key = (
                     artifact.ecosystem.osv_name().to_string(),
                     artifact.name.clone(),
+                    artifact.version.clone(),
                 );
-                let range_count = if let Some(count) = range_counts.get(&package_key) {
-                    *count
+                let hits = if let Some(hits) = range_results.get(&range_key) {
+                    hits.clone()
                 } else {
-                    let count = range_count(connection, artifact)?;
-                    range_counts.insert(package_key, count);
-                    count
+                    let hits = range_hits(connection, artifact)?;
+                    range_results.insert(range_key, hits.clone());
+                    hits
                 };
-                if range_count > 0 {
-                    return Err(MaliciousError::UnsupportedRange(artifact.identity()));
+                for index in indexes {
+                    results[index] = hits.clone();
                 }
-            }
-            for index in indexes {
-                results[index] = hits.clone();
+            } else {
+                for index in indexes {
+                    results[index] = hits.clone();
+                }
             }
         }
         Ok(results)
@@ -462,22 +464,223 @@ ORDER BY a.osv_id
     rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
 }
 
-fn range_count(connection: &Connection, artifact: &Artifact) -> Result<u32, MaliciousError> {
-    connection
-        .query_row(
+#[derive(Debug, Clone)]
+struct StoredRange {
+    advisory: MaliciousHit,
+    range_type: String,
+    events: Vec<RangeEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct RangeEvent {
+    event_type: String,
+    version: String,
+}
+
+fn range_hits(
+    connection: &Connection,
+    artifact: &Artifact,
+) -> Result<Vec<MaliciousHit>, MaliciousError> {
+    let ranges = stored_ranges(connection, artifact)?;
+    let mut hits = Vec::new();
+    for range in ranges {
+        if range_matches_artifact(&range, artifact)? {
+            hits.push(range.advisory);
+        }
+    }
+    hits.sort_by(|left, right| left.osv_id.cmp(&right.osv_id));
+    Ok(hits)
+}
+
+fn stored_ranges(
+    connection: &Connection,
+    artifact: &Artifact,
+) -> Result<Vec<StoredRange>, MaliciousError> {
+    let mut statement = connection
+        .prepare(
             r#"
-SELECT COUNT(*)
+SELECT ar.id, a.osv_id, a.summary, a.source, a.modified, ar.range_type
 FROM affected_packages ap
 JOIN affected_ranges ar ON ar.affected_package_id = ap.id
 JOIN advisories a ON a.osv_id = ap.osv_id
 WHERE ap.ecosystem = ?1
   AND ap.name = ?2
   AND a.withdrawn IS NULL
+ORDER BY a.osv_id, ar.id
 "#,
-            params![artifact.ecosystem.osv_name(), artifact.name],
-            |row| row.get(0),
         )
-        .map_err(sqlite_error)
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(
+            params![artifact.ecosystem.osv_name(), artifact.name],
+            |row| {
+                let modified = row
+                    .get::<_, Option<String>>(4)?
+                    .map(|value| parse_timestamp(&value))
+                    .transpose()
+                    .map_err(|err| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(err),
+                        )
+                    })?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    MaliciousHit {
+                        osv_id: row.get(1)?,
+                        summary: row.get(2)?,
+                        source: row.get(3)?,
+                        modified,
+                    },
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .map_err(sqlite_error)?;
+
+    let mut ranges = Vec::new();
+    for row in rows {
+        let (range_id, advisory, range_type) = row.map_err(sqlite_error)?;
+        ranges.push(StoredRange {
+            advisory,
+            range_type,
+            events: range_events(connection, range_id)?,
+        });
+    }
+    Ok(ranges)
+}
+
+fn range_events(connection: &Connection, range_id: i64) -> Result<Vec<RangeEvent>, MaliciousError> {
+    let mut statement = connection
+        .prepare(
+            r#"
+SELECT event_type, version
+FROM affected_range_events
+WHERE range_id = ?1
+ORDER BY event_order
+"#,
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map([range_id], |row| {
+            Ok(RangeEvent {
+                event_type: row.get(0)?,
+                version: row.get(1)?,
+            })
+        })
+        .map_err(sqlite_error)?;
+
+    rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
+}
+
+fn range_matches_artifact(
+    range: &StoredRange,
+    artifact: &Artifact,
+) -> Result<bool, MaliciousError> {
+    match (artifact.ecosystem.osv_name(), range.range_type.as_str()) {
+        ("npm", "SEMVER") => {
+            let version = npm_semver::Version::parse(&artifact.version).map_err(|err| {
+                range_error(
+                    artifact,
+                    format!("invalid npm version {}: {err}", artifact.version),
+                )
+            })?;
+            evaluate_range_events(range, artifact, |boundary| {
+                compare_npm_version(&version, boundary, artifact)
+            })
+        }
+        ("PyPI", "ECOSYSTEM") => {
+            let version = pep440::Version::from_str(&artifact.version).map_err(|err| {
+                range_error(
+                    artifact,
+                    format!("invalid PyPI version {}: {err}", artifact.version),
+                )
+            })?;
+            evaluate_range_events(range, artifact, |boundary| {
+                compare_pypi_version(&version, boundary, artifact)
+            })
+        }
+        (_, range_type) => Err(range_error(
+            artifact,
+            format!(
+                "unsupported range type {range_type} for ecosystem {}",
+                artifact.ecosystem.osv_name()
+            ),
+        )),
+    }
+}
+
+fn evaluate_range_events<F>(
+    range: &StoredRange,
+    artifact: &Artifact,
+    mut compare_boundary: F,
+) -> Result<bool, MaliciousError>
+where
+    F: FnMut(&str) -> Result<Ordering, MaliciousError>,
+{
+    let mut affected = false;
+    for event in &range.events {
+        match event.event_type.as_str() {
+            "introduced" => {
+                if event.version == "0" || compare_boundary(&event.version)? != Ordering::Less {
+                    affected = true;
+                }
+            }
+            "fixed" | "limit" => {
+                if affected && compare_boundary(&event.version)? != Ordering::Less {
+                    affected = false;
+                }
+            }
+            "last_affected" => {
+                if affected {
+                    affected = compare_boundary(&event.version)? != Ordering::Greater;
+                }
+            }
+            other => {
+                return Err(range_error(
+                    artifact,
+                    format!("unsupported range event type {other}"),
+                ));
+            }
+        }
+    }
+    Ok(affected)
+}
+
+fn compare_npm_version(
+    version: &npm_semver::Version,
+    boundary: &str,
+    artifact: &Artifact,
+) -> Result<Ordering, MaliciousError> {
+    let boundary = npm_semver::Version::parse(boundary).map_err(|err| {
+        range_error(
+            artifact,
+            format!("invalid npm range boundary {boundary}: {err}"),
+        )
+    })?;
+    Ok(version.cmp(&boundary))
+}
+
+fn compare_pypi_version(
+    version: &pep440::Version,
+    boundary: &str,
+    artifact: &Artifact,
+) -> Result<Ordering, MaliciousError> {
+    let boundary = pep440::Version::from_str(boundary).map_err(|err| {
+        range_error(
+            artifact,
+            format!("invalid PyPI range boundary {boundary}: {err}"),
+        )
+    })?;
+    Ok(version.cmp(&boundary))
+}
+
+fn range_error(artifact: &Artifact, message: String) -> MaliciousError {
+    MaliciousError::RangeEvaluation {
+        package: artifact.identity(),
+        message,
+    }
 }
 
 fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, MaliciousError> {
@@ -720,18 +923,216 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_checker_returns_explicit_error_for_relevant_range_rows() {
+    async fn sqlite_checker_matches_npm_introduced_zero_range() {
         let dir = tempdir().unwrap();
         let db = initialized_db(dir.path());
         let connection = Connection::open(&db).unwrap();
         insert_healthy_sync_state(&connection, "npm");
-        insert_range_advisory(&connection, "MAL-2026-000001", "npm", "demo");
+        insert_range_advisory_with_events(
+            &connection,
+            "MAL-2026-000001",
+            "npm",
+            "demo",
+            "SEMVER",
+            &[("introduced", "0")],
+        );
+        let checker = checker_for(&db);
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None);
+
+        let hits = checker.check(&artifact).await.unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].osv_id, "MAL-2026-000001");
+    }
+
+    #[tokio::test]
+    async fn sqlite_checker_handles_npm_fixed_boundaries() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_range_advisory_with_events(
+            &connection,
+            "MAL-2026-000001",
+            "npm",
+            "demo",
+            "SEMVER",
+            &[("introduced", "1.0.0"), ("fixed", "2.0.0")],
+        );
+        let checker = checker_for(&db);
+
+        assert!(
+            checker
+                .check(&Artifact::package(Ecosystem::Npm, "demo", "0.9.9", None))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            checker
+                .check(&Artifact::package(Ecosystem::Npm, "demo", "1.5.0", None))
+                .await
+                .unwrap()[0]
+                .osv_id,
+            "MAL-2026-000001"
+        );
+        assert!(
+            checker
+                .check(&Artifact::package(Ecosystem::Npm, "demo", "2.0.0", None))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_checker_handles_fixed_reopening_intervals() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_range_advisory_with_events(
+            &connection,
+            "MAL-2026-000001",
+            "npm",
+            "demo",
+            "SEMVER",
+            &[
+                ("introduced", "1.0.0"),
+                ("fixed", "2.0.0"),
+                ("introduced", "3.0.0"),
+                ("fixed", "4.0.0"),
+            ],
+        );
+        let checker = checker_for(&db);
+
+        assert!(
+            checker
+                .check(&Artifact::package(Ecosystem::Npm, "demo", "2.5.0", None))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            checker
+                .check(&Artifact::package(Ecosystem::Npm, "demo", "3.5.0", None))
+                .await
+                .unwrap()[0]
+                .osv_id,
+            "MAL-2026-000001"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_checker_handles_pypi_last_affected() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "PyPI");
+        insert_range_advisory_with_events(
+            &connection,
+            "MAL-2026-000001",
+            "PyPI",
+            "demo",
+            "ECOSYSTEM",
+            &[("introduced", "1.0"), ("last_affected", "1.5")],
+        );
+        let checker = checker_for(&db);
+
+        assert_eq!(
+            checker
+                .check(&Artifact::package(Ecosystem::Pypi, "demo", "1.5", None))
+                .await
+                .unwrap()[0]
+                .osv_id,
+            "MAL-2026-000001"
+        );
+        assert!(
+            checker
+                .check(&Artifact::package(Ecosystem::Pypi, "demo", "1.5.1", None))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_checker_handles_pypi_limit() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "PyPI");
+        insert_range_advisory_with_events(
+            &connection,
+            "MAL-2026-000001",
+            "PyPI",
+            "demo",
+            "ECOSYSTEM",
+            &[("introduced", "1.0"), ("limit", "2.0")],
+        );
+        let checker = checker_for(&db);
+
+        assert_eq!(
+            checker
+                .check(&Artifact::package(Ecosystem::Pypi, "demo", "1.9", None))
+                .await
+                .unwrap()[0]
+                .osv_id,
+            "MAL-2026-000001"
+        );
+        assert!(
+            checker
+                .check(&Artifact::package(Ecosystem::Pypi, "demo", "2.0", None))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_checker_errors_for_unsupported_range_type() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_range_advisory_with_events(
+            &connection,
+            "MAL-2026-000001",
+            "npm",
+            "demo",
+            "GIT",
+            &[("introduced", "1.0.0")],
+        );
         let checker = checker_for(&db);
         let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None);
 
         let err = checker.check(&artifact).await.unwrap_err();
 
-        assert!(matches!(err, MaliciousError::UnsupportedRange(_)));
+        assert!(matches!(err, MaliciousError::RangeEvaluation { .. }));
+        assert!(err.to_string().contains("unsupported range type GIT"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_checker_errors_for_unevaluable_version() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_range_advisory_with_events(
+            &connection,
+            "MAL-2026-000001",
+            "npm",
+            "demo",
+            "SEMVER",
+            &[("introduced", "1.0.0")],
+        );
+        let checker = checker_for(&db);
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "not-a-version", None);
+
+        let err = checker.check(&artifact).await.unwrap_err();
+
+        assert!(matches!(err, MaliciousError::RangeEvaluation { .. }));
+        assert!(err.to_string().contains("invalid npm version"));
     }
 
     fn initialized_db(dir: &Path) -> std::path::PathBuf {
@@ -809,7 +1210,14 @@ INSERT OR REPLACE INTO sync_state (
             .unwrap();
     }
 
-    fn insert_range_advisory(connection: &Connection, osv_id: &str, ecosystem: &str, name: &str) {
+    fn insert_range_advisory_with_events(
+        connection: &Connection,
+        osv_id: &str,
+        ecosystem: &str,
+        name: &str,
+        range_type: &str,
+        events: &[(&str, &str)],
+    ) {
         insert_advisory(connection, osv_id, Some("Range package"));
         connection
             .execute(
@@ -820,17 +1228,19 @@ INSERT OR REPLACE INTO sync_state (
         let package_id = connection.last_insert_rowid();
         connection
             .execute(
-                "INSERT INTO affected_ranges (affected_package_id, range_type) VALUES (?1, 'SEMVER')",
-                [package_id],
+                "INSERT INTO affected_ranges (affected_package_id, range_type) VALUES (?1, ?2)",
+                params![package_id, range_type],
             )
             .unwrap();
         let range_id = connection.last_insert_rowid();
-        connection
-            .execute(
-                "INSERT INTO affected_range_events (range_id, event_order, event_type, version) VALUES (?1, 0, 'introduced', '0')",
-                [range_id],
-            )
-            .unwrap();
+        for (index, (event_type, version)) in events.iter().enumerate() {
+            connection
+                .execute(
+                    "INSERT INTO affected_range_events (range_id, event_order, event_type, version) VALUES (?1, ?2, ?3, ?4)",
+                    params![range_id, index as i64, event_type, version],
+                )
+                .unwrap();
+        }
     }
 
     fn insert_advisory(connection: &Connection, osv_id: &str, summary: Option<&str>) {

@@ -184,7 +184,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Baseline and real OSV data shape
 - [x] Milestone 1: SQLite schema, config, and local checker
-- [ ] Milestone 2: npm/PyPI version range evaluation
+- [x] Milestone 2: npm/PyPI version range evaluation
 - [ ] Milestone 3: Explicit OSV dump sync command
 - [ ] Milestone 4: Request-path local mode integration
 - [ ] Milestone 5: Background sync in serve
@@ -367,6 +367,23 @@ cargo fmt --check
 Commit requirement:
 
 - Commit after marking this milestone done and adding the status note.
+
+Status note 2026-07-08:
+
+- Added read-time OSV range evaluation for local SQLite checks without
+  pre-expanding ranges into registry versions.
+- npm `SEMVER` ranges use `node-semver`; PyPI `ECOSYSTEM` ranges use
+  `pep440_rs`.
+- Implemented `introduced`, `fixed`, `last_affected`, and `limit` event
+  handling. Unsupported range types and unevaluable target/boundary versions
+  return checker errors instead of silently allowing.
+- Exact affected versions still match first by string equality, preserving the
+  existing exact-version path.
+- Commands run: `cargo test malicious` passed with 28 tests; `cargo test range`
+  passed with 3 matching tests; `cargo fmt --check` passed. The first sandboxed
+  test attempt failed to resolve `index.crates.io`; reran with approved Cargo
+  network access to resolve new dependencies.
+- Commit: this commit.
 
 ## Milestone 3: Explicit OSV Dump Sync Command
 
