@@ -539,7 +539,7 @@ Status note 2026-07-08:
   31 tests; `cargo test malicious` first failed in the sandbox on loopback
   listener permission from server coverage, then passed outside the sandbox with
   36 tests; `cargo fmt --check` passed.
-- Commit: pending.
+- Commit: `da4eeb7`.
 
 ## Milestone 5: Background Sync In Serve
 
