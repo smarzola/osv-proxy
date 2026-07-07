@@ -247,7 +247,7 @@ Status note 2026-07-07:
   --check` passed; `cargo clippy --all-targets --all-features -- -D warnings`
   passed; OSV sampling used `curl -fsSL` for the listed GCS artifacts,
   `unzip -Z1`, `unzip -p`, and a read-only `python3` zip/JSON scan.
-- Commit: pending.
+- Commit: `a2f3cdf`.
 
 ## Milestone 1: SQLite Schema, Config, and Local Checker
 
