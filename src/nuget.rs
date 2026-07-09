@@ -354,6 +354,8 @@ async fn filter_registration(
                 .ok_or_else(|| {
                     NugetError::InvalidMetadata("registration leaf has no version".into())
                 })?;
+            let version = normalize_nuget_version(version)
+                .map_err(|err| NugetError::InvalidMetadata(err.to_string()))?;
             artifacts.push((
                 page_index,
                 leaf_index,
