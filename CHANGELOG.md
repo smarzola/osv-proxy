@@ -3,6 +3,21 @@
 All notable changes to `osv-proxy` are tracked here. Release sections are the
 source for GitHub release notes.
 
+## [0.4.0] - 2026-07-09
+
+### Added
+
+- Added Cargo and crates.io sparse-index support with policy-filtered version
+  discovery and protected crate downloads.
+- Added Go module proxy support for version discovery, metadata, module files,
+  and zip downloads without requiring Git.
+- Added restore-scoped NuGet V3 support for service discovery, registrations,
+  flat-container metadata, packages, and nuspecs.
+- Added live and local OSV evaluation for crates.io, Go, and NuGet, including
+  ecosystem-specific version range handling.
+- Added hermetic real-client coverage for Cargo, Go, and .NET restore in both
+  redirect and streaming proxy modes, including fresh and locked denials.
+
 ## [0.3.1] - 2026-07-08
 
 ### Changed
