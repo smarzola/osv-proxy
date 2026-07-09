@@ -193,6 +193,27 @@ fn start_proxy(upstream_base_url: String) -> TestServer {
     })
 }
 
+/// Starts the real Axum listener used by client compatibility tests. Unlike the
+/// synchronous route helper above this exercises the production HTTP path.
+fn start_axum_proxy(mut config: Config) -> TestServer {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    config.server.bind = listener.local_addr().unwrap().to_string();
+    config.server.public_base_url = base_url.clone();
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, server::router(config)).await.unwrap();
+        });
+    });
+    TestServer { base_url }
+}
+
 fn fixture_response(
     fixture: &FixtureArtifacts,
     base_url: &str,
