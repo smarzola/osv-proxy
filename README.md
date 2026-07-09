@@ -1,6 +1,6 @@
 # osv-proxy
 
-`osv-proxy` is a package-registry security proxy for npm, PyPI, and Go modules that combines
+`osv-proxy` is a package-registry security proxy for npm, PyPI, Cargo/crates.io, and Go modules that combines
 the [OSV vulnerability database](https://osv.dev/) with local policy.
 
 It sits between package managers and public registries, filters package metadata

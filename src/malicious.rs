@@ -7,6 +7,7 @@ use node_semver as npm_semver;
 use pep440_rs as pep440;
 use reqwest::Client;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use semver::Version as cargo_semver;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -347,7 +348,12 @@ pub async fn sync_malicious(
     SqliteMaliciousChecker::initialize(&config.sqlite_path)?;
     let mut connection = open_read_write_connection(&config.sqlite_path)?;
     let mut ecosystems = Vec::new();
-    for ecosystem in [Ecosystem::Npm, Ecosystem::Pypi, Ecosystem::Go] {
+    for ecosystem in [
+        Ecosystem::Npm,
+        Ecosystem::Pypi,
+        Ecosystem::Go,
+        Ecosystem::CratesIo,
+    ] {
         ecosystems.push(
             sync_ecosystem(
                 &mut connection,
@@ -1205,6 +1211,17 @@ fn range_matches_artifact(
                     .map_err(|err| range_error(artifact, err.to_string()))
             })
         }
+        ("crates.io", "SEMVER" | "ECOSYSTEM") => {
+            let version = cargo_semver::parse(&artifact.version).map_err(|err| {
+                range_error(
+                    artifact,
+                    format!("invalid Cargo version {}: {err}", artifact.version),
+                )
+            })?;
+            evaluate_range_events(range, artifact, |boundary| {
+                compare_cargo_version(&version, boundary, artifact)
+            })
+        }
         (_, range_type) => Err(range_error(
             artifact,
             format!(
@@ -1283,6 +1300,20 @@ fn compare_pypi_version(
         range_error(
             artifact,
             format!("invalid PyPI range boundary {boundary}: {err}"),
+        )
+    })?;
+    Ok(version.cmp(&boundary))
+}
+
+fn compare_cargo_version(
+    version: &cargo_semver,
+    boundary: &str,
+    artifact: &Artifact,
+) -> Result<Ordering, MaliciousError> {
+    let boundary = cargo_semver::parse(boundary).map_err(|err| {
+        range_error(
+            artifact,
+            format!("invalid Cargo range boundary {boundary}: {err}"),
         )
     })?;
     Ok(version.cmp(&boundary))
@@ -1862,6 +1893,7 @@ INSERT INTO advisories (
                 all_zip_url(Ecosystem::Pypi),
                 zip_bytes([("MAL-2023-10.json", pypi_exact.as_slice())]),
             ),
+            (all_zip_url(Ecosystem::CratesIo), zip_bytes([])),
         ]);
 
         let report = sync_malicious(&config, &client).await.unwrap();
@@ -1920,6 +1952,7 @@ INSERT INTO advisories (
                 zip_bytes([("MAL-2022-1122.json", npm_exact_and_range.as_slice())]),
             ),
             (all_zip_url(Ecosystem::Pypi), zip_bytes([])),
+            (all_zip_url(Ecosystem::CratesIo), zip_bytes([])),
         ]);
 
         sync_malicious(&config, &client).await.unwrap();
@@ -1962,11 +1995,13 @@ INSERT INTO advisories (
                 zip_bytes([("MAL-2026-000001.json", first.as_slice())]),
             ),
             (all_zip_url(Ecosystem::Pypi), zip_bytes([])),
+            (all_zip_url(Ecosystem::CratesIo), zip_bytes([])),
             (
                 modified_id_csv_url(Ecosystem::Npm),
                 b"2099-01-01T00:00:00Z,MAL-2026-000001\n".to_vec(),
             ),
             (modified_id_csv_url(Ecosystem::Pypi), Vec::new()),
+            (modified_id_csv_url(Ecosystem::CratesIo), Vec::new()),
             (advisory_json_url(Ecosystem::Npm, "MAL-2026-000001"), second),
         ]);
         sync_malicious(&config, &client).await.unwrap();
@@ -2019,11 +2054,13 @@ INSERT INTO advisories (
                 zip_bytes([("MAL-2026-000001.json", active.as_slice())]),
             ),
             (all_zip_url(Ecosystem::Pypi), zip_bytes([])),
+            (all_zip_url(Ecosystem::CratesIo), zip_bytes([])),
             (
                 modified_id_csv_url(Ecosystem::Npm),
                 b"2099-01-01T00:00:00Z,MAL-2026-000001\n".to_vec(),
             ),
             (modified_id_csv_url(Ecosystem::Pypi), Vec::new()),
+            (modified_id_csv_url(Ecosystem::CratesIo), Vec::new()),
             (
                 advisory_json_url(Ecosystem::Npm, "MAL-2026-000001"),
                 withdrawn,
@@ -2060,11 +2097,13 @@ INSERT INTO advisories (
                 zip_bytes([("MAL-2026-000001.json", active.as_slice())]),
             ),
             (all_zip_url(Ecosystem::Pypi), zip_bytes([])),
+            (all_zip_url(Ecosystem::CratesIo), zip_bytes([])),
             (
                 modified_id_csv_url(Ecosystem::Npm),
                 b"2099-01-01T00:00:00Z,MAL-2026-999999\n".to_vec(),
             ),
             (modified_id_csv_url(Ecosystem::Pypi), Vec::new()),
+            (modified_id_csv_url(Ecosystem::CratesIo), Vec::new()),
         ]);
         sync_malicious(&config, &client).await.unwrap();
 

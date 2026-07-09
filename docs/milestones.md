@@ -1,5 +1,8 @@
 # Milestones
 
+Cargo/crates.io sparse replacement filters index records, rechecks policy at
+artifact delivery, and supports redirect or proxy artifact behavior.
+
 ## First End-to-End Target
 
 1. Rust binary

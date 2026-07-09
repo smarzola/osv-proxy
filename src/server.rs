@@ -1,4 +1,5 @@
 use crate::artifacts::{ArtifactDeliveryClient, ArtifactDeliveryOptions};
+use crate::cargo::{self, CargoRegistryClient};
 use crate::config::{Config, LocalOsvConfig, OsvSource};
 use crate::go::{self, GoProxyClient};
 use crate::malicious::{
@@ -233,58 +234,86 @@ async fn route_request_with_dependencies(
         return simple_response(405, "method not allowed");
     }
 
-    match parse_npm_route(path) {
-        Some(NpmRoute::Metadata { package }) => npm::metadata_response(
-            config,
-            dependencies.npm_upstream,
-            dependencies.checker,
-            &package,
-            now,
-        )
-        .await
-        .unwrap_or_else(|err| npm::error_response(&err)),
-        Some(NpmRoute::Artifact { package, tarball }) => npm::artifact_response(
-            config,
-            dependencies.npm_upstream,
-            dependencies.checker,
-            &package,
-            &tarball,
-            now,
-        )
-        .await
-        .unwrap_or_else(|err| npm::error_response(&err)),
-        None => match parse_pypi_route(path) {
-            Some(PypiRoute::SimpleRoot) => {
-                pypi::simple_root_response(config, dependencies.pypi_upstream)
+    let cargo_upstream = CargoRegistryClient::new(config);
+    match parse_cargo_route(path) {
+        Some(CargoRoute::Config) => cargo::config_response(config),
+        Some(CargoRoute::Index { name }) => {
+            cargo::index_response(config, &cargo_upstream, dependencies.checker, &name, now)
+                .await
+                .unwrap_or_else(|err| cargo::error_response(&err))
+        }
+        Some(CargoRoute::Artifact { name, version }) => {
+            let delivery = ArtifactDeliveryClient::new();
+            match cargo::artifact_delivery_response(
+                config,
+                &cargo_upstream,
+                dependencies.checker,
+                &name,
+                &version,
+                now,
+                ArtifactDeliveryOptions::new(&delivery),
+            )
+            .await
+            {
+                Ok(response) => response.into_registry_response().await,
+                Err(err) => cargo::error_response(&err),
+            }
+        }
+        None => match parse_npm_route(path) {
+            Some(NpmRoute::Metadata { package }) => npm::metadata_response(
+                config,
+                dependencies.npm_upstream,
+                dependencies.checker,
+                &package,
+                now,
+            )
+            .await
+            .unwrap_or_else(|err| npm::error_response(&err)),
+            Some(NpmRoute::Artifact { package, tarball }) => npm::artifact_response(
+                config,
+                dependencies.npm_upstream,
+                dependencies.checker,
+                &package,
+                &tarball,
+                now,
+            )
+            .await
+            .unwrap_or_else(|err| npm::error_response(&err)),
+            None => match parse_pypi_route(path) {
+                Some(PypiRoute::SimpleRoot) => {
+                    pypi::simple_root_response(config, dependencies.pypi_upstream)
+                        .await
+                        .unwrap_or_else(|err| pypi::error_response(&err))
+                }
+                Some(PypiRoute::SimpleProject { project }) => {
+                    pypi::simple_project_response_for_accept(
+                        config,
+                        dependencies.pypi_upstream,
+                        dependencies.checker,
+                        &project,
+                        now,
+                        dependencies.accept,
+                    )
                     .await
                     .unwrap_or_else(|err| pypi::error_response(&err))
-            }
-            Some(PypiRoute::SimpleProject { project }) => pypi::simple_project_response_for_accept(
-                config,
-                dependencies.pypi_upstream,
-                dependencies.checker,
-                &project,
-                now,
-                dependencies.accept,
-            )
-            .await
-            .unwrap_or_else(|err| pypi::error_response(&err)),
-            Some(PypiRoute::Artifact {
-                project,
-                version,
-                filename,
-            }) => pypi::artifact_response(
-                config,
-                dependencies.pypi_upstream,
-                dependencies.checker,
-                &project,
-                &version,
-                &filename,
-                now,
-            )
-            .await
-            .unwrap_or_else(|err| pypi::error_response(&err)),
-            None => simple_response(404, "not found"),
+                }
+                Some(PypiRoute::Artifact {
+                    project,
+                    version,
+                    filename,
+                }) => pypi::artifact_response(
+                    config,
+                    dependencies.pypi_upstream,
+                    dependencies.checker,
+                    &project,
+                    &version,
+                    &filename,
+                    now,
+                )
+                .await
+                .unwrap_or_else(|err| pypi::error_response(&err)),
+                None => simple_response(404, "not found"),
+            },
         },
     }
 }
@@ -313,6 +342,7 @@ async fn route_http_request_with_accept_and_headers(
     let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
     let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
     let go_upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
+    let cargo_upstream = CargoRegistryClient::new(config);
     let delivery = ArtifactDeliveryClient::new();
     let now = Utc::now();
 
@@ -333,63 +363,89 @@ async fn route_http_request_with_accept_and_headers(
         .into_http_response();
     }
 
-    match parse_npm_route(path) {
-        Some(NpmRoute::Metadata { package }) => {
-            npm::metadata_response(config, &npm_upstream, checker, &package, now)
+    match parse_cargo_route(path) {
+        Some(CargoRoute::Config) => cargo::config_response(config).into_http_response(),
+        Some(CargoRoute::Index { name }) => cargo::apply_if_none_match(
+            cargo::index_response(config, &cargo_upstream, checker, &name, now)
                 .await
-                .unwrap_or_else(|err| npm::error_response(&err))
-                .into_http_response()
-        }
-        Some(NpmRoute::Artifact { package, tarball }) => npm::artifact_delivery_response(
+                .unwrap_or_else(|err| cargo::error_response(&err)),
+            headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok()),
+        )
+        .into_http_response(),
+        Some(CargoRoute::Artifact { name, version }) => cargo::artifact_delivery_response(
             config,
-            &npm_upstream,
+            &cargo_upstream,
             checker,
-            npm::NpmArtifactRoute {
-                package: &package,
-                tarball: &tarball,
-            },
+            &name,
+            &version,
             now,
             ArtifactDeliveryOptions::with_request_headers(&delivery, headers),
         )
         .await
         .map(|response| response.into_http_response())
-        .unwrap_or_else(|err| npm::error_response(&err).into_http_response()),
-        None => match parse_pypi_route(path) {
-            Some(PypiRoute::SimpleRoot) => pypi::simple_root_response(config, &pypi_upstream)
-                .await
-                .unwrap_or_else(|err| pypi::error_response(&err))
-                .into_http_response(),
-            Some(PypiRoute::SimpleProject { project }) => pypi::simple_project_response_for_accept(
+        .unwrap_or_else(|err| cargo::error_response(&err).into_http_response()),
+        None => match parse_npm_route(path) {
+            Some(NpmRoute::Metadata { package }) => {
+                npm::metadata_response(config, &npm_upstream, checker, &package, now)
+                    .await
+                    .unwrap_or_else(|err| npm::error_response(&err))
+                    .into_http_response()
+            }
+            Some(NpmRoute::Artifact { package, tarball }) => npm::artifact_delivery_response(
                 config,
-                &pypi_upstream,
+                &npm_upstream,
                 checker,
-                &project,
-                now,
-                accept,
-            )
-            .await
-            .unwrap_or_else(|err| pypi::error_response(&err))
-            .into_http_response(),
-            Some(PypiRoute::Artifact {
-                project,
-                version,
-                filename,
-            }) => pypi::artifact_delivery_response(
-                config,
-                &pypi_upstream,
-                checker,
-                pypi::PypiArtifactRoute {
-                    project: &project,
-                    version: &version,
-                    filename: &filename,
+                npm::NpmArtifactRoute {
+                    package: &package,
+                    tarball: &tarball,
                 },
                 now,
                 ArtifactDeliveryOptions::with_request_headers(&delivery, headers),
             )
             .await
             .map(|response| response.into_http_response())
-            .unwrap_or_else(|err| pypi::error_response(&err).into_http_response()),
-            None => simple_response(404, "not found").into_http_response(),
+            .unwrap_or_else(|err| npm::error_response(&err).into_http_response()),
+            None => match parse_pypi_route(path) {
+                Some(PypiRoute::SimpleRoot) => pypi::simple_root_response(config, &pypi_upstream)
+                    .await
+                    .unwrap_or_else(|err| pypi::error_response(&err))
+                    .into_http_response(),
+                Some(PypiRoute::SimpleProject { project }) => {
+                    pypi::simple_project_response_for_accept(
+                        config,
+                        &pypi_upstream,
+                        checker,
+                        &project,
+                        now,
+                        accept,
+                    )
+                    .await
+                    .unwrap_or_else(|err| pypi::error_response(&err))
+                    .into_http_response()
+                }
+                Some(PypiRoute::Artifact {
+                    project,
+                    version,
+                    filename,
+                }) => pypi::artifact_delivery_response(
+                    config,
+                    &pypi_upstream,
+                    checker,
+                    pypi::PypiArtifactRoute {
+                        project: &project,
+                        version: &version,
+                        filename: &filename,
+                    },
+                    now,
+                    ArtifactDeliveryOptions::with_request_headers(&delivery, headers),
+                )
+                .await
+                .map(|response| response.into_http_response())
+                .unwrap_or_else(|err| pypi::error_response(&err).into_http_response()),
+                None => simple_response(404, "not found").into_http_response(),
+            },
         },
     }
 }
@@ -446,6 +502,35 @@ enum PypiRoute {
         version: String,
         filename: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CargoRoute {
+    Config,
+    Index { name: String },
+    Artifact { name: String, version: String },
+}
+
+fn parse_cargo_route(path: &str) -> Option<CargoRoute> {
+    let path = path.split('?').next().unwrap_or(path);
+    if path == "/cargo/config.json" {
+        return Some(CargoRoute::Config);
+    }
+    if let Some(rest) = path.strip_prefix("/cargo/api/v1/crates/") {
+        let parts = rest.split('/').collect::<Vec<_>>();
+        if let [name, version, "download"] = parts.as_slice() {
+            cargo::sparse_path(name).ok()?;
+            return Some(CargoRoute::Artifact {
+                name: name.to_ascii_lowercase(),
+                version: (*version).to_string(),
+            });
+        }
+        return None;
+    }
+    let rest = path.strip_prefix("/cargo/")?;
+    Some(CargoRoute::Index {
+        name: cargo::name_from_sparse_path(rest).ok()?,
+    })
 }
 
 fn parse_pypi_route(path: &str) -> Option<PypiRoute> {
@@ -722,7 +807,7 @@ mod tests {
     }
 
     fn new_time() -> DateTime<Utc> {
-        now() - ChronoDuration::hours(12)
+        Utc::now() - ChronoDuration::hours(12)
     }
 
     fn pypi_file(filename: &str, url: &str, upload_time: Option<DateTime<Utc>>) -> SimpleFile {

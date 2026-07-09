@@ -9,7 +9,7 @@ use std::io::Cursor;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -90,6 +90,59 @@ fn go_mod_download_works_with_proxy_artifact_mode() {
         "Go module download in proxy artifact mode",
         &go_download(&project, &proxy, workspace.child("proxy-cache")),
     );
+}
+const CARGO_PACKAGE: &str = "osv-proxy-e2e-cargo";
+
+#[test]
+fn cargo_source_replacement_supports_redirect_and_proxy_and_rejects_blocked_versions() {
+    require_command("cargo");
+    let workspace = TempWorkspace::new("cargo-install-e2e");
+    let fixture = FixtureArtifacts::create(workspace.path());
+    let upstream = start_fixture_upstream(fixture);
+
+    for behavior in [ArtifactBehavior::Redirect, ArtifactBehavior::Proxy] {
+        let proxy = start_proxy_with_behavior(upstream.base_url(), behavior);
+        let allowed = workspace.child(match behavior {
+            ArtifactBehavior::Redirect => "cargo-redirect",
+            _ => "cargo-proxy",
+        });
+        cargo_project(&allowed, "1.0.0");
+        write_cargo_source_replacement(&allowed, &proxy.base_url());
+        let output = Command::new("cargo")
+            .arg("build")
+            .current_dir(&allowed)
+            .output()
+            .unwrap();
+        assert_success("cargo build allowed package", &output);
+    }
+
+    let proxy = start_proxy_with_behavior(upstream.base_url(), ArtifactBehavior::Redirect);
+    let blocked = workspace.child("cargo-blocked");
+    cargo_project(&blocked, "1.0.1");
+    write_cargo_source_replacement(&blocked, &proxy.base_url());
+    let output = Command::new("cargo")
+        .arg("build")
+        .current_dir(&blocked)
+        .output()
+        .unwrap();
+    assert_failure("cargo build blocked package", &output);
+
+    let locked = workspace.child("cargo-locked-blocked");
+    cargo_project(&locked, "1.0.1");
+    write_cargo_source_replacement_url(&locked, &format!("sparse+{}/", upstream.base_url()));
+    let output = Command::new("cargo")
+        .arg("generate-lockfile")
+        .current_dir(&locked)
+        .output()
+        .unwrap();
+    assert_success("cargo generate lockfile for fixture", &output);
+    write_cargo_source_replacement(&locked, &proxy.base_url());
+    let output = Command::new("cargo")
+        .args(["build", "--locked"])
+        .current_dir(&locked)
+        .output()
+        .unwrap();
+    assert_failure("cargo build blocked lockfile package", &output);
 }
 
 #[test]
@@ -211,6 +264,7 @@ fn uv_pip_install_uses_proxy_for_allowed_and_blocked_versions() {
 struct FixtureArtifacts {
     npm_tarballs: HashMap<String, Vec<u8>>,
     pypi_wheels: HashMap<String, Vec<u8>>,
+    cargo_crates: HashMap<String, Vec<u8>>,
 }
 
 impl FixtureArtifacts {
@@ -218,6 +272,7 @@ impl FixtureArtifacts {
         Self {
             npm_tarballs: create_npm_tarballs(root),
             pypi_wheels: create_pypi_wheels(root),
+            cargo_crates: create_cargo_crates(root),
         }
     }
 }
@@ -232,6 +287,10 @@ fn start_fixture_upstream(fixture: FixtureArtifacts) -> TestServer {
 
 fn start_proxy(upstream_base_url: String) -> TestServer {
     start_go_proxy(upstream_base_url, false, ArtifactBehavior::Redirect)
+}
+
+fn start_proxy_with_behavior(upstream_base_url: String, behavior: ArtifactBehavior) -> TestServer {
+    start_go_proxy(upstream_base_url, false, behavior)
 }
 
 fn start_go_proxy(
@@ -253,6 +312,9 @@ fn start_go_proxy(
             config.upstreams.npm.registry_url = upstream_base_url.clone();
             config.upstreams.pypi.simple_url = format!("{upstream_base_url}/simple");
             config.upstreams.go.proxy_url = upstream_base_url.clone();
+            config.upstreams.cargo.sparse_index_url = upstream_base_url.clone();
+            config.upstreams.cargo.download_url = format!("{upstream_base_url}/cargo-files");
+            config.upstreams.go.proxy_url = upstream_base_url.clone();
             config.policy.osv.api_url = upstream_base_url.clone();
             config.artifacts.behavior = behavior;
             config.blocklist.push(BlocklistEntry {
@@ -269,6 +331,12 @@ fn start_go_proxy(
                     reason: "package-manager e2e blocked Go version".to_string(),
                 });
             }
+            config.blocklist.push(BlocklistEntry {
+                ecosystem: Ecosystem::CratesIo,
+                name: CARGO_PACKAGE.to_string(),
+                versions: vec!["1.0.1".to_string()],
+                reason: "package-manager e2e blocked Cargo version".to_string(),
+            });
             config.blocklist.push(BlocklistEntry {
                 ecosystem: Ecosystem::Pypi,
                 name: PYPI_PACKAGE.to_string(),
@@ -379,6 +447,13 @@ fn fixture_response(
         if path == format!("/{GO_MODULE}/@v/v1.0.0.zip") {
             return binary_response("application/zip", go_module_zip());
         }
+        if path == "/config.json" {
+            return RegistryResponse::json(
+                200,
+                &json!({ "dl": format!("{base_url}/cargo-files") }),
+            )
+            .unwrap();
+        }
         if let Some(filename) = path.strip_prefix("/npm-files/")
             && let Some(body) = fixture.npm_tarballs.get(filename)
         {
@@ -403,6 +478,23 @@ fn fixture_response(
 
         if let Some(filename) = path.strip_prefix("/pypi-files/")
             && let Some(body) = fixture.pypi_wheels.get(filename)
+        {
+            return binary_response("application/octet-stream", body.clone());
+        }
+        if path == format!("/os/v-/{CARGO_PACKAGE}") {
+            let lines = ["1.0.0", "1.0.1"].into_iter().map(|version| {
+                let filename = format!("{CARGO_PACKAGE}-{version}.crate");
+                let checksum = sha256_hex(fixture.cargo_crates.get(&filename).unwrap());
+                format!("{{\"name\":\"{CARGO_PACKAGE}\",\"vers\":\"{version}\",\"deps\":[],\"cksum\":\"{checksum}\",\"features\":{{}},\"yanked\":false,\"pubtime\":\"2026-06-01T00:00:00Z\"}}")
+            }).collect::<Vec<_>>().join("\n");
+            return RegistryResponse {
+                status: 200,
+                headers: vec![("content-type".to_string(), "text/plain".to_string())],
+                body: format!("{lines}\n").into_bytes(),
+            };
+        }
+        if let Some(filename) = path.strip_prefix(&format!("/cargo-files/{CARGO_PACKAGE}/"))
+            && let Some(body) = fixture.cargo_crates.get(filename)
         {
             return binary_response("application/octet-stream", body.clone());
         }
@@ -537,6 +629,76 @@ fn create_pypi_wheels(root: &Path) -> HashMap<String, Vec<u8>> {
     }
 
     wheels
+}
+
+fn create_cargo_crates(root: &Path) -> HashMap<String, Vec<u8>> {
+    let package_dir = root.join("cargo-package");
+    fs::create_dir_all(package_dir.join("src")).unwrap();
+    write_file(
+        &package_dir.join("src/lib.rs"),
+        "pub fn fixture() -> &'static str { \"ok\" }\n",
+    );
+    let mut crates = HashMap::new();
+    for version in ["1.0.0", "1.0.1"] {
+        write_file(
+            &package_dir.join("Cargo.toml"),
+            &format!(
+                "[package]\nname = \"{CARGO_PACKAGE}\"\nversion = \"{version}\"\nedition = \"2021\"\n"
+            ),
+        );
+        let output = Command::new("cargo")
+            .args(["package", "--allow-dirty", "--no-verify"])
+            .current_dir(&package_dir)
+            .output()
+            .unwrap();
+        assert_success("cargo package fixture", &output);
+        let filename = format!("{CARGO_PACKAGE}-{version}.crate");
+        crates.insert(
+            filename.clone(),
+            fs::read(package_dir.join("target/package").join(filename)).unwrap(),
+        );
+    }
+    crates
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut child = Command::new("shasum")
+        .args(["-a", "256"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string()
+}
+
+fn cargo_project(path: &Path, version: &str) {
+    write_file(
+        &path.join("Cargo.toml"),
+        &format!(
+            "[package]\nname = \"consumer\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{CARGO_PACKAGE} = \"={version}\"\n"
+        ),
+    );
+    write_file(&path.join("src/main.rs"), "fn main() {}\n");
+}
+
+fn write_cargo_source_replacement(path: &Path, proxy_url: &str) {
+    write_cargo_source_replacement_url(path, &format!("sparse+{proxy_url}/cargo/"));
+}
+
+fn write_cargo_source_replacement_url(path: &Path, registry_url: &str) {
+    write_file(
+        &path.join(".cargo/config.toml"),
+        &format!(
+            "[source.crates-io]\nreplace-with = \"osv-proxy\"\n\n[source.osv-proxy]\nregistry = \"{registry_url}\"\n"
+        ),
+    );
 }
 
 type Handler = dyn Fn(HttpRequest) -> RegistryResponse + Send + Sync + 'static;

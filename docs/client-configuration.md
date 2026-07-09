@@ -2,6 +2,17 @@
 
 These examples assume `osv-proxy` is listening at `http://127.0.0.1:8080`.
 
+## Cargo / crates.io
+
+```toml
+[source.crates-io]
+replace-with = "osv-proxy"
+[source.osv-proxy]
+registry = "sparse+http://127.0.0.1:8080/cargo/"
+```
+
+This is read-only sparse source replacement, not publishing or a private registry.
+
 ## npm
 
 ```sh

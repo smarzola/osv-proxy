@@ -10,6 +10,8 @@ pub enum Ecosystem {
     Npm,
     Pypi,
     Go,
+    #[serde(rename = "crates.io")]
+    CratesIo,
 }
 
 impl Ecosystem {
@@ -18,6 +20,7 @@ impl Ecosystem {
             Ecosystem::Npm => name.to_string(),
             Ecosystem::Pypi => normalize_pypi_name(name),
             Ecosystem::Go => name.to_string(),
+            Ecosystem::CratesIo => normalize_cargo_name(name),
         }
     }
 
@@ -26,6 +29,7 @@ impl Ecosystem {
             Ecosystem::Npm => "npm",
             Ecosystem::Pypi => "PyPI",
             Ecosystem::Go => "Go",
+            Ecosystem::CratesIo => "crates.io",
         }
     }
 }
@@ -36,6 +40,7 @@ impl fmt::Display for Ecosystem {
             Ecosystem::Npm => write!(f, "npm"),
             Ecosystem::Pypi => write!(f, "pypi"),
             Ecosystem::Go => write!(f, "go"),
+            Ecosystem::CratesIo => write!(f, "crates.io"),
         }
     }
 }
@@ -48,6 +53,7 @@ impl FromStr for Ecosystem {
             "npm" => Ok(Ecosystem::Npm),
             "pypi" | "python" | "python-package" => Ok(Ecosystem::Pypi),
             "go" | "golang" | "go-module" => Ok(Ecosystem::Go),
+            "crates.io" | "cargo" | "crates-io" => Ok(Ecosystem::CratesIo),
             other => Err(ArtifactParseError::UnsupportedEcosystem(other.to_string())),
         }
     }
@@ -161,6 +167,10 @@ pub fn normalize_pypi_name(name: &str) -> String {
     out.trim_matches('-').to_string()
 }
 
+pub fn normalize_cargo_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ArtifactParseError {
     #[error("unsupported ecosystem: {0}")]
@@ -196,5 +206,14 @@ mod tests {
         assert_eq!(identity.name, "@babel/core");
         assert_eq!(identity.version, "7.24.0");
         assert_eq!(identity.identity(), "npm:@babel/core@7.24.0");
+    }
+
+    #[test]
+    fn normalizes_cargo_identity() {
+        let artifact = parse_identity("crates.io:My_Crate@1.0.0", None).unwrap();
+        assert_eq!(artifact.ecosystem, Ecosystem::CratesIo);
+        assert_eq!(artifact.name, "my_crate");
+        assert_eq!(artifact.identity(), "crates.io:my_crate@1.0.0");
+        assert_eq!(artifact.ecosystem.osv_name(), "crates.io");
     }
 }
