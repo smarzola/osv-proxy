@@ -26,7 +26,7 @@ Validate it with:
 cargo run -- config validate --config examples/basic/osv-proxy.yaml
 ```
 
-The npm registry, PyPI Simple API, and OSV API default to their public URLs.
+The npm registry, PyPI Simple API, NuGet V3 service index, and OSV API default to their public URLs.
 Configure them only when routing through a mirror, fixture, or private gateway.
 
 ## Server
@@ -47,6 +47,8 @@ server:
 upstreams:
   npm:
     registry_url: "https://registry.npmjs.org"
+  nuget:
+    service_index_url: "https://api.nuget.org/v3/index.json"
   pypi:
     simple_url: "https://pypi.org/simple"
 ```

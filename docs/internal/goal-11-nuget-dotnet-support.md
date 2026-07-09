@@ -110,8 +110,8 @@ For every completed milestone:
 - [x] Milestone 0: NuGet V3 research and restore contract
 - [x] Milestone 1: NuGet ecosystem, config, OSV, and CLI foundations
 - [x] Milestone 2: Service index and registration filtering
-- [ ] Milestone 3: Flat-container and package enforcement
-- [ ] Milestone 4: Real .NET restore, docs, and regression
+- [x] Milestone 3: Flat-container and package enforcement
+- [x] Milestone 4: Real .NET restore, docs, and regression
 
 ## Milestone 0: NuGet V3 Research and Restore Contract
 
@@ -205,6 +205,11 @@ cargo test cli
 cargo test malicious
 cargo fmt --check
 ```
+
+Status (2026-07-09): Complete. Flat-container indexes are derived from filtered
+registration leaves and direct `.nupkg`/`.nuspec` requests re-evaluate policy
+before redirect or streaming delivery. Verified with focused NuGet unit tests
+and real-client redirect/proxy restore tests.
 
 Status (2026-07-09): Complete. The proxy service index advertises only owned
 registration and flat-container resources. Registration roots hydrate bounded
@@ -339,6 +344,12 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo run -- config validate --config examples/basic/osv-proxy.yaml
 git diff --check
 ```
+
+Status (2026-07-09): Complete. CI pins .NET SDK 8.0.128. Hermetic actual-listener
+tests use a local V3 upstream and only the proxy source, covering dependency
+restore, redirect and proxy delivery, fresh block, locked newly-blocked restore,
+and an explicit prerelease. Final verification commands are recorded in the
+checkpoint commit.
 
 ## Final Response Required
 
