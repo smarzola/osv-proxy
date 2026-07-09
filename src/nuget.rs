@@ -596,6 +596,14 @@ mod tests {
         assert!(body.contains("/nuget/v3/registration-semver2/demo/page/0.json"));
         assert!(body.contains("/nuget/v3/flatcontainer/demo/1.0.0/demo.1.0.0.nupkg"));
     }
+    #[tokio::test]
+    async fn hydration_fails_closed_over_page_cap() {
+        let mut document = json!({"items": (0..=MAX_REGISTRATION_PAGES).map(|index| json!({"@id":format!("https://upstream/page/{index}.json")})).collect::<Vec<_>>()});
+        let err = hydrate_registration_pages(&provider(), &mut document)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("page count exceeds"));
+    }
     #[test]
     fn service_index_owns_only_restore_resources() {
         let response = service_index_response(&Config::default()).unwrap();
