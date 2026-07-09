@@ -288,6 +288,18 @@ async fn route_http_request_with_accept_and_headers(
             .unwrap_or_else(|err| simple_response(502, &err.to_string()))
             .into_http_response();
     }
+    if let Some(package) = parse_nuget_flat_index_route(path) {
+        return nuget::flat_container_index_response(
+            config,
+            &nuget_upstream,
+            checker,
+            &package,
+            now,
+        )
+        .await
+        .unwrap_or_else(|err| simple_response(502, &err.to_string()))
+        .into_http_response();
+    }
     if let Some((package, version, filename)) = parse_nuget_flat_artifact_route(path) {
         let result = async {
             let artifact = nuget::lookup_artifact(&nuget_upstream, &package, &version).await?;
@@ -469,6 +481,17 @@ fn parse_nuget_flat_artifact_route(path: &str) -> Option<(String, String, String
         }
         _ => None,
     }
+}
+
+fn parse_nuget_flat_index_route(path: &str) -> Option<String> {
+    let rest = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .strip_prefix("/nuget/v3/flatcontainer/")?;
+    let package = rest.strip_suffix("/index.json")?;
+    (!package.is_empty() && !package.contains('/'))
+        .then(|| crate::artifact::normalize_nuget_name(package))
 }
 
 fn parse_pypi_route(path: &str) -> Option<PypiRoute> {
@@ -1501,6 +1524,7 @@ INSERT INTO advisories (
     async fn local_mode_filters_pypi_metadata_and_blocks_artifact_without_osv_http() {
         let dir = tempdir().unwrap();
         let mut config = local_malicious_config(dir.path().join("malicious.sqlite"));
+        config.policy.minimum_age = Duration::from_secs(7 * 24 * 60 * 60);
         insert_local_malicious_version(
             &config,
             Ecosystem::Pypi,

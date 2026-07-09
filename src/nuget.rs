@@ -131,17 +131,17 @@ async fn find_leaf(
         } else {
             continue;
         };
-        if let Some(leaves) = page.get("items").and_then(Value::as_array) {
-            if let Some(leaf) = leaves.iter().find(|leaf| {
+        if let Some(leaves) = page.get("items").and_then(Value::as_array)
+            && let Some(leaf) = leaves.iter().find(|leaf| {
                 leaf.get("catalogEntry")
                     .and_then(|entry| entry.get("version"))
                     .and_then(Value::as_str)
                     .and_then(|candidate| normalize_nuget_version(candidate).ok())
                     .as_deref()
                     == Some(version)
-            }) {
-                return Ok(leaf.clone());
-            }
+            })
+        {
+            return Ok(leaf.clone());
         }
     }
     Err(NugetError::VersionNotFound(version.to_string()))
@@ -193,6 +193,44 @@ pub async fn registration_response(
     filter_registration(config, checker, &package, &mut document, now).await?;
     rewrite_registration_urls(config, &package, &mut document);
     Ok(RegistryResponse::json(200, &document)?)
+}
+
+pub async fn flat_container_index_response(
+    config: &Config,
+    provider: &dyn NugetProvider,
+    checker: &dyn MaliciousChecker,
+    package: &str,
+    now: DateTime<Utc>,
+) -> Result<RegistryResponse, NugetError> {
+    let index = provider.fetch_service_index().await?;
+    let base = registration_base(&index)?;
+    let package = normalize_nuget_name(package);
+    let mut document = provider
+        .fetch_json(&format!("{base}/{package}/index.json"))
+        .await?;
+    filter_registration(config, checker, &package, &mut document, now).await?;
+    let versions = document
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|page| {
+            page.get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|leaf| {
+            leaf.get("catalogEntry")
+                .and_then(|entry| entry.get("version"))
+                .and_then(Value::as_str)
+        })
+        .filter_map(|version| normalize_nuget_version(version).ok())
+        .collect::<Vec<_>>();
+    Ok(RegistryResponse::json(
+        200,
+        &serde_json::json!({"versions": versions}),
+    )?)
 }
 
 fn registration_base(index: &Value) -> Result<&str, NugetError> {
@@ -280,16 +318,16 @@ fn rewrite_registration_urls(config: &Config, package: &str, document: &mut Valu
                         .and_then(|c| c.get("version"))
                         .and_then(Value::as_str)
                         .and_then(|v| normalize_nuget_version(v).ok());
-                    if let Some(version) = version {
-                        if let Some(object) = leaf.as_object_mut() {
-                            object.insert(
-                                "@id".into(),
-                                Value::String(format!(
-                                    "{base}/nuget/v3/registration-semver2/{package}/{version}.json"
-                                )),
-                            );
-                            object.insert("packageContent".into(),Value::String(format!("{base}/nuget/v3/flatcontainer/{package}/{version}/{package}.{version}.nupkg")));
-                        }
+                    if let Some(version) = version
+                        && let Some(object) = leaf.as_object_mut()
+                    {
+                        object.insert(
+                            "@id".into(),
+                            Value::String(format!(
+                                "{base}/nuget/v3/registration-semver2/{package}/{version}.json"
+                            )),
+                        );
+                        object.insert("packageContent".into(),Value::String(format!("{base}/nuget/v3/flatcontainer/{package}/{version}/{package}.{version}.nupkg")));
                     }
                 }
             }
@@ -298,3 +336,73 @@ fn rewrite_registration_urls(config: &Config, package: &str, document: &mut Valu
 }
 
 use chrono::Datelike;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::malicious::{MaliciousChecker, MaliciousError, MaliciousHit};
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    struct Static {
+        documents: HashMap<String, Value>,
+    }
+    struct Clean;
+    #[async_trait]
+    impl MaliciousChecker for Clean {
+        async fn check(&self, _: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            Ok(Vec::new())
+        }
+    }
+    #[async_trait]
+    impl NugetProvider for Static {
+        async fn fetch_service_index(&self) -> Result<Value, NugetError> {
+            Ok(
+                json!({"resources":[{"@type":"RegistrationsBaseUrl/3.6.0","@id":"https://upstream/registration"}]}),
+            )
+        }
+        async fn fetch_json(&self, url: &str) -> Result<Value, NugetError> {
+            self.documents
+                .get(url)
+                .cloned()
+                .ok_or_else(|| NugetError::InvalidMetadata(url.into()))
+        }
+    }
+    fn provider() -> Static {
+        Static {
+            documents: HashMap::from([(
+                "https://upstream/registration/demo/index.json".into(),
+                json!({"items":[{"count":2,"items":[
+                    {"catalogEntry":{"version":"1.0.0","published":"2026-01-01T00:00:00Z"},"packageContent":"https://upstream/demo.1.0.0.nupkg"},
+                    {"catalogEntry":{"version":"2.0.0","published":"2026-07-09T00:00:00Z"},"packageContent":"https://upstream/demo.2.0.0.nupkg"}
+                ]}]}),
+            )]),
+        }
+    }
+    #[tokio::test]
+    async fn filters_registration_and_flat_container_versions() {
+        let mut config = Config::default();
+        config.policy.minimum_age = Duration::from_secs(24 * 60 * 60);
+        config.policy.osv.block_malicious = false;
+        let response =
+            flat_container_index_response(&config, &provider(), &Clean, "Demo", Utc::now())
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).unwrap()["versions"],
+            json!(["1.0.0"])
+        );
+    }
+    #[test]
+    fn service_index_owns_only_restore_resources() {
+        let response = service_index_response(&Config::default()).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&response.body).unwrap()["resources"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+}

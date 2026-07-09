@@ -1,6 +1,6 @@
 # osv-proxy
 
-`osv-proxy` is a package-registry security proxy for npm and PyPI that combines
+`osv-proxy` is a package-registry security proxy for npm, PyPI, and NuGet restore that combines
 the [OSV vulnerability database](https://osv.dev/) with local policy.
 
 It sits between package managers and public registries, filters package metadata
@@ -25,6 +25,8 @@ Implemented now:
 
 - npm metadata filtering and tarball delivery.
 - PyPI Simple JSON-backed filtering, HTML/JSON responses, and file delivery.
+- NuGet V3 restore service discovery, registration filtering, flat-container
+  version enumeration, and protected `.nupkg`/`.nuspec` delivery.
 - YAML config loading and validation.
 - `serve`, `check`, `eval`, `config validate`, and `malicious sync`
   commands.
@@ -105,6 +107,15 @@ Use `uv` with the proxy:
 ```sh
 uv pip install --index-url http://127.0.0.1:8080/pypi/simple/ requests
 ```
+
+Point .NET restore at the NuGet V3 proxy source:
+
+```sh
+dotnet restore --source http://127.0.0.1:8080/nuget/v3/index.json
+```
+
+NuGet support is read-only and restore-scoped: search, publishing, symbols,
+and authentication are deliberately unsupported.
 
 ## Check a Package
 

@@ -28,6 +28,11 @@ jobs:
           rustup default stable
           rustup component add rustfmt
 
+      - name: Install .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.128'
+
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
