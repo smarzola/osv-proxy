@@ -412,7 +412,7 @@ async fn filter_registration(
                 .2;
             let result = results.get(&(page_index, leaf_index)).cloned().map(Ok);
             if policy
-                .evaluate_with_malicious_result(artifact, now, result.map(|hits| hits))
+                .evaluate_with_malicious_result(artifact, now, result)
                 .allowed
             {
                 kept.push(leaf);
