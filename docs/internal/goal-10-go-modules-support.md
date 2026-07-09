@@ -116,7 +116,7 @@ For every completed milestone:
 - [x] Milestone 1: Go ecosystem, config, OSV, and CLI foundations
 - [x] Milestone 2: Discovery and metadata filtering
 - [x] Milestone 3: Immutable module content enforcement
-- [ ] Milestone 4: Real Go compatibility, docs, and regression
+- [x] Milestone 4: Real Go compatibility, docs, and regression
 
 ## Milestone 0: Protocol and Performance Contract
 
@@ -359,6 +359,20 @@ git diff --check
 ```
 
 ## Final Response Required
+
+Status (2026-07-09): Complete. Added a hermetic Go-client integration test that
+builds a local module-proxy fixture, runs `go mod download` through
+`GOPROXY=<local>/go`, uses `GOSUMDB=off`/`GONOSUMDB=*`, and verifies `go.sum`
+creation without Git, public registries, OSV, or sum.golang.org. CI installs Go
+1.24 before `cargo test --locked`, so this coverage cannot be silently omitted.
+README, client configuration, configuration reference, and registry behavior
+now document Go support plus the mandatory-gate warning: a single `GOPROXY`
+value is required because `,direct`, another proxy, `GONOPROXY`, or `GOPRIVATE`
+can bypass a gate after fallback-eligible upstream errors. Policy denials use
+terminal 403. Ran `cargo fmt --check`, `cargo test --offline` (148 unit and 3
+integration tests), `cargo clippy --offline --all-targets --all-features -- -D
+warnings`, `cargo run --offline -- config validate --config
+examples/basic/osv-proxy.yaml`, and `git diff --check` successfully.
 
 Report:
 

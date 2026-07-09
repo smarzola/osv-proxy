@@ -119,6 +119,20 @@ links are not passed through to clients.
 File routes fetch upstream Simple JSON, rebuild the requested artifact, and
 evaluate policy again before artifact delivery.
 
+## Go module routes
+
+`/go/` implements the read-only GOPROXY routes `@v/list`, `@latest`,
+`@v/<version>.info`, `.mod`, and `.zip`. The proxy escapes uppercase module
+path and version characters using Go's `!` encoding. It enriches at most 256
+listed versions with at most 16 in flight, filters each one by policy, and
+returns a deterministic Go-semver-sorted result. An enrichment error fails the
+discovery response closed. Direct `.info`, `.mod`, and `.zip` requests rebuild
+the canonical artifact and re-evaluate policy; denials are terminal `403`.
+
+Allowed `.mod` and `.zip` bytes are redirected or streamed unchanged, so Go's
+module checksum verification remains valid. A missing upstream module remains
+`404`/`410`, which is the only response class that permits GOPROXY fallback.
+
 ## Artifact Modes
 
 Redirect mode is the default public-service mode:

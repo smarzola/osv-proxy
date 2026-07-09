@@ -5,6 +5,7 @@ use osv_proxy::server;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Cursor;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -12,10 +13,42 @@ use std::process::{Command, Output};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zip::ZipWriter;
+use zip::write::SimpleFileOptions;
 
 const NPM_PACKAGE: &str = "osv-proxy-e2e-npm";
 const PYPI_PACKAGE: &str = "osv-proxy-e2e-pypi";
 const PYPI_MODULE: &str = "osv_proxy_e2e_pypi";
+const GO_MODULE: &str = "example.com/fixture";
+
+#[test]
+fn go_mod_download_uses_hermetic_proxy() {
+    require_command("go");
+    let workspace = TempWorkspace::new("go-mod-download-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+    let proxy = start_proxy(upstream.base_url());
+    let project = workspace.child("go-client");
+    fs::create_dir_all(&project).unwrap();
+    write_file(
+        &project.join("go.mod"),
+        "module client.example/test\n\ngo 1.24\n\nrequire example.com/fixture v1.0.0\n",
+    );
+    let output = Command::new("go")
+        .arg("mod")
+        .arg("download")
+        .arg("example.com/fixture")
+        .current_dir(&project)
+        .env("GOPROXY", format!("{}/go", proxy.base_url()))
+        .env("GOSUMDB", "off")
+        .env("GONOSUMDB", "*")
+        .env("GONOPROXY", "")
+        .env("GOPRIVATE", "")
+        .env("GOMODCACHE", workspace.child("go-cache"))
+        .output()
+        .unwrap();
+    assert_success("go mod download through proxy", &output);
+    assert!(project.join("go.sum").exists());
+}
 
 #[test]
 fn npm_install_uses_proxy_for_allowed_and_blocked_versions() {
@@ -169,6 +202,7 @@ fn start_proxy(upstream_base_url: String) -> TestServer {
             config.server.public_base_url = proxy_base_url.clone();
             config.upstreams.npm.registry_url = upstream_base_url.clone();
             config.upstreams.pypi.simple_url = format!("{upstream_base_url}/simple");
+            config.upstreams.go.proxy_url = upstream_base_url.clone();
             config.policy.osv.api_url = upstream_base_url.clone();
             config.blocklist.push(BlocklistEntry {
                 ecosystem: Ecosystem::Npm,
@@ -232,6 +266,31 @@ fn fixture_response(
     }
 
     if request.method == "GET" {
+        if path == format!("/{GO_MODULE}/@v/list") {
+            return RegistryResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: b"v1.0.0\n".to_vec(),
+            };
+        }
+        if path == format!("/{GO_MODULE}/@latest") || path == format!("/{GO_MODULE}/@v/v1.0.0.info")
+        {
+            return RegistryResponse::json(
+                200,
+                &json!({"Version":"v1.0.0","Time":"2020-01-01T00:00:00Z"}),
+            )
+            .unwrap();
+        }
+        if path == format!("/{GO_MODULE}/@v/v1.0.0.mod") {
+            return RegistryResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: b"module example.com/fixture\n\ngo 1.24\n".to_vec(),
+            };
+        }
+        if path == format!("/{GO_MODULE}/@v/v1.0.0.zip") {
+            return binary_response("application/zip", go_module_zip());
+        }
         if let Some(filename) = path.strip_prefix("/npm-files/")
             && let Some(body) = fixture.npm_tarballs.get(filename)
         {
@@ -268,6 +327,24 @@ fn fixture_response(
         }),
     )
     .unwrap()
+}
+
+fn go_module_zip() -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let prefix = "example.com/fixture@v1.0.0/";
+    writer
+        .start_file(format!("{prefix}go.mod"), SimpleFileOptions::default())
+        .unwrap();
+    writer
+        .write_all(b"module example.com/fixture\n\ngo 1.24\n")
+        .unwrap();
+    writer
+        .start_file(format!("{prefix}fixture.go"), SimpleFileOptions::default())
+        .unwrap();
+    writer
+        .write_all(b"package fixture\n\nconst Value = 1\n")
+        .unwrap();
+    writer.finish().unwrap().into_inner()
 }
 
 fn npm_version_metadata(base_url: &str, version: &str) -> serde_json::Value {
