@@ -451,8 +451,24 @@ async fn filter_registration(
 
 fn rewrite_registration_urls(config: &Config, package: &str, document: &mut Value) {
     let base = config.server.public_base_url.trim_end_matches('/');
+    if let Some(object) = document.as_object_mut() {
+        object.insert(
+            "@id".into(),
+            Value::String(format!(
+                "{base}/nuget/v3/registration-semver2/{package}/index.json"
+            )),
+        );
+    }
     if let Some(items) = document.get_mut("items").and_then(Value::as_array_mut) {
         for page in items {
+            if let Some(object) = page.as_object_mut() {
+                object.insert(
+                    "@id".into(),
+                    Value::String(format!(
+                        "{base}/nuget/v3/registration-semver2/{package}/page.json"
+                    )),
+                );
+            }
             if let Some(leaves) = page.get_mut("items").and_then(Value::as_array_mut) {
                 for leaf in leaves {
                     let version = leaf
@@ -470,6 +486,23 @@ fn rewrite_registration_urls(config: &Config, package: &str, document: &mut Valu
                             )),
                         );
                         object.insert("packageContent".into(),Value::String(format!("{base}/nuget/v3/flatcontainer/{package}/{version}/{package}.{version}.nupkg")));
+                        object.insert(
+                            "registration".into(),
+                            Value::String(format!(
+                                "{base}/nuget/v3/registration-semver2/{package}/index.json"
+                            )),
+                        );
+                        if let Some(catalog) = object
+                            .get_mut("catalogEntry")
+                            .and_then(Value::as_object_mut)
+                        {
+                            catalog.insert(
+                                "@id".into(),
+                                Value::String(format!(
+                                    "{base}/nuget/v3/registration-semver2/{package}/{version}.json"
+                                )),
+                            );
+                        }
                     }
                 }
             }
