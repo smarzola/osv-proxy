@@ -544,6 +544,8 @@ mod tests {
     use crate::malicious::{MaliciousChecker, MaliciousError, MaliciousHit};
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     struct Static {
         documents: HashMap<String, Value>,
@@ -697,6 +699,58 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, NugetError::VersionNotFound(_)));
+    }
+    struct DelayedPages {
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl NugetProvider for DelayedPages {
+        async fn fetch_service_index(&self) -> Result<Value, NugetError> {
+            Ok(json!({}))
+        }
+        async fn fetch_json(&self, url: &str) -> Result<Value, NugetError> {
+            let active = self.active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.peak.fetch_max(active, AtomicOrdering::SeqCst);
+            let index = url
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .trim_end_matches(".json")
+                .parse::<u64>()
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(
+                (REGISTRATION_PAGE_CONCURRENCY as u64 + 2 - index) * 2,
+            ))
+            .await;
+            self.active.fetch_sub(1, AtomicOrdering::SeqCst);
+            Ok(
+                json!({"items":[{"catalogEntry":{"version":format!("1.0.{index}"),"published":"2020-01-01T00:00:00Z"}}]}),
+            )
+        }
+    }
+    #[tokio::test]
+    async fn hydration_is_bounded_concurrent_and_reassembles_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let provider = DelayedPages {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+        };
+        let count = REGISTRATION_PAGE_CONCURRENCY + 2;
+        let mut document = json!({"items": (0..count).map(|index| json!({"@id":format!("https://upstream/{index}.json")})).collect::<Vec<_>>()});
+        hydrate_registration_pages(&provider, &mut document)
+            .await
+            .unwrap();
+        assert!(peak.load(AtomicOrdering::SeqCst) > 1);
+        assert!(peak.load(AtomicOrdering::SeqCst) <= REGISTRATION_PAGE_CONCURRENCY);
+        assert_eq!(active.load(AtomicOrdering::SeqCst), 0);
+        for index in 0..count {
+            assert_eq!(
+                document["items"][index]["items"][0]["catalogEntry"]["version"],
+                json!(format!("1.0.{index}"))
+            );
+        }
     }
     #[test]
     fn service_index_owns_only_restore_resources() {
