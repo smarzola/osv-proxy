@@ -12,6 +12,7 @@ use thiserror::Error;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_REGISTRATION_PAGES: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct NugetClient {
@@ -238,6 +239,11 @@ async fn hydrate_registration_pages(
         .get_mut("items")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| NugetError::InvalidMetadata("registration items must be an array".into()))?;
+    if pages.len() > MAX_REGISTRATION_PAGES {
+        return Err(NugetError::InvalidMetadata(format!(
+            "registration page count exceeds {MAX_REGISTRATION_PAGES}"
+        )));
+    }
     for page in pages {
         if page.get("items").is_none() {
             let id = page
@@ -336,6 +342,11 @@ async fn filter_registration(
             .iter()
             .enumerate()
         {
+            if leaf.get("catalogEntry").is_some_and(Value::is_string) {
+                return Err(NugetError::InvalidMetadata(
+                    "string catalogEntry is unsupported".into(),
+                ));
+            }
             let catalog = leaf.get("catalogEntry").unwrap_or(leaf);
             let version = catalog
                 .get("version")
