@@ -185,7 +185,7 @@ pub async fn registration_response(
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, NugetError> {
     let index = provider.fetch_service_index().await?;
-    let base = registration_base(&index)?;
+    let base = registration_base(&index)?.trim_end_matches('/');
     let package = normalize_nuget_name(package);
     let mut document = provider
         .fetch_json(&format!("{base}/{package}/index.json"))
@@ -208,7 +208,7 @@ pub async fn registration_resource_response(
         return registration_response(config, provider, checker, package, now).await;
     }
     let index = provider.fetch_service_index().await?;
-    let base = registration_base(&index)?;
+    let base = registration_base(&index)?.trim_end_matches('/');
     let package = normalize_nuget_name(package);
     let raw = provider
         .fetch_json(&format!("{base}/{package}/{suffix}"))
@@ -267,7 +267,7 @@ pub async fn flat_container_index_response(
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, NugetError> {
     let index = provider.fetch_service_index().await?;
-    let base = registration_base(&index)?;
+    let base = registration_base(&index)?.trim_end_matches('/');
     let package = normalize_nuget_name(package);
     let mut document = provider
         .fetch_json(&format!("{base}/{package}/index.json"))

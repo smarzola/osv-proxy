@@ -344,6 +344,48 @@ fn locked_dotnet_restore_fails_after_nuget_package_is_blocked() {
     assert!(!String::from_utf8_lossy(&second.stderr).contains("nuget.org"));
 }
 
+#[test]
+fn dotnet_restore_explicit_nuget_prerelease_through_proxy() {
+    require_command("dotnet");
+    let workspace = TempWorkspace::new("dotnet-prerelease-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+    let mut config = Config::default();
+    config.upstreams.nuget.service_index_url = format!("{}/v3/index.json", upstream.base_url());
+    config.policy.osv.block_malicious = false;
+    config.policy.minimum_age = Duration::from_secs(0);
+    let proxy = start_axum_proxy(config);
+    let project = workspace.child("project");
+    fs::create_dir_all(&project).unwrap();
+    write_file(
+        &project.join("project.csproj"),
+        "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup><ItemGroup><PackageReference Include=\"Fixture.Prerelease\" Version=\"1.1.0-beta.1\" /></ItemGroup></Project>",
+    );
+    write_file(
+        &project.join("NuGet.Config"),
+        &format!(
+            "<configuration><packageSources><clear/><add key=\"proxy\" value=\"{}/nuget/v3/index.json\"/></packageSources></configuration>",
+            proxy.base_url()
+        ),
+    );
+    let output = Command::new("dotnet")
+        .args([
+            "restore",
+            "--configfile",
+            "NuGet.Config",
+            "--packages",
+            workspace.child("packages").to_str().unwrap(),
+        ])
+        .current_dir(&project)
+        .output()
+        .unwrap();
+    assert_success("prerelease restore", &output);
+    assert!(
+        workspace
+            .child("packages/fixture.prerelease/1.1.0-beta.1")
+            .exists()
+    );
+}
+
 struct FixtureArtifacts {
     npm_tarballs: HashMap<String, Vec<u8>>,
     pypi_wheels: HashMap<String, Vec<u8>>,
@@ -471,7 +513,9 @@ fn fixture_response(
         let id = path
             .trim_start_matches("/registration/")
             .trim_end_matches("/index.json");
-        let (version, dependency) = if id == "fixture.root" {
+        let (version, dependency) = if id == "fixture.prerelease" {
+            ("1.1.0-beta.1", None)
+        } else if id == "fixture.root" {
             ("1.0.0", Some("Fixture.Dependency"))
         } else {
             ("1.0.0", None)
@@ -479,7 +523,12 @@ fn fixture_response(
         return RegistryResponse::json(200, &json!({"items":[{"count":1,"items":[{"catalogEntry":{"version":version,"published":"2020-01-01T00:00:00Z","dependencyGroups":dependency.map(|name| json!([{ "dependencies":[{"id":name,"range":"[1.0.0]"}]}])).unwrap_or(json!([]))},"packageContent":format!("{base_url}/packages/{id}.{version}.nupkg")}]}]})).unwrap();
     }
     if request.method == "GET" && path.starts_with("/flat/") && path.ends_with("/index.json") {
-        return RegistryResponse::json(200, &json!({"versions":["1.0.0"]})).unwrap();
+        let version = if path.contains("fixture.prerelease") {
+            "1.1.0-beta.1"
+        } else {
+            "1.0.0"
+        };
+        return RegistryResponse::json(200, &json!({"versions":[version]})).unwrap();
     }
     if request.method == "GET" && path.starts_with("/packages/") {
         let name = path.trim_start_matches("/packages/");
@@ -635,12 +684,14 @@ fn create_nuget_packages() -> HashMap<String, Vec<u8>> {
     [
         ("fixture.root", "Fixture.Root", Some("Fixture.Dependency")),
         ("fixture.dependency", "Fixture.Dependency", None),
+        ("fixture.prerelease", "Fixture.Prerelease", None),
     ].into_iter().map(|(key, id, dependency)| {
+        let version = if key == "fixture.prerelease" { "1.1.0-beta.1" } else { "1.0.0" };
         let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
         writer.start_file(format!("{id}.nuspec"), SimpleFileOptions::default()).unwrap();
         let dependencies = dependency.map(|dep| format!("<dependencies><dependency id=\"{dep}\" version=\"[1.0.0]\" /></dependencies>")).unwrap_or_default();
-        writer.write_all(format!("<?xml version=\"1.0\"?><package><metadata><id>{id}</id><version>1.0.0</version><authors>test</authors><description>fixture</description>{dependencies}</metadata></package>").as_bytes()).unwrap();
-        (format!("{key}.1.0.0.nupkg"), writer.finish().unwrap().into_inner())
+        writer.write_all(format!("<?xml version=\"1.0\"?><package><metadata><id>{id}</id><version>{version}</version><authors>test</authors><description>fixture</description>{dependencies}</metadata></package>").as_bytes()).unwrap();
+        (format!("{key}.{version}.nupkg"), writer.finish().unwrap().into_inner())
     }).collect()
 }
 
