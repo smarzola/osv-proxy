@@ -584,6 +584,18 @@ mod tests {
             json!(["1.0.0"])
         );
     }
+    #[tokio::test]
+    async fn registration_response_owns_all_emitted_urls() {
+        let mut config = Config::default();
+        config.policy.osv.block_malicious = false;
+        let response = registration_response(&config, &provider(), &Clean, "demo", Utc::now())
+            .await
+            .unwrap();
+        let body = String::from_utf8(response.body).unwrap();
+        assert!(!body.contains("https://upstream"));
+        assert!(body.contains("/nuget/v3/registration-semver2/demo/page/0.json"));
+        assert!(body.contains("/nuget/v3/flatcontainer/demo/1.0.0/demo.1.0.0.nupkg"));
+    }
     #[test]
     fn service_index_owns_only_restore_resources() {
         let response = service_index_response(&Config::default()).unwrap();
