@@ -89,6 +89,21 @@ Supported routes:
 - `GET /pypi/simple/{project}/`
 - `GET /pypi/packages/{project}/{version}/{filename}`
 
+## NuGet V3 Restore Routes
+
+Supported read-only restore routes:
+
+- `GET /nuget/v3/index.json`
+- `GET /nuget/v3/registration-semver2/{id}/...json`
+- `GET /nuget/v3/flatcontainer/{id}/index.json`
+- `GET /nuget/v3/flatcontainer/{id}/{version}/{id}.{version}.nupkg`
+- `GET /nuget/v3/flatcontainer/{id}/{version}/{id}.nuspec`
+
+The service index advertises only these proxy-owned resources. Registration and
+flat-container discovery omit versions denied by policy; package bytes are
+rechecked before redirect or proxy delivery. Search, publish, delete, symbols,
+and authentication are unsupported.
+
 Examples:
 
 - `GET /pypi/simple/requests/`
