@@ -174,6 +174,24 @@ fn dotnet_restore_uses_proxying_nuget_proxy_with_dependency() {
     assert!(workspace.child("packages/fixture.dependency/1.0.0").exists());
 }
 
+#[test]
+fn dotnet_restore_cannot_use_blocked_nuget_package() {
+    require_command("dotnet");
+    let workspace = TempWorkspace::new("dotnet-restore-blocked-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+    let mut config = Config::default();
+    config.upstreams.nuget.service_index_url = format!("{}/v3/index.json", upstream.base_url());
+    config.policy.osv.block_malicious = false; config.policy.minimum_age = Duration::from_secs(0);
+    config.blocklist.push(BlocklistEntry { ecosystem: Ecosystem::Nuget, name: NUGET_ROOT.into(), versions: vec!["1.0.0".into()], reason: "fixture block".into() });
+    let proxy = start_axum_proxy(config);
+    let project = workspace.child("project"); fs::create_dir_all(&project).unwrap();
+    write_file(&project.join("project.csproj"), &format!("<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup><ItemGroup><PackageReference Include=\"{NUGET_ROOT}\" Version=\"1.0.0\" /></ItemGroup></Project>"));
+    write_file(&project.join("NuGet.Config"), &format!("<configuration><packageSources><clear /><add key=\"proxy\" value=\"{}/nuget/v3/index.json\" /></packageSources></configuration>", proxy.base_url()));
+    let output = Command::new("dotnet").args(["restore", "--configfile", "NuGet.Config", "--packages", workspace.child("packages").to_str().unwrap()]).current_dir(&project).output().unwrap();
+    assert_failure("dotnet restore blocked package", &output);
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("nuget.org"));
+}
+
 struct FixtureArtifacts {
     npm_tarballs: HashMap<String, Vec<u8>>,
     pypi_wheels: HashMap<String, Vec<u8>>,
