@@ -114,7 +114,7 @@ For every completed milestone:
 
 - [x] Milestone 0: Protocol and performance contract
 - [x] Milestone 1: Go ecosystem, config, OSV, and CLI foundations
-- [ ] Milestone 2: Discovery and metadata filtering
+- [x] Milestone 2: Discovery and metadata filtering
 - [ ] Milestone 3: Immutable module content enforcement
 - [ ] Milestone 4: Real Go compatibility, docs, and regression
 
@@ -218,15 +218,18 @@ upstream URL construction. Ran `cargo test go_modules`, `cargo test artifacts`,
 `cargo test server`, and `cargo fmt --check`; the sandbox blocks loopback
 listeners, so server/artifact proxy fixtures require host-mode verification.
 
-Status (2026-07-09): Partial implementation. Added the `/go/<module>/@v/list`, `@latest`,
+Status (2026-07-09): Complete. Added the `/go/<module>/@v/list`, `@latest`,
 and version `.info` adapter routes. Discovery evaluates each candidate's trusted
 `.info` timestamp before exposing it, omits denied/missing-metadata entries,
 de-duplicates then Go-semver sorts the output, and computes latest from the
 same filtered candidate window. The 256-entry window prevents unbounded list
-fan-out; the current implementation performs those requests serially, which is
-safe but has a known latency cost recorded as a residual risk. Exact `.info`
+fan-out; `.info` enrichment uses at most 16 in-flight requests and preserves a
+deterministic sorted/de-duplicated response after collection. A single `.info`
+failure fails the whole discovery response closed. Exact `.info`
 requests independently re-evaluate policy and return structured terminal 403.
-Ran `cargo test go_modules`, `cargo check`, and `cargo fmt --check` successfully.
+Ran `cargo test go_modules`, `cargo test server`, `cargo check --offline`, and
+`cargo fmt --check` successfully. Also fixed the PyPI local-policy test's stale
+wall-clock fixture by giving that test an explicit age gap.
 
 Status (2026-07-09): Complete. Added the case-sensitive `Go` ecosystem,
 `upstreams.go.proxy_url` (defaulting to `https://proxy.golang.org`), Go

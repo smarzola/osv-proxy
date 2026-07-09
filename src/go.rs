@@ -8,6 +8,10 @@ use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures_util::{
+    FutureExt,
+    stream::{FuturesUnordered, StreamExt},
+};
 use node_semver::Version;
 use reqwest::Client;
 use serde::Deserialize;
@@ -17,6 +21,8 @@ use thiserror::Error;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const LIST_INFO_CONCURRENCY: usize = 16;
+const LIST_INFO_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct GoInfo {
@@ -216,22 +222,11 @@ pub async fn route_response(
 ) -> Result<RegistryResponse, GoError> {
     match route {
         GoRoute::List => {
-            let versions = upstream.list(module).await?;
-            let mut allowed = Vec::new();
-            // The contract bounds fan-out to the first 256 entries. This
-            // adapter deliberately fails closed per unavailable `.info`.
-            for version in versions.into_iter().take(256) {
-                let Ok(info) = upstream.info(module, &version).await else {
-                    continue;
-                };
-                if PolicyEngine::new(config)
-                    .evaluate(&artifact(module, &info), now, checker)
-                    .await
-                    .allowed
-                {
-                    allowed.push(info.version);
-                }
-            }
+            let mut allowed = filtered_infos(config, upstream, checker, module, now)
+                .await?
+                .into_iter()
+                .map(|info| info.version)
+                .collect::<Vec<_>>();
             allowed.sort_by(|a, b| compare_versions(a, b).unwrap_or_else(|_| a.cmp(b)));
             allowed.dedup();
             Ok(RegistryResponse {
@@ -245,24 +240,13 @@ pub async fn route_response(
             })
         }
         GoRoute::Latest => {
-            let versions = upstream.list(module).await?;
-            let mut selected: Option<GoInfo> = None;
-            for version in versions.into_iter().take(256) {
-                let Ok(info) = upstream.info(module, &version).await else {
-                    continue;
-                };
-                if PolicyEngine::new(config)
-                    .evaluate(&artifact(module, &info), now, checker)
-                    .await
-                    .allowed
-                    && selected.as_ref().is_none_or(|old| {
-                        compare_versions(&info.version, &old.version)
-                            .is_ok_and(|order| order == Ordering::Greater)
-                    })
-                {
-                    selected = Some(info);
-                }
-            }
+            let selected = filtered_infos(config, upstream, checker, module, now)
+                .await?
+                .into_iter()
+                .max_by(|left, right| {
+                    compare_versions(&left.version, &right.version)
+                        .unwrap_or_else(|_| left.version.cmp(&right.version))
+                });
             selected.map(|info| RegistryResponse::json(200, &serde_json::json!({"Version": info.version, "Time": info.time.to_rfc3339()})).map_err(|err| GoError::InvalidResponse(err.to_string()))).unwrap_or_else(|| Err(GoError::UpstreamStatus(404)))
         }
         GoRoute::Info(version) => {
@@ -304,6 +288,48 @@ pub async fn route_response(
                 .await)
         }
     }
+}
+
+async fn filtered_infos(
+    config: &Config,
+    upstream: &dyn GoProxyProvider,
+    checker: &dyn MaliciousChecker,
+    module: &str,
+    now: DateTime<Utc>,
+) -> Result<Vec<GoInfo>, GoError> {
+    let versions = upstream.list(module).await?;
+    let mut pending = FuturesUnordered::new();
+    let mut versions = versions.into_iter().take(LIST_INFO_LIMIT);
+    for _ in 0..LIST_INFO_CONCURRENCY {
+        if let Some(version) = versions.next() {
+            pending.push(async move { upstream.info(module, &version).await }.boxed());
+        }
+    }
+    let mut infos = Vec::new();
+    let mut failed = None;
+    while let Some(result) = pending.next().await {
+        match result {
+            Ok(info) => infos.push(info),
+            Err(error) => failed = Some(error),
+        }
+        if let Some(version) = versions.next() {
+            pending.push(async move { upstream.info(module, &version).await }.boxed());
+        }
+    }
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    let mut allowed = Vec::new();
+    for info in infos {
+        if PolicyEngine::new(config)
+            .evaluate(&artifact(module, &info), now, checker)
+            .await
+            .allowed
+        {
+            allowed.push(info);
+        }
+    }
+    Ok(allowed)
 }
 
 #[derive(Debug, Clone, Copy)]

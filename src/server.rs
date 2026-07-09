@@ -1478,6 +1478,9 @@ INSERT INTO advisories (
     async fn local_mode_filters_pypi_metadata_and_blocks_artifact_without_osv_http() {
         let dir = tempdir().unwrap();
         let mut config = local_malicious_config(dir.path().join("malicious.sqlite"));
+        // This route uses wall-clock policy evaluation; retain a deliberate
+        // age gap between the fixed fixture's old and new uploads.
+        config.policy.minimum_age = Duration::from_secs(120 * 60 * 60);
         insert_local_malicious_version(
             &config,
             Ecosystem::Pypi,
