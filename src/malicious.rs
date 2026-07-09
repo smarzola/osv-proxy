@@ -1196,6 +1196,9 @@ fn range_matches_artifact(
                 compare_pypi_version(&version, boundary, artifact)
             })
         }
+        ("NuGet", "ECOSYSTEM") => evaluate_range_events(range, artifact, |boundary| {
+            compare_nuget_version(&artifact.version, boundary, artifact)
+        }),
         (_, range_type) => Err(range_error(
             artifact,
             format!(
@@ -1204,6 +1207,60 @@ fn range_matches_artifact(
             ),
         )),
     }
+}
+
+fn compare_nuget_version(
+    version: &str,
+    boundary: &str,
+    artifact: &Artifact,
+) -> Result<Ordering, MaliciousError> {
+    let parse = |value: &str| {
+        crate::artifact::normalize_nuget_version(value).map_err(|err| {
+            range_error(
+                artifact,
+                format!("invalid NuGet range boundary {value}: {err}"),
+            )
+        })
+    };
+    let version = parse(version)?;
+    let boundary = parse(boundary)?;
+    let split = |value: &str| {
+        let (core, pre) = value
+            .split_once('-')
+            .map_or((value, None), |parts| (parts.0, Some(parts.1)));
+        (
+            core.split('.')
+                .map(|n| n.parse::<u64>().unwrap_or(0))
+                .collect::<Vec<_>>(),
+            pre.map(str::to_ascii_lowercase),
+        )
+    };
+    let (left, left_pre) = split(&version);
+    let (right, right_pre) = split(&boundary);
+    match left.cmp(&right) {
+        Ordering::Equal => match (left_pre, right_pre) {
+            (None, None) => Ok(Ordering::Equal),
+            (None, Some(_)) => Ok(Ordering::Greater),
+            (Some(_), None) => Ok(Ordering::Less),
+            (Some(a), Some(b)) => Ok(compare_nuget_prerelease(&a, &b)),
+        },
+        other => Ok(other),
+    }
+}
+
+fn compare_nuget_prerelease(left: &str, right: &str) -> Ordering {
+    for (a, b) in left.split('.').zip(right.split('.')) {
+        let order = match (a.parse::<u64>(), b.parse::<u64>()) {
+            (Ok(a), Ok(b)) => a.cmp(&b),
+            (Ok(_), Err(_)) => Ordering::Less,
+            (Err(_), Ok(_)) => Ordering::Greater,
+            _ => a.cmp(b),
+        };
+        if order != Ordering::Equal {
+            return order;
+        }
+    }
+    left.split('.').count().cmp(&right.split('.').count())
 }
 
 fn evaluate_range_events<F>(
