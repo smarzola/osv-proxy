@@ -113,7 +113,7 @@ For every completed milestone:
 5. Record and report the commit hash before continuing.
 
 - [x] Milestone 0: Protocol and performance contract
-- [ ] Milestone 1: Go ecosystem, config, OSV, and CLI foundations
+- [x] Milestone 1: Go ecosystem, config, OSV, and CLI foundations
 - [ ] Milestone 2: Discovery and metadata filtering
 - [ ] Milestone 3: Immutable module content enforcement
 - [ ] Milestone 4: Real Go compatibility, docs, and regression
@@ -207,6 +207,16 @@ cargo test cli
 cargo test malicious
 cargo fmt --check
 ```
+
+Status (2026-07-09): Complete. Added the case-sensitive `Go` ecosystem,
+`upstreams.go.proxy_url` (defaulting to `https://proxy.golang.org`), Go
+identities for `check` and `eval`, Go OSV API names, and independent local-dump
+sync state. The dedicated adapter validates and escapes module paths, accepts
+canonical `v` versions including pseudo versions and `+incompatible`, and uses
+Go-semver comparison for observed `SEMVER`/`ECOSYSTEM` local range records.
+Existing `cargo test config`, `cargo test cli`, and all non-listener malicious
+tests passed; listener-based tests need the host execution mode because this
+sandbox denies loopback binds. `cargo fmt --check` passed.
 
 ## Milestone 2: Discovery and Metadata Filtering
 

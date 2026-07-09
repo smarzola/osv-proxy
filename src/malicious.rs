@@ -1,5 +1,6 @@
 use crate::artifact::{Artifact, Ecosystem};
 use crate::config::{Config, LocalOsvConfig, LocalOsvStaleBehavior, OsvSource};
+use crate::go;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use node_semver as npm_semver;
@@ -346,7 +347,7 @@ pub async fn sync_malicious(
     SqliteMaliciousChecker::initialize(&config.sqlite_path)?;
     let mut connection = open_read_write_connection(&config.sqlite_path)?;
     let mut ecosystems = Vec::new();
-    for ecosystem in [Ecosystem::Npm, Ecosystem::Pypi] {
+    for ecosystem in [Ecosystem::Npm, Ecosystem::Pypi, Ecosystem::Go] {
         ecosystems.push(
             sync_ecosystem(
                 &mut connection,
@@ -1194,6 +1195,14 @@ fn range_matches_artifact(
             })?;
             evaluate_range_events(range, artifact, |boundary| {
                 compare_pypi_version(&version, boundary, artifact)
+            })
+        }
+        ("Go", "SEMVER") | ("Go", "ECOSYSTEM") => {
+            go::validate_version(&artifact.version)
+                .map_err(|err| range_error(artifact, err.to_string()))?;
+            evaluate_range_events(range, artifact, |boundary| {
+                go::compare_versions(&artifact.version, boundary)
+                    .map_err(|err| range_error(artifact, err.to_string()))
             })
         }
         (_, range_type) => Err(range_error(
@@ -2103,10 +2112,21 @@ INSERT INTO advisories (
     #[async_trait]
     impl OsvDumpClient for FixtureDumpClient {
         async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, MaliciousError> {
-            self.responses
-                .get(url)
-                .cloned()
-                .ok_or_else(|| MaliciousError::Sync(format!("missing fixture response for {url}")))
+            if let Some(response) = self.responses.get(url) {
+                return Ok(response.clone());
+            }
+            // Go was added after the existing npm/PyPI fixtures. Empty Go
+            // snapshots keep those fixtures focused while exercising its
+            // independent local-sync state machine.
+            if url.contains("/Go/all.zip") {
+                return Ok(zip_bytes([]));
+            }
+            if url.contains("/Go/modified_id.csv") {
+                return Ok(Vec::new());
+            }
+            Err(MaliciousError::Sync(format!(
+                "missing fixture response for {url}"
+            )))
         }
     }
 
