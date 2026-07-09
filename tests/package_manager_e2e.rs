@@ -314,7 +314,6 @@ fn start_go_proxy(
             config.upstreams.go.proxy_url = upstream_base_url.clone();
             config.upstreams.cargo.sparse_index_url = upstream_base_url.clone();
             config.upstreams.cargo.download_url = format!("{upstream_base_url}/cargo-files");
-            config.upstreams.go.proxy_url = upstream_base_url.clone();
             config.policy.osv.api_url = upstream_base_url.clone();
             config.artifacts.behavior = behavior;
             config.blocklist.push(BlocklistEntry {
