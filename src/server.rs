@@ -5,6 +5,7 @@ use crate::malicious::{
     sync_malicious,
 };
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
+use crate::nuget::{self, NugetClient};
 use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
 use crate::response::RegistryResponse;
 use async_trait::async_trait;
@@ -273,8 +274,53 @@ async fn route_http_request_with_accept_and_headers(
     let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
     let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
     let delivery = ArtifactDeliveryClient::new();
+    let nuget_upstream = NugetClient::new(&config.upstreams.nuget.service_index_url);
     let now = Utc::now();
 
+    if path.split('?').next().unwrap_or(path) == "/nuget/v3/index.json" {
+        return nuget::service_index_response(config)
+            .unwrap_or_else(|err| simple_response(502, &err.to_string()))
+            .into_http_response();
+    }
+    if let Some(package) = parse_nuget_registration_route(path) {
+        return nuget::registration_response(config, &nuget_upstream, checker, &package, now)
+            .await
+            .unwrap_or_else(|err| simple_response(502, &err.to_string()))
+            .into_http_response();
+    }
+    if let Some((package, version, filename)) = parse_nuget_flat_artifact_route(path) {
+        let result = async {
+            let artifact = nuget::lookup_artifact(&nuget_upstream, &package, &version).await?;
+            let decision = crate::policy::PolicyEngine::new(config)
+                .evaluate(&artifact, now, checker)
+                .await;
+            if !decision.allowed {
+                return Ok::<_, crate::nuget::NugetError>(
+                    simple_response(403, &serde_json::to_string(&decision).unwrap_or_default())
+                        .into_http_response(),
+                );
+            }
+            let mut upstream = artifact.upstream_url.ok_or_else(|| {
+                crate::nuget::NugetError::InvalidMetadata(
+                    "registration leaf has no packageContent".into(),
+                )
+            })?;
+            if filename.ends_with(".nuspec") {
+                upstream = upstream
+                    .rsplit_once('/')
+                    .map(|(base, _)| format!("{base}/{package}.nuspec"))
+                    .unwrap_or(upstream);
+            }
+            Ok(ArtifactDeliveryClient::new()
+                .deliver(config, upstream, Some(headers))
+                .await
+                .map_err(|err| crate::nuget::NugetError::InvalidMetadata(err.to_string()))?
+                .into_http_response())
+        }
+        .await;
+        return result
+            .unwrap_or_else(|err| simple_response(502, &err.to_string()).into_http_response());
+    }
     match parse_npm_route(path) {
         Some(NpmRoute::Metadata { package }) => {
             npm::metadata_response(config, &npm_upstream, checker, &package, now)
@@ -388,6 +434,41 @@ enum PypiRoute {
         version: String,
         filename: String,
     },
+}
+
+fn parse_nuget_registration_route(path: &str) -> Option<String> {
+    let rest = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .strip_prefix("/nuget/v3/registration-semver2/")?;
+    let package = rest.strip_suffix("/index.json")?;
+    (!package.is_empty() && !package.contains('/'))
+        .then(|| crate::artifact::normalize_nuget_name(package))
+}
+
+fn parse_nuget_flat_artifact_route(path: &str) -> Option<(String, String, String)> {
+    let segments = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .strip_prefix("/nuget/v3/flatcontainer/")?
+        .split('/')
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        [package, version, filename]
+            if !package.is_empty()
+                && !version.is_empty()
+                && (filename.ends_with(".nupkg") || filename.ends_with(".nuspec")) =>
+        {
+            Some((
+                crate::artifact::normalize_nuget_name(package),
+                crate::artifact::normalize_nuget_version(version).ok()?,
+                (*filename).to_string(),
+            ))
+        }
+        _ => None,
+    }
 }
 
 fn parse_pypi_route(path: &str) -> Option<PypiRoute> {
