@@ -109,7 +109,7 @@ When a milestone is complete:
 4. Commit code, tests, docs, and the status update together.
 5. Record and report the commit hash before starting the next milestone.
 
-- [ ] Milestone 0: Protocol research and adapter contract
+- [x] Milestone 0: Protocol research and adapter contract
 - [ ] Milestone 1: Ecosystem, config, OSV, and CLI foundations
 - [ ] Milestone 2: Sparse index filtering and routing
 - [ ] Milestone 3: Crate artifact delivery and policy recheck
@@ -145,6 +145,35 @@ Verification:
 ```bash
 git diff --check
 ```
+
+Status note 2026-07-09:
+
+- Reviewed Cargo's primary registry-index and source-replacement documentation,
+  the live crates.io sparse `config.json`, recent `serde` sparse records, and
+  the crates.io OSV dump endpoint. The live configuration advertises
+  `https://static.crates.io/crates`; observed index records are JSON lines with
+  `name`, `vers`, `cksum`, dependency metadata, `yanked`, and optional UTC
+  `pubtime` fields.
+- The adapter contract is read-only: `GET /cargo/config.json` returns a proxy
+  download template, `GET /cargo/<sparse-path>` fetches and filters one
+  lower-case sparse index file, and `GET /cargo/api/v1/crates/<name>/<version>/download`
+  re-reads the canonical record, rechecks policy, then redirects or streams the
+  untouched upstream crate. Sparse paths are verified against Cargo's documented
+  name-to-path mapping before upstream access.
+- Filtering parses each JSON line only to construct policy context and then
+  emits the original line unchanged when allowed. `pubtime` is parsed as UTC;
+  a missing value is passed through as `None` so the configured
+  `missing_publish_time` decision applies. Malformed records fail closed.
+- Cargo's sparse protocol caches metadata using ETag or Last-Modified and may
+  issue conditional requests. The adapter will forward useful validators where
+  possible, but never caches or rewrites retained record bytes. The documented
+  source replacement model requires a subset of crates.io, so filtering is
+  compatible with lockfiles only while their selected versions remain allowed.
+- Commands run: `curl --fail --silent --show-error https://index.crates.io/config.json`
+  (passed), the same command for `https://index.crates.io/se/rd/serde` (passed,
+  observed current `pubtime` records), `curl --fail --silent --show-error --head
+  https://storage.googleapis.com/osv-vulnerabilities/crates.io/all.zip` (passed,
+  HTTP 200), and `git diff --check` (passed).
 
 ## Milestone 1: Ecosystem, Config, OSV, and CLI Foundations
 
@@ -313,4 +342,3 @@ Report:
 - protocol or performance risks that remain;
 - explicit confirmation that you did not merge, tag, release, or modify another
   ecosystem goal prompt.
-
