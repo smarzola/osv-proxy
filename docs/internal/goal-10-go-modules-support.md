@@ -112,7 +112,7 @@ For every completed milestone:
 4. Commit implementation, tests, docs, and the status note together.
 5. Record and report the commit hash before continuing.
 
-- [ ] Milestone 0: Protocol and performance contract
+- [x] Milestone 0: Protocol and performance contract
 - [ ] Milestone 1: Go ecosystem, config, OSV, and CLI foundations
 - [ ] Milestone 2: Discovery and metadata filtering
 - [ ] Milestone 3: Immutable module content enforcement
@@ -148,6 +148,27 @@ Verification:
 ```bash
 git diff --check
 ```
+
+Status (2026-07-09): Complete. Inspected the Go module proxy and module-path
+specification and fetched `proxy.golang.org/github.com/pkg/errors` responses:
+`@v/list` is newline-delimited versions with no timestamps; `@latest` and
+`@v/v0.9.1.info` are `{ "Version", "Time" }` JSON; `.mod` is text and `.zip`
+is `application/zip`. The adapter will use Go's `!` uppercase escaping on each
+path segment and version, reject decoded traversal/non-canonical request
+components, and retain Go module paths case-sensitively. `GET /go/<module>/@v/list`
+will fetch a bounded prefix of at most 256 list entries, then concurrently fetch
+their `.info` metadata with a semaphore bound of 16 and a 5-second request
+timeout. It will evaluate entries after collecting results, sort by Go-semver
+order, de-duplicate exact versions, and fail closed for an incomplete selected
+window; older pages are intentionally not advertised without a metadata cache.
+`@latest` derives from exactly that filtered set. A direct `.info`, `.mod`, or
+`.zip` obtains trusted `.info`, re-evaluates policy, and returns structured
+`403` on denial; only upstream `404`/`410` permit GOPROXY fallback. `.mod` and
+`.zip` responses are redirected or streamed byte-for-byte with upstream
+content headers, preserving `go.sum` checksum assumptions. Ran `git diff
+--check` successfully. Local Go is available at `/opt/homebrew/bin/go` despite
+the initial prompt snapshot stating otherwise; real-client tests will therefore
+run locally as well as in CI.
 
 ## Milestone 1: Go Ecosystem, Config, OSV, and CLI Foundations
 
@@ -311,4 +332,3 @@ Report:
 - measured/bounded list-enrichment behavior and remaining performance risks;
 - confirmation that no merge, version bump, tag, release, Git implementation,
   or edits to another ecosystem goal prompt were made.
-
