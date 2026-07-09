@@ -3,6 +3,13 @@
 All notable changes to `osv-proxy` are tracked here. Release sections are the
 source for GitHub release notes.
 
+## [0.4.1] - 2026-07-09
+
+### Changed
+
+- Updated the hermetic .NET restore tests to explicitly permit their
+  loopback-only HTTP NuGet source under the SDK's HTTPS-source enforcement.
+
 ## [0.4.0] - 2026-07-09
 
 ### Added

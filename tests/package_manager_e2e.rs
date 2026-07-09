@@ -153,7 +153,7 @@ fn write_nuget_proxy_config(project: &Path, proxy: &TestServer) {
     write_file(
         &project.join("NuGet.Config"),
         &format!(
-            "<configuration><packageSources><clear/><add key=\"proxy\" value=\"{}/nuget/v3/index.json\"/></packageSources></configuration>",
+            "<configuration><packageSources><clear/><add key=\"proxy\" value=\"{}/nuget/v3/index.json\" allowInsecureConnections=\"true\"/></packageSources></configuration>",
             proxy.base_url()
         ),
     );
