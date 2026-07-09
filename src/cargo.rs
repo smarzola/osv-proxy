@@ -369,4 +369,28 @@ mod tests {
                 .contains("invalid Cargo sparse-index record")
         );
     }
+
+    #[tokio::test]
+    async fn blocked_artifact_is_rechecked_before_delivery() {
+        let upstream = StaticIndex(HashMap::from([("de/mo/demo".to_string(), "{\"name\":\"demo\",\"vers\":\"1.0.0\",\"cksum\":\"abc\",\"pubtime\":\"2024-01-01T00:00:00Z\"}\n".to_string())]));
+        let mut config = Config::default();
+        config.blocklist.push(crate::config::BlocklistEntry {
+            ecosystem: Ecosystem::CratesIo,
+            name: "demo".to_string(),
+            versions: vec!["1.0.0".to_string()],
+            reason: "fixture".to_string(),
+        });
+        let client = crate::artifacts::ArtifactDeliveryClient::new();
+        let result = artifact_delivery_response(
+            &config,
+            &upstream,
+            &CleanChecker,
+            "demo",
+            "1.0.0",
+            Utc::now(),
+            ArtifactDeliveryOptions::new(&client),
+        )
+        .await;
+        assert!(matches!(result, Err(CargoError::Blocked(_))));
+    }
 }

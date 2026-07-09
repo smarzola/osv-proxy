@@ -112,7 +112,7 @@ When a milestone is complete:
 - [x] Milestone 0: Protocol research and adapter contract
 - [x] Milestone 1: Ecosystem, config, OSV, and CLI foundations
 - [x] Milestone 2: Sparse index filtering and routing
-- [ ] Milestone 3: Crate artifact delivery and policy recheck
+- [x] Milestone 3: Crate artifact delivery and policy recheck
 - [ ] Milestone 4: Real Cargo compatibility, docs, and regression
 
 ## Milestone 0: Protocol Research and Adapter Contract
@@ -213,6 +213,18 @@ cargo test cli
 cargo test malicious
 cargo fmt --check
 ```
+
+Status note 2026-07-09:
+
+- Added Cargo artifact delivery at `/cargo/api/v1/crates/<name>/<version>/download`.
+  Each request resolves its canonical sparse record, verifies its name/version,
+  builds the checksum-bearing artifact context, and reevaluates current policy
+  before delegating to the shared redirect/proxy delivery layer.
+- Blocked direct requests return structured 403 before the delivery client can
+  fetch bytes. Allowed redirects/proxy streams retain the upstream `.crate`
+  URL and bytes unchanged.
+- Commands run: `cargo test cargo` passed (7 tests), `cargo fmt --check`
+  passed, and `git diff --check` passed.
 
 Status note 2026-07-09:
 
