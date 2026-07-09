@@ -2079,4 +2079,49 @@ INSERT INTO advisories (
         let artifact = Artifact::package(Ecosystem::Npm, "lodash", "4.17.21", None);
         assert_eq!(artifact.identity(), "npm:lodash@4.17.21");
     }
+
+    #[test]
+    fn nuget_error_mapper_returns_structured_not_found_and_gateway_errors() {
+        let missing = nuget_error_response(crate::nuget::NugetError::VersionNotFound(
+            "demo@1.0.0".into(),
+        ));
+        assert_eq!(missing.status, 404);
+        let missing_body: Value = serde_json::from_slice(&missing.body).unwrap();
+        assert_eq!(missing_body["reason"], "nuget_upstream_error");
+        assert_eq!(missing_body["allowed"], false);
+
+        let malformed = nuget_error_response(crate::nuget::NugetError::InvalidMetadata(
+            "bad fixture".into(),
+        ));
+        assert_eq!(malformed.status, 502);
+        let malformed_body: Value = serde_json::from_slice(&malformed.body).unwrap();
+        assert_eq!(malformed_body["reason"], "nuget_upstream_error");
+        assert_ne!(malformed.body, b"null");
+    }
+
+    #[tokio::test]
+    async fn nuget_route_preserves_upstream_not_found_as_structured_404() {
+        let (service_url, _request) = serve_http_once(
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+        )
+        .await;
+        let mut config = Config::default();
+        config.upstreams.nuget.service_index_url = service_url;
+        let response = router(config)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/nuget/v3/flatcontainer/demo/index.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["reason"], "nuget_upstream_error");
+    }
 }
