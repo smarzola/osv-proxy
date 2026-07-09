@@ -110,7 +110,7 @@ When a milestone is complete:
 5. Record and report the commit hash before starting the next milestone.
 
 - [x] Milestone 0: Protocol research and adapter contract
-- [ ] Milestone 1: Ecosystem, config, OSV, and CLI foundations
+- [x] Milestone 1: Ecosystem, config, OSV, and CLI foundations
 - [ ] Milestone 2: Sparse index filtering and routing
 - [ ] Milestone 3: Crate artifact delivery and policy recheck
 - [ ] Milestone 4: Real Cargo compatibility, docs, and regression
@@ -213,6 +213,22 @@ cargo test cli
 cargo test malicious
 cargo fmt --check
 ```
+
+Status note 2026-07-09:
+
+- Added canonical `crates.io` identities, lower-case Cargo name normalization,
+  strict `upstreams.cargo` sparse-index/download configuration, and a
+  registry-backed Cargo check path that constructs canonical artifacts with the
+  sparse index checksum and optional `pubtime`.
+- Added `crates.io` to live OSV requests and independent local dump-sync health.
+  Local range evaluation now uses Cargo SemVer ordering for both observed
+  `SEMVER` and `ECOSYSTEM` range records, including prereleases.
+- Commands run outside the listener-restricted sandbox: `cargo test cargo`
+  passed (4 tests), `cargo test config` passed (34 tests), `cargo test cli`
+  passed (34 tests), `cargo test malicious -- --test-threads=1` passed (40
+  tests), and `cargo fmt --check` passed. A broad `cargo test artifact` run
+  passed its Cargo/normalization tests but exposed a pre-existing time-sensitive
+  PyPI local-mode assertion; it is deferred to the full-regression milestone.
 
 ## Milestone 2: Sparse Index Filtering and Routing
 

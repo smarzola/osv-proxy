@@ -1,4 +1,5 @@
 use crate::artifact::{Artifact, Ecosystem, parse_identity, parse_package_identity};
+use crate::cargo::{CargoIndexProvider, CargoRegistryClient};
 use crate::config::Config;
 use crate::malicious::{
     HttpOsvDumpClient, MaliciousChecker, configured_malicious_checker, sync_malicious,
@@ -167,6 +168,28 @@ async fn registry_check(
     npm_upstream: &dyn NpmMetadataProvider,
     pypi_upstream: &dyn PypiSimpleProvider,
 ) -> anyhow::Result<CheckOutput> {
+    let cargo_upstream = CargoRegistryClient::new(config);
+    registry_check_with_upstreams(
+        config,
+        package,
+        now,
+        checker,
+        npm_upstream,
+        pypi_upstream,
+        &cargo_upstream,
+    )
+    .await
+}
+
+async fn registry_check_with_upstreams(
+    config: &Config,
+    package: &str,
+    now: DateTime<Utc>,
+    checker: &dyn MaliciousChecker,
+    npm_upstream: &dyn NpmMetadataProvider,
+    pypi_upstream: &dyn PypiSimpleProvider,
+    cargo_upstream: &dyn CargoIndexProvider,
+) -> anyhow::Result<CheckOutput> {
     let identity = parse_package_identity(package)?;
     let artifacts = match identity.ecosystem {
         Ecosystem::Npm => vec![
@@ -176,6 +199,15 @@ async fn registry_check(
             crate::pypi::lookup_artifacts(config, pypi_upstream, &identity.name, &identity.version)
                 .await?
         }
+        Ecosystem::CratesIo => vec![
+            crate::cargo::lookup_artifact(
+                config,
+                cargo_upstream,
+                &identity.name,
+                &identity.version,
+            )
+            .await?,
+        ],
     };
     let artifacts = evaluate_artifacts(config, artifacts, now, checker).await;
     Ok(CheckOutput {
