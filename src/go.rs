@@ -373,6 +373,42 @@ pub fn parse_route(path: &str) -> Option<(String, GoRoute<'_>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{BlocklistEntry, Config};
+    use crate::malicious::{MaliciousError, MaliciousHit};
+    use async_trait::async_trait;
+
+    struct Clean;
+    #[async_trait]
+    impl MaliciousChecker for Clean {
+        async fn check(&self, _: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            Ok(Vec::new())
+        }
+    }
+    struct Fixture;
+    #[async_trait]
+    impl GoProxyProvider for Fixture {
+        async fn list(&self, _: &str) -> Result<Vec<String>, GoError> {
+            Ok(vec!["v1.0.0".into(), "v1.0.1".into()])
+        }
+        async fn info(&self, _: &str, version: &str) -> Result<GoInfo, GoError> {
+            Ok(GoInfo {
+                version: version.into(),
+                time: DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+            })
+        }
+        fn resource_url(
+            &self,
+            module: &str,
+            version: &str,
+            extension: &str,
+        ) -> Result<String, GoError> {
+            Ok(format!(
+                "https://fixture.invalid/{module}/{version}.{extension}"
+            ))
+        }
+    }
     #[test]
     fn escapes_uppercase_path_segments() {
         assert_eq!(
@@ -408,5 +444,32 @@ mod tests {
             }
         ));
         assert!(parse_route("/go/example.com/../bad/@v/list").is_none());
+    }
+
+    #[tokio::test]
+    async fn go_modules_blocks_direct_content_before_delivery() {
+        let mut config = Config::default();
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Go,
+            name: "example.com/mod".into(),
+            versions: vec!["v1.0.1".into()],
+            reason: "test".into(),
+        });
+        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let response = route_response(
+            &config,
+            &Fixture,
+            &Clean,
+            "example.com/mod",
+            GoRoute::Content {
+                version: "v1.0.1",
+                extension: "zip",
+            },
+            Utc::now(),
+            Some(ArtifactDeliveryOptions::new(&delivery)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status, 403);
     }
 }

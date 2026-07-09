@@ -115,7 +115,7 @@ For every completed milestone:
 - [x] Milestone 0: Protocol and performance contract
 - [x] Milestone 1: Go ecosystem, config, OSV, and CLI foundations
 - [x] Milestone 2: Discovery and metadata filtering
-- [ ] Milestone 3: Immutable module content enforcement
+- [x] Milestone 3: Immutable module content enforcement
 - [ ] Milestone 4: Real Go compatibility, docs, and regression
 
 ## Milestone 0: Protocol and Performance Contract
@@ -208,7 +208,7 @@ cargo test malicious
 cargo fmt --check
 ```
 
-Status (2026-07-09): Partial implementation. `.mod` and `.zip` routes first retrieve trusted
+Status (2026-07-09): Complete. `.mod` and `.zip` routes first retrieve trusted
 `.info`, rebuild the canonical Go artifact, and evaluate current policy before
 artifact delivery; denied direct requests receive policy JSON with terminal
 403. Allowed content uses the established redirect/proxy delivery path without
@@ -217,6 +217,10 @@ version components, traversal, and unsupported suffixes are rejected before
 upstream URL construction. Ran `cargo test go_modules`, `cargo test artifacts`,
 `cargo test server`, and `cargo fmt --check`; the sandbox blocks loopback
 listeners, so server/artifact proxy fixtures require host-mode verification.
+Focused coverage confirms a blocked direct ZIP is denied before the delivery
+client can contact its URL; allowed responses retain redirect/proxy byte
+delivery. Ran `cargo test go_modules`, `cargo test artifacts`, `cargo test
+server`, and `cargo fmt --check` successfully in host mode.
 
 Status (2026-07-09): Complete. Added the `/go/<module>/@v/list`, `@latest`,
 and version `.info` adapter routes. Discovery evaluates each candidate's trusted
