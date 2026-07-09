@@ -12,6 +12,7 @@ use std::process::{Command, Output};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zip::{ZipWriter, write::SimpleFileOptions};
 
 const NPM_PACKAGE: &str = "osv-proxy-e2e-npm";
 const PYPI_PACKAGE: &str = "osv-proxy-e2e-pypi";
@@ -136,6 +137,7 @@ fn uv_pip_install_uses_proxy_for_allowed_and_blocked_versions() {
 struct FixtureArtifacts {
     npm_tarballs: HashMap<String, Vec<u8>>,
     pypi_wheels: HashMap<String, Vec<u8>>,
+    nuget_packages: HashMap<String, Vec<u8>>,
 }
 
 impl FixtureArtifacts {
@@ -143,6 +145,7 @@ impl FixtureArtifacts {
         Self {
             npm_tarballs: create_npm_tarballs(root),
             pypi_wheels: create_pypi_wheels(root),
+            nuget_packages: create_nuget_packages(),
         }
     }
 }
@@ -250,6 +253,26 @@ fn fixture_response(
             }),
         )
         .unwrap();
+    }
+    if request.method == "GET" && path == "/v3/index.json" {
+        return RegistryResponse::json(200, &json!({"version":"3.0.0","resources":[{"@id":format!("{base_url}/registration/"),"@type":"RegistrationsBaseUrl/3.6.0"}]})).unwrap();
+    }
+    if request.method == "GET" && path.starts_with("/registration/") {
+        let id = path
+            .trim_start_matches("/registration/")
+            .trim_end_matches("/index.json");
+        let (version, dependency) = if id == "fixture.root" {
+            ("1.0.0", Some("Fixture.Dependency"))
+        } else {
+            ("1.0.0", None)
+        };
+        return RegistryResponse::json(200, &json!({"items":[{"count":1,"items":[{"catalogEntry":{"version":version,"published":"2020-01-01T00:00:00Z","dependencyGroups":dependency.map(|name| json!([{ "dependencies":[{"id":name,"range":"[1.0.0]"}]}])).unwrap_or(json!([]))},"packageContent":format!("{base_url}/packages/{id}.{version}.nupkg")}]}]})).unwrap();
+    }
+    if request.method == "GET" && path.starts_with("/packages/") {
+        let name = path.trim_start_matches("/packages/");
+        if let Some(bytes) = fixture.nuget_packages.get(name) {
+            return binary_response("application/octet-stream", bytes.clone());
+        }
     }
 
     if request.method == "GET" {
@@ -393,6 +416,19 @@ fn create_pypi_wheels(root: &Path) -> HashMap<String, Vec<u8>> {
     }
 
     wheels
+}
+
+fn create_nuget_packages() -> HashMap<String, Vec<u8>> {
+    [
+        ("fixture.root", "Fixture.Root", Some("Fixture.Dependency")),
+        ("fixture.dependency", "Fixture.Dependency", None),
+    ].into_iter().map(|(key, id, dependency)| {
+        let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer.start_file(format!("{id}.nuspec"), SimpleFileOptions::default()).unwrap();
+        let dependencies = dependency.map(|dep| format!("<dependencies><dependency id=\"{dep}\" version=\"[1.0.0]\" /></dependencies>")).unwrap_or_default();
+        writer.write_all(format!("<?xml version=\"1.0\"?><package><metadata><id>{id}</id><version>1.0.0</version><authors>test</authors><description>fixture</description>{dependencies}</metadata></package>").as_bytes()).unwrap();
+        (format!("{key}.1.0.0.nupkg"), writer.finish().unwrap().into_inner())
+    }).collect()
 }
 
 type Handler = dyn Fn(HttpRequest) -> RegistryResponse + Send + Sync + 'static;
