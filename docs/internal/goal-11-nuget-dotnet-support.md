@@ -107,7 +107,7 @@ For every completed milestone:
 4. Commit code, tests, docs, and status update together.
 5. Record and report the commit hash before continuing.
 
-- [ ] Milestone 0: NuGet V3 research and restore contract
+- [x] Milestone 0: NuGet V3 research and restore contract
 - [ ] Milestone 1: NuGet ecosystem, config, OSV, and CLI foundations
 - [ ] Milestone 2: Service index and registration filtering
 - [ ] Milestone 3: Flat-container and package enforcement
@@ -145,6 +145,25 @@ Verification:
 ```bash
 git diff --check
 ```
+
+Status (2026-07-09): Complete. Inspected the Microsoft Learn service-index,
+registration-base-url, package-base-address, and package-versioning references,
+plus nuget.org's documented V3 index and observed `Newtonsoft.Json` restore
+graph. The proxy will advertise only `RegistrationsBaseUrl/3.6.0` at
+`/nuget/v3/registration-semver2/` and `PackageBaseAddress/3.0.0` at
+`/nuget/v3/flatcontainer/`; the service index is `/nuget/v3/index.json`.
+Registration index/page/leaf `@id`, `catalogEntry`, and `packageContent` links
+are rewritten to those surfaces. Flat-container index, `.nupkg`, and `.nuspec`
+use lower-invariant package IDs and normalized, lowercased versions. NuGet
+normalization removes leading zeroes, a zero fourth component, and SemVer 2
+build metadata; prerelease labels compare case-insensitively. Registration
+`published` is the age timestamp. nuget.org's `1900-01-01T00:00:00Z` unlisted
+sentinel is treated as missing publication time, never as an old allowed
+release. Flat-container discovery fetches one registration index and at most
+one page per version-list page (with a fixed bound) before policy evaluation;
+unsupported registration shapes fail closed. A policy denial is `403`; missing
+resources are `404`; malformed/upstream metadata is a deterministic `502`.
+Verified with `git diff --check` (pass).
 
 ## Milestone 1: NuGet Ecosystem, Config, OSV, and CLI Foundations
 
@@ -314,4 +333,3 @@ Report:
 - supported V3 resources and remaining interoperability/performance risks;
 - confirmation that no merge, version bump, tag, release, publishing/search
   implementation, or edits to another ecosystem goal prompt were made.
-
