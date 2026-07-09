@@ -561,13 +561,19 @@ mod tests {
     }
     fn provider() -> Static {
         Static {
-            documents: HashMap::from([(
-                "https://upstream/registration/demo/index.json".into(),
-                json!({"items":[{"count":2,"items":[
-                    {"catalogEntry":{"version":"1.0.0","published":"2026-01-01T00:00:00Z"},"packageContent":"https://upstream/demo.1.0.0.nupkg"},
-                    {"catalogEntry":{"version":"2.0.0","published":"2026-07-09T00:00:00Z"},"packageContent":"https://upstream/demo.2.0.0.nupkg"}
-                ]}]}),
-            )]),
+            documents: HashMap::from([
+                (
+                    "https://upstream/registration/demo/index.json".into(),
+                    json!({"items":[{"count":2,"items":[
+                        {"catalogEntry":{"version":"1.0.0","published":"2026-01-01T00:00:00Z"},"packageContent":"https://upstream/demo.1.0.0.nupkg"},
+                        {"catalogEntry":{"version":"2.0.0","published":"2026-07-09T00:00:00Z"},"packageContent":"https://upstream/demo.2.0.0.nupkg"}
+                    ]}]}),
+                ),
+                (
+                    "https://upstream/registration/demo/1.0.0.json".into(),
+                    json!({"catalogEntry":{"version":"1.0.0","published":"2026-01-01T00:00:00Z","@id":"https://upstream/catalog"},"packageContent":"https://upstream/demo.1.0.0.nupkg","@id":"https://upstream/leaf"}),
+                ),
+            ]),
         }
     }
     #[tokio::test]
@@ -622,6 +628,37 @@ mod tests {
         assert!(page.get("items").and_then(Value::as_array).is_some());
         assert!(page["@id"].as_str().unwrap().ends_with("/page/0.json"));
         assert!(!page.to_string().contains("https://upstream"));
+    }
+    #[tokio::test]
+    async fn rewritten_leaf_route_returns_owned_leaf() {
+        let mut config = Config::default();
+        config.policy.osv.block_malicious = false;
+        let response = registration_resource_response(
+            &config,
+            &provider(),
+            &Clean,
+            "demo",
+            "1.0.0.json",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let leaf: Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(leaf.get("catalogEntry").is_some());
+        assert!(leaf["@id"].as_str().unwrap().ends_with("/demo/1.0.0.json"));
+        assert!(
+            leaf["catalogEntry"]["@id"]
+                .as_str()
+                .unwrap()
+                .ends_with("/demo/1.0.0.json")
+        );
+        assert!(
+            leaf["packageContent"]
+                .as_str()
+                .unwrap()
+                .contains("/flatcontainer/demo/1.0.0/")
+        );
+        assert!(!leaf.to_string().contains("https://upstream"));
     }
     #[test]
     fn service_index_owns_only_restore_resources() {
