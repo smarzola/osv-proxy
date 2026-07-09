@@ -155,6 +155,33 @@ pub fn escape_module_path(module: &str) -> Result<String, GoError> {
         .map(|parts| parts.join("/"))
 }
 
+pub fn unescape_go_component(value: &str) -> Result<String, GoError> {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '!' {
+            let next = chars
+                .next()
+                .filter(|ch| ch.is_ascii_lowercase())
+                .ok_or_else(|| GoError::InvalidRoute(value.into()))?;
+            out.push(next.to_ascii_uppercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    Ok(out)
+}
+
+fn unescape_module_path(value: &str) -> Result<String, GoError> {
+    let module = value
+        .split('/')
+        .map(unescape_go_component)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("/");
+    escape_module_path(&module)?;
+    Ok(module)
+}
+
 pub fn validate_version(version: &str) -> Result<(), GoError> {
     if !version.starts_with('v')
         || version.contains('/')
@@ -293,21 +320,19 @@ pub enum GoRoute<'a> {
 pub fn parse_route(path: &str) -> Option<(String, GoRoute<'_>)> {
     let raw = path.strip_prefix("/go/")?.trim_start_matches('/');
     let (module, suffix) = raw.split_once("/@")?;
-    if escape_module_path(module).is_err() {
-        return None;
-    }
+    let module = unescape_module_path(module).ok()?;
     match suffix {
-        "v/list" => Some((module.into(), GoRoute::List)),
-        "latest" => Some((module.into(), GoRoute::Latest)),
+        "v/list" => Some((module, GoRoute::List)),
+        "latest" => Some((module, GoRoute::Latest)),
         _ => {
             let (version, ext) = suffix.strip_prefix("v/")?.rsplit_once('.')?;
             if validate_version(version).is_err() {
                 return None;
             }
             match ext {
-                "info" => Some((module.into(), GoRoute::Info(version))),
+                "info" => Some((module, GoRoute::Info(version))),
                 "mod" | "zip" => Some((
-                    module.into(),
+                    module,
                     GoRoute::Content {
                         version,
                         extension: ext,
@@ -347,7 +372,7 @@ mod tests {
 
     #[test]
     fn go_modules_parse_proxy_routes() {
-        let (module, route) = parse_route("/go/GitHub.com/Acme/Thing/@v/v2.0.0.mod").unwrap();
+        let (module, route) = parse_route("/go/!git!hub.com/!acme/!thing/@v/v2.0.0.mod").unwrap();
         assert_eq!(module, "GitHub.com/Acme/Thing");
         assert!(matches!(
             route,
