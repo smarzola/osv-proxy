@@ -6,6 +6,7 @@ use crate::malicious::{
     HttpOsvDumpClient, MaliciousChecker, configured_malicious_checker, sync_malicious,
 };
 use crate::npm::{NpmMetadataProvider, NpmRegistryClient};
+use crate::nuget::NugetClient;
 use crate::policy::{Decision, PolicyEngine};
 use crate::pypi::{PypiSimpleClient, PypiSimpleProvider};
 use crate::server;
@@ -211,6 +212,14 @@ async fn registry_check_with_upstreams(
             crate::cargo::lookup_artifact(
                 config,
                 cargo_upstream,
+                &identity.name,
+                &identity.version,
+            )
+            .await?,
+        ],
+        Ecosystem::Nuget => vec![
+            crate::nuget::lookup_artifact(
+                &NugetClient::new(&config.upstreams.nuget.service_index_url),
                 &identity.name,
                 &identity.version,
             )

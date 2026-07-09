@@ -20,6 +20,162 @@ const NPM_PACKAGE: &str = "osv-proxy-e2e-npm";
 const PYPI_PACKAGE: &str = "osv-proxy-e2e-pypi";
 const PYPI_MODULE: &str = "osv_proxy_e2e_pypi";
 const GO_MODULE: &str = "example.com/fixture";
+const NUGET_ROOT: &str = "Fixture.Root";
+
+#[test]
+fn dotnet_restore_uses_redirecting_nuget_proxy_with_dependency() {
+    nuget_restore_case(
+        "dotnet-restore-e2e",
+        ArtifactBehavior::Redirect,
+        NUGET_ROOT,
+        "1.0.0",
+        false,
+        false,
+    );
+}
+#[test]
+fn dotnet_restore_uses_proxying_nuget_proxy_with_dependency() {
+    nuget_restore_case(
+        "dotnet-restore-proxy-e2e",
+        ArtifactBehavior::Proxy,
+        NUGET_ROOT,
+        "1.0.0",
+        false,
+        false,
+    );
+}
+#[test]
+fn dotnet_restore_cannot_use_blocked_nuget_package() {
+    nuget_restore_case(
+        "dotnet-restore-blocked-e2e",
+        ArtifactBehavior::Redirect,
+        NUGET_ROOT,
+        "1.0.0",
+        true,
+        false,
+    );
+}
+#[test]
+fn locked_dotnet_restore_fails_after_nuget_package_is_blocked() {
+    nuget_restore_case(
+        "dotnet-locked-blocked-e2e",
+        ArtifactBehavior::Redirect,
+        NUGET_ROOT,
+        "1.0.0",
+        true,
+        true,
+    );
+}
+#[test]
+fn dotnet_restore_explicit_nuget_prerelease_through_proxy() {
+    nuget_restore_case(
+        "dotnet-prerelease-e2e",
+        ArtifactBehavior::Redirect,
+        "Fixture.Prerelease",
+        "1.1.0-beta.1",
+        false,
+        false,
+    );
+}
+
+fn nuget_restore_case(
+    label: &str,
+    behavior: ArtifactBehavior,
+    package: &str,
+    version: &str,
+    blocked: bool,
+    locked_transition: bool,
+) {
+    require_command("dotnet");
+    let workspace = TempWorkspace::new(label);
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+    let project = workspace.child("project");
+    fs::create_dir_all(&project).unwrap();
+    write_file(
+        &project.join("project.csproj"),
+        &format!(
+            "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework>{}</PropertyGroup><ItemGroup><PackageReference Include=\"{package}\" Version=\"{version}\" /></ItemGroup></Project>",
+            if locked_transition {
+                "<RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>"
+            } else {
+                ""
+            }
+        ),
+    );
+    let mut allowed = nuget_e2e_config(&upstream, behavior, false, package, version);
+    let allowed_proxy = start_axum_proxy(std::mem::take(&mut allowed));
+    write_nuget_proxy_config(&project, &allowed_proxy);
+    let first = run_dotnet_restore(&project, workspace.child("allowed-packages"), false);
+    if !blocked {
+        assert_success("NuGet restore", &first);
+        return;
+    }
+    if locked_transition {
+        assert_success("seed locked NuGet restore", &first);
+    }
+    let blocked_proxy = start_axum_proxy(nuget_e2e_config(
+        &upstream, behavior, true, package, version,
+    ));
+    write_nuget_proxy_config(&project, &blocked_proxy);
+    let result = run_dotnet_restore(
+        &project,
+        workspace.child("blocked-packages"),
+        locked_transition,
+    );
+    assert_failure("blocked NuGet restore", &result);
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("nuget.org"));
+}
+
+fn nuget_e2e_config(
+    upstream: &TestServer,
+    behavior: ArtifactBehavior,
+    blocked: bool,
+    package: &str,
+    version: &str,
+) -> Config {
+    let mut config = Config::default();
+    config.upstreams.nuget.service_index_url = format!("{}/v3/index.json", upstream.base_url());
+    config.policy.osv.block_malicious = false;
+    config.policy.minimum_age = Duration::from_secs(0);
+    config.artifacts.behavior = behavior;
+    if blocked {
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Nuget,
+            name: package.into(),
+            versions: vec![version.into()],
+            reason: "NuGet E2E policy block".into(),
+        });
+    }
+    config
+}
+
+fn write_nuget_proxy_config(project: &Path, proxy: &TestServer) {
+    write_file(
+        &project.join("NuGet.Config"),
+        &format!(
+            "<configuration><packageSources><clear/><add key=\"proxy\" value=\"{}/nuget/v3/index.json\"/></packageSources></configuration>",
+            proxy.base_url()
+        ),
+    );
+}
+
+fn run_dotnet_restore(project: &Path, packages: PathBuf, locked: bool) -> Output {
+    let mut command = Command::new("dotnet");
+    command.arg("restore");
+    if locked {
+        command.arg("--locked-mode");
+    }
+    command
+        .args([
+            "--configfile",
+            "NuGet.Config",
+            "--packages",
+            packages.to_str().unwrap(),
+        ])
+        .current_dir(project)
+        .output()
+        .unwrap()
+}
 
 #[test]
 fn go_mod_download_uses_hermetic_proxy() {
@@ -264,6 +420,7 @@ fn uv_pip_install_uses_proxy_for_allowed_and_blocked_versions() {
 struct FixtureArtifacts {
     npm_tarballs: HashMap<String, Vec<u8>>,
     pypi_wheels: HashMap<String, Vec<u8>>,
+    nuget_packages: HashMap<String, Vec<u8>>,
     cargo_crates: HashMap<String, Vec<u8>>,
 }
 
@@ -272,6 +429,7 @@ impl FixtureArtifacts {
         Self {
             npm_tarballs: create_npm_tarballs(root),
             pypi_wheels: create_pypi_wheels(root),
+            nuget_packages: create_nuget_packages(),
             cargo_crates: create_cargo_crates(root),
         }
     }
@@ -287,6 +445,26 @@ fn start_fixture_upstream(fixture: FixtureArtifacts) -> TestServer {
 
 fn start_proxy(upstream_base_url: String) -> TestServer {
     start_go_proxy(upstream_base_url, false, ArtifactBehavior::Redirect)
+}
+
+/// Starts the production Axum HTTP path for NuGet client compatibility tests.
+fn start_axum_proxy(mut config: Config) -> TestServer {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    config.server.bind = listener.local_addr().unwrap().to_string();
+    config.server.public_base_url = base_url.clone();
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, server::router(config)).await.unwrap();
+        });
+    });
+    TestServer { base_url }
 }
 
 fn start_proxy_with_behavior(upstream_base_url: String, behavior: ArtifactBehavior) -> TestServer {
@@ -418,6 +596,36 @@ fn fixture_response(
             }),
         )
         .unwrap();
+    }
+    if request.method == "GET" && path == "/v3/index.json" {
+        return RegistryResponse::json(200, &json!({"version":"3.0.0","resources":[{"@id":format!("{base_url}/registration/"),"@type":"RegistrationsBaseUrl/3.6.0"},{"@id":format!("{base_url}/flat/"),"@type":"PackageBaseAddress/3.0.0"}]})).unwrap();
+    }
+    if request.method == "GET" && path.starts_with("/registration/") {
+        let id = path
+            .trim_start_matches("/registration/")
+            .trim_end_matches("/index.json");
+        let (version, dependency) = if id == "fixture.prerelease" {
+            ("1.1.0-beta.1", None)
+        } else if id == "fixture.root" {
+            ("1.0.0", Some("Fixture.Dependency"))
+        } else {
+            ("1.0.0", None)
+        };
+        return RegistryResponse::json(200, &json!({"items":[{"count":1,"items":[{"catalogEntry":{"version":version,"published":"2020-01-01T00:00:00Z","dependencyGroups":dependency.map(|name| json!([{ "dependencies":[{"id":name,"range":"[1.0.0]"}]}])).unwrap_or(json!([]))},"packageContent":format!("{base_url}/packages/{id}.{version}.nupkg")}]}]})).unwrap();
+    }
+    if request.method == "GET" && path.starts_with("/flat/") && path.ends_with("/index.json") {
+        let version = if path.contains("fixture.prerelease") {
+            "1.1.0-beta.1"
+        } else {
+            "1.0.0"
+        };
+        return RegistryResponse::json(200, &json!({"versions":[version]})).unwrap();
+    }
+    if request.method == "GET" && path.starts_with("/packages/") {
+        let name = path.trim_start_matches("/packages/");
+        if let Some(bytes) = fixture.nuget_packages.get(name) {
+            return binary_response("application/octet-stream", bytes.clone());
+        }
     }
 
     if request.method == "GET" {
@@ -628,6 +836,24 @@ fn create_pypi_wheels(root: &Path) -> HashMap<String, Vec<u8>> {
     }
 
     wheels
+}
+
+fn create_nuget_packages() -> HashMap<String, Vec<u8>> {
+    [
+        ("fixture.root", "Fixture.Root", Some("Fixture.Dependency")),
+        ("fixture.dependency", "Fixture.Dependency", None),
+        ("fixture.prerelease", "Fixture.Prerelease", None),
+    ]
+    .into_iter()
+    .map(|(key, id, dependency)| {
+        let version = if key == "fixture.prerelease" { "1.1.0-beta.1" } else { "1.0.0" };
+        let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer.start_file(format!("{id}.nuspec"), SimpleFileOptions::default()).unwrap();
+        let dependencies = dependency.map(|dep| format!("<dependencies><dependency id=\"{dep}\" version=\"[1.0.0]\" /></dependencies>")).unwrap_or_default();
+        writer.write_all(format!("<?xml version=\"1.0\"?><package><metadata><id>{id}</id><version>{version}</version><authors>test</authors><description>fixture</description>{dependencies}</metadata></package>").as_bytes()).unwrap();
+        (format!("{key}.{version}.nupkg"), writer.finish().unwrap().into_inner())
+    })
+    .collect()
 }
 
 fn create_cargo_crates(root: &Path) -> HashMap<String, Vec<u8>> {
