@@ -196,6 +196,40 @@ pub async fn registration_response(
     Ok(RegistryResponse::json(200, &document)?)
 }
 
+pub async fn registration_resource_response(
+    config: &Config,
+    provider: &dyn NugetProvider,
+    checker: &dyn MaliciousChecker,
+    package: &str,
+    suffix: &str,
+    now: DateTime<Utc>,
+) -> Result<RegistryResponse, NugetError> {
+    if suffix == "index.json" {
+        return registration_response(config, provider, checker, package, now).await;
+    }
+    let index = provider.fetch_service_index().await?;
+    let base = registration_base(&index)?;
+    let package = normalize_nuget_name(package);
+    let raw = provider
+        .fetch_json(&format!("{base}/{package}/{suffix}"))
+        .await?;
+    let mut root = if raw.get("catalogEntry").is_some() {
+        serde_json::json!({"items":[{"items":[raw]}]})
+    } else {
+        serde_json::json!({"items":[raw]})
+    };
+    filter_registration(config, checker, &package, &mut root, now).await?;
+    rewrite_registration_urls(config, &package, &mut root);
+    let result = root["items"][0]["items"].clone();
+    if suffix.ends_with(".json")
+        && !suffix.contains("page/")
+        && result.as_array().is_some_and(|items| items.len() == 1)
+    {
+        return Ok(RegistryResponse::json(200, &result[0])?);
+    }
+    Ok(RegistryResponse::json(200, &root["items"][0])?)
+}
+
 async fn hydrate_registration_pages(
     provider: &dyn NugetProvider,
     document: &mut Value,

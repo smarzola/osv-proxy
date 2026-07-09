@@ -109,7 +109,7 @@ For every completed milestone:
 
 - [x] Milestone 0: NuGet V3 research and restore contract
 - [x] Milestone 1: NuGet ecosystem, config, OSV, and CLI foundations
-- [ ] Milestone 2: Service index and registration filtering
+- [x] Milestone 2: Service index and registration filtering
 - [ ] Milestone 3: Flat-container and package enforcement
 - [ ] Milestone 4: Real .NET restore, docs, and regression
 
@@ -205,6 +205,14 @@ cargo test cli
 cargo test malicious
 cargo fmt --check
 ```
+
+Status (2026-07-09): Complete. The proxy service index advertises only owned
+registration and flat-container resources. Registration roots hydrate bounded
+upstream pages, filter every leaf by publication time and policy, recompute
+counts, and rewrite package-content and registration URLs. Proxy-owned root,
+page, and leaf routes filter their returned document before serialization.
+Verified with `cargo test nuget::tests`, `cargo fmt --check`, `cargo clippy
+--all-targets --all-features -- -D warnings`, and `git diff --check` (pass).
 
 Status (2026-07-09): Complete. Added the `NuGet` OSV ecosystem, strict
 `upstreams.nuget.service_index_url` configuration (defaulting to nuget.org),

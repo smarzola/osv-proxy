@@ -282,11 +282,18 @@ async fn route_http_request_with_accept_and_headers(
             .unwrap_or_else(|err| simple_response(502, &err.to_string()))
             .into_http_response();
     }
-    if let Some(package) = parse_nuget_registration_route(path) {
-        return nuget::registration_response(config, &nuget_upstream, checker, &package, now)
-            .await
-            .unwrap_or_else(|err| simple_response(502, &err.to_string()))
-            .into_http_response();
+    if let Some((package, suffix)) = parse_nuget_registration_route(path) {
+        return nuget::registration_resource_response(
+            config,
+            &nuget_upstream,
+            checker,
+            &package,
+            &suffix,
+            now,
+        )
+        .await
+        .unwrap_or_else(|err| simple_response(502, &err.to_string()))
+        .into_http_response();
     }
     if let Some(package) = parse_nuget_flat_index_route(path) {
         return nuget::flat_container_index_response(
@@ -448,15 +455,17 @@ enum PypiRoute {
     },
 }
 
-fn parse_nuget_registration_route(path: &str) -> Option<String> {
+fn parse_nuget_registration_route(path: &str) -> Option<(String, String)> {
     let rest = path
         .split('?')
         .next()
         .unwrap_or(path)
         .strip_prefix("/nuget/v3/registration-semver2/")?;
-    let package = rest.strip_suffix("/index.json")?;
-    (!package.is_empty() && !package.contains('/'))
-        .then(|| crate::artifact::normalize_nuget_name(package))
+    let mut segments = rest.split('/');
+    let package = segments.next()?;
+    let suffix = segments.collect::<Vec<_>>().join("/");
+    (!package.is_empty() && !suffix.is_empty() && suffix.ends_with(".json"))
+        .then(|| (crate::artifact::normalize_nuget_name(package), suffix))
 }
 
 fn parse_nuget_flat_artifact_route(path: &str) -> Option<(String, String, String)> {
