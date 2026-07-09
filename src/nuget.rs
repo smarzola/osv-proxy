@@ -5,6 +5,7 @@ use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use reqwest::Client;
 use serde_json::Value;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use thiserror::Error;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REGISTRATION_PAGES: usize = 64;
+const REGISTRATION_PAGE_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct NugetClient {
@@ -88,6 +90,8 @@ pub async fn lookup_artifact(
             package
         ))
         .await?;
+    let mut root = root;
+    hydrate_registration_pages(provider, &mut root).await?;
     let leaf = find_leaf(provider, &root, &version).await?;
     let catalog = leaf.get("catalogEntry").unwrap_or(&leaf);
     let published_at = catalog
@@ -116,7 +120,7 @@ pub async fn lookup_artifact(
 }
 
 async fn find_leaf(
-    provider: &dyn NugetProvider,
+    _provider: &dyn NugetProvider,
     root: &Value,
     version: &str,
 ) -> Result<Value, NugetError> {
@@ -125,13 +129,7 @@ async fn find_leaf(
         .and_then(Value::as_array)
         .ok_or_else(|| NugetError::InvalidMetadata("registration items must be an array".into()))?;
     for item in items {
-        let page = if item.get("items").is_some() {
-            item.clone()
-        } else if let Some(id) = item.get("@id").and_then(Value::as_str) {
-            provider.fetch_json(id).await?
-        } else {
-            continue;
-        };
+        let page = item;
         if let Some(leaves) = page.get("items").and_then(Value::as_array)
             && let Some(leaf) = leaves.iter().find(|leaf| {
                 leaf.get("catalogEntry")
@@ -244,23 +242,40 @@ async fn hydrate_registration_pages(
             "registration page count exceeds {MAX_REGISTRATION_PAGES}"
         )));
     }
-    for page in pages {
+    let mut requests = Vec::new();
+    for (index, page) in pages.iter().enumerate() {
         if page.get("items").is_none() {
             let id = page
                 .get("@id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| NugetError::InvalidMetadata("registration page has no id".into()))?
-                .to_string();
-            let hydrated = provider.fetch_json(&id).await?;
-            let leaves = hydrated.get("items").cloned().ok_or_else(|| {
-                NugetError::InvalidMetadata("registration page has no items".into())
-            })?;
-            page.as_object_mut()
-                .ok_or_else(|| {
-                    NugetError::InvalidMetadata("registration page is not an object".into())
-                })?
-                .insert("items".into(), leaves);
+                .ok_or_else(|| NugetError::InvalidMetadata("registration page has no id".into()))?;
+            requests.push((index, id.to_string()));
         }
+    }
+    let mut pending = FuturesUnordered::new();
+    let mut next = 0;
+    let mut results = Vec::new();
+    while next < requests.len() || !pending.is_empty() {
+        while next < requests.len() && pending.len() < REGISTRATION_PAGE_CONCURRENCY {
+            let (index, id) = &requests[next];
+            pending.push(async move { (*index, provider.fetch_json(id).await) });
+            next += 1;
+        }
+        let (index, page) = pending.next().await.expect("pending nonempty");
+        results.push((index, page?));
+    }
+    results.sort_by_key(|(index, _)| *index);
+    for (index, hydrated) in results {
+        let leaves = hydrated
+            .get("items")
+            .cloned()
+            .ok_or_else(|| NugetError::InvalidMetadata("registration page has no items".into()))?;
+        pages[index]
+            .as_object_mut()
+            .ok_or_else(|| {
+                NugetError::InvalidMetadata("registration page is not an object".into())
+            })?
+            .insert("items".into(), leaves);
     }
     Ok(())
 }
