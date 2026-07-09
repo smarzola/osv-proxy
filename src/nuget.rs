@@ -190,9 +190,39 @@ pub async fn registration_response(
     let mut document = provider
         .fetch_json(&format!("{base}/{package}/index.json"))
         .await?;
+    hydrate_registration_pages(provider, &mut document).await?;
     filter_registration(config, checker, &package, &mut document, now).await?;
     rewrite_registration_urls(config, &package, &mut document);
     Ok(RegistryResponse::json(200, &document)?)
+}
+
+async fn hydrate_registration_pages(
+    provider: &dyn NugetProvider,
+    document: &mut Value,
+) -> Result<(), NugetError> {
+    let pages = document
+        .get_mut("items")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| NugetError::InvalidMetadata("registration items must be an array".into()))?;
+    for page in pages {
+        if page.get("items").is_none() {
+            let id = page
+                .get("@id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| NugetError::InvalidMetadata("registration page has no id".into()))?
+                .to_string();
+            let hydrated = provider.fetch_json(&id).await?;
+            let leaves = hydrated.get("items").cloned().ok_or_else(|| {
+                NugetError::InvalidMetadata("registration page has no items".into())
+            })?;
+            page.as_object_mut()
+                .ok_or_else(|| {
+                    NugetError::InvalidMetadata("registration page is not an object".into())
+                })?
+                .insert("items".into(), leaves);
+        }
+    }
+    Ok(())
 }
 
 pub async fn flat_container_index_response(
@@ -208,6 +238,7 @@ pub async fn flat_container_index_response(
     let mut document = provider
         .fetch_json(&format!("{base}/{package}/index.json"))
         .await?;
+    hydrate_registration_pages(provider, &mut document).await?;
     filter_registration(config, checker, &package, &mut document, now).await?;
     let versions = document
         .get("items")
