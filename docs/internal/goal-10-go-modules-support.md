@@ -114,8 +114,8 @@ For every completed milestone:
 
 - [x] Milestone 0: Protocol and performance contract
 - [x] Milestone 1: Go ecosystem, config, OSV, and CLI foundations
-- [ ] Milestone 2: Discovery and metadata filtering
-- [ ] Milestone 3: Immutable module content enforcement
+- [x] Milestone 2: Discovery and metadata filtering
+- [x] Milestone 3: Immutable module content enforcement
 - [ ] Milestone 4: Real Go compatibility, docs, and regression
 
 ## Milestone 0: Protocol and Performance Contract
@@ -207,6 +207,26 @@ cargo test cli
 cargo test malicious
 cargo fmt --check
 ```
+
+Status (2026-07-09): Complete. `.mod` and `.zip` routes first retrieve trusted
+`.info`, rebuild the canonical Go artifact, and evaluate current policy before
+artifact delivery; denied direct requests receive policy JSON with terminal
+403. Allowed content uses the established redirect/proxy delivery path without
+changing bytes or weakening forwarded cache/range headers. Invalid module and
+version components, traversal, and unsupported suffixes are rejected before
+upstream URL construction. Ran `cargo test go_modules`, `cargo test artifacts`,
+`cargo test server`, and `cargo fmt --check`; the sandbox blocks loopback
+listeners, so server/artifact proxy fixtures require host-mode verification.
+
+Status (2026-07-09): Complete. Added the `/go/<module>/@v/list`, `@latest`,
+and version `.info` adapter routes. Discovery evaluates each candidate's trusted
+`.info` timestamp before exposing it, omits denied/missing-metadata entries,
+de-duplicates then Go-semver sorts the output, and computes latest from the
+same filtered candidate window. The 256-entry window prevents unbounded list
+fan-out; the current implementation performs those requests serially, which is
+safe but has a known latency cost recorded as a residual risk. Exact `.info`
+requests independently re-evaluate policy and return structured terminal 403.
+Ran `cargo test go_modules`, `cargo check`, and `cargo fmt --check` successfully.
 
 Status (2026-07-09): Complete. Added the case-sensitive `Go` ecosystem,
 `upstreams.go.proxy_url` (defaulting to `https://proxy.golang.org`), Go

@@ -344,4 +344,18 @@ mod tests {
             Ordering::Equal
         );
     }
+
+    #[test]
+    fn go_modules_parse_proxy_routes() {
+        let (module, route) = parse_route("/go/GitHub.com/Acme/Thing/@v/v2.0.0.mod").unwrap();
+        assert_eq!(module, "GitHub.com/Acme/Thing");
+        assert!(matches!(
+            route,
+            GoRoute::Content {
+                extension: "mod",
+                ..
+            }
+        ));
+        assert!(parse_route("/go/example.com/../bad/@v/list").is_none());
+    }
 }

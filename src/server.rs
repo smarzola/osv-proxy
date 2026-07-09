@@ -1,5 +1,6 @@
 use crate::artifacts::{ArtifactDeliveryClient, ArtifactDeliveryOptions};
 use crate::config::{Config, LocalOsvConfig, OsvSource};
+use crate::go::{self, GoProxyClient};
 use crate::malicious::{
     HttpOsvDumpClient, MaliciousChecker, OsvDumpClient, configured_malicious_checker,
     sync_malicious,
@@ -124,7 +125,22 @@ pub async fn route_request_with_accept(
 ) -> RegistryResponse {
     let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
     let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
+    let go_upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
     let checker = configured_malicious_checker(config);
+    if let Some((module, route)) = go::parse_route(path) {
+        let delivery = ArtifactDeliveryClient::new();
+        return go::route_response(
+            config,
+            &go_upstream,
+            checker.as_ref(),
+            &module,
+            route,
+            Utc::now(),
+            Some(ArtifactDeliveryOptions::new(&delivery)),
+        )
+        .await
+        .unwrap_or_else(|err| go_error_response(&err));
+    }
     return route_request_with_dependencies(
         config,
         method,
@@ -169,6 +185,21 @@ pub async fn route_request_with_upstreams(
     npm_upstream: &dyn NpmMetadataProvider,
     pypi_upstream: &dyn PypiSimpleProvider,
 ) -> RegistryResponse {
+    if let Some((module, route)) = go::parse_route(path) {
+        let delivery = ArtifactDeliveryClient::new();
+        let go_upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
+        return go::route_response(
+            config,
+            &go_upstream,
+            checker,
+            &module,
+            route,
+            Utc::now(),
+            Some(ArtifactDeliveryOptions::new(&delivery)),
+        )
+        .await
+        .unwrap_or_else(|err| go_error_response(&err));
+    }
     route_request_with_dependencies(
         config,
         method,
@@ -258,6 +289,15 @@ async fn route_request_with_dependencies(
     }
 }
 
+fn go_error_response(error: &go::GoError) -> RegistryResponse {
+    let status = match error {
+        go::GoError::UpstreamStatus(404 | 410) => 404,
+        go::GoError::InvalidRoute(_) => 404,
+        _ => 502,
+    };
+    RegistryResponse::json(status, &serde_json::json!({"allowed": false, "reason": "go_upstream_error", "message": error.to_string()})).expect("static Go error response")
+}
+
 async fn route_http_request_with_accept_and_headers(
     config: &Config,
     checker: &dyn MaliciousChecker,
@@ -272,8 +312,26 @@ async fn route_http_request_with_accept_and_headers(
 
     let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
     let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
+    let go_upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
     let delivery = ArtifactDeliveryClient::new();
     let now = Utc::now();
+
+    if let Some((module, route)) = go::parse_route(path) {
+        return go::route_response(
+            config,
+            &go_upstream,
+            checker,
+            &module,
+            route,
+            now,
+            Some(ArtifactDeliveryOptions::with_request_headers(
+                &delivery, headers,
+            )),
+        )
+        .await
+        .unwrap_or_else(|err| go_error_response(&err))
+        .into_http_response();
+    }
 
     match parse_npm_route(path) {
         Some(NpmRoute::Metadata { package }) => {
