@@ -271,6 +271,9 @@ pub enum CargoError {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::malicious::{MaliciousChecker, MaliciousError, MaliciousHit};
+    use async_trait::async_trait;
+    use chrono::Duration as ChronoDuration;
     use std::collections::HashMap;
 
     struct StaticIndex(HashMap<String, String>);
@@ -282,6 +285,15 @@ mod tests {
                 .get(path)
                 .cloned()
                 .ok_or_else(|| CargoError::InvalidIndex("missing fixture".to_string()))
+        }
+    }
+
+    struct CleanChecker;
+
+    #[async_trait]
+    impl MaliciousChecker for CleanChecker {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            Ok(Vec::new())
         }
     }
     #[test]
@@ -303,6 +315,58 @@ mod tests {
         assert_eq!(
             artifact.published_at.unwrap().to_rfc3339(),
             "2024-01-01T00:00:00+00:00"
+        );
+    }
+
+    #[tokio::test]
+    async fn index_filter_preserves_allowed_lines_and_excludes_too_new_versions() {
+        let old = (Utc::now() - ChronoDuration::hours(100)).format("%Y-%m-%dT%H:%M:%SZ");
+        let new = (Utc::now() - ChronoDuration::hours(1)).format("%Y-%m-%dT%H:%M:%SZ");
+        let old_line = format!(
+            "{{\"name\":\"demo\",\"vers\":\"1.0.0\",\"deps\":[],\"cksum\":\"old\",\"yanked\":false,\"pubtime\":\"{old}\",\"x-forward\":true}}"
+        );
+        let new_line = format!(
+            "{{\"name\":\"demo\",\"vers\":\"2.0.0\",\"deps\":[],\"cksum\":\"new\",\"yanked\":true,\"pubtime\":\"{new}\"}}"
+        );
+        let upstream = StaticIndex(HashMap::from([(
+            "de/mo/demo".to_string(),
+            format!("{old_line}\n{new_line}\n"),
+        )]));
+        let response = index_response(
+            &Config::default(),
+            &upstream,
+            &CleanChecker,
+            "demo",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            String::from_utf8(response.body).unwrap(),
+            format!("{old_line}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_index_records_fail_closed() {
+        let upstream = StaticIndex(HashMap::from([(
+            "de/mo/demo".to_string(),
+            "not json\n".to_string(),
+        )]));
+        let error = index_response(
+            &Config::default(),
+            &upstream,
+            &CleanChecker,
+            "demo",
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid Cargo sparse-index record")
         );
     }
 }

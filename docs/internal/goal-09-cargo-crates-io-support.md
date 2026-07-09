@@ -111,7 +111,7 @@ When a milestone is complete:
 
 - [x] Milestone 0: Protocol research and adapter contract
 - [x] Milestone 1: Ecosystem, config, OSV, and CLI foundations
-- [ ] Milestone 2: Sparse index filtering and routing
+- [x] Milestone 2: Sparse index filtering and routing
 - [ ] Milestone 3: Crate artifact delivery and policy recheck
 - [ ] Milestone 4: Real Cargo compatibility, docs, and regression
 
@@ -213,6 +213,21 @@ cargo test cli
 cargo test malicious
 cargo fmt --check
 ```
+
+Status note 2026-07-09:
+
+- Implemented the `/cargo/` sparse surface: a read-only `config.json`, canonical
+  path validation, upstream sparse record retrieval, deterministic JSON-lines
+  filtering, and fail-closed malformed-record errors. Retained lines are emitted
+  byte-for-byte with their original ordering and forward-compatible fields.
+- `pubtime` drives the existing minimum-age policy; absent `pubtime` reaches the
+  configured missing-time behavior. The adapter has no metadata cache and
+  performs bounded sequential policy work.
+- Commands run outside the listener-restricted sandbox: `cargo test cargo`
+  passed (6 tests) and `cargo fmt --check` passed. `cargo test server --
+  --test-threads=1` passed 25/26 tests; the sole failure is the existing
+  time-relative PyPI local-mode expectation that assumes a too-young fixture
+  remains blocked after its timestamp ages past the configured gate.
 
 Status note 2026-07-09:
 
