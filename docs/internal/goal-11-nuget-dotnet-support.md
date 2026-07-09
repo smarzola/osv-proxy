@@ -107,11 +107,11 @@ For every completed milestone:
 4. Commit code, tests, docs, and status update together.
 5. Record and report the commit hash before continuing.
 
-- [ ] Milestone 0: NuGet V3 research and restore contract
-- [ ] Milestone 1: NuGet ecosystem, config, OSV, and CLI foundations
-- [ ] Milestone 2: Service index and registration filtering
-- [ ] Milestone 3: Flat-container and package enforcement
-- [ ] Milestone 4: Real .NET restore, docs, and regression
+- [x] Milestone 0: NuGet V3 research and restore contract
+- [x] Milestone 1: NuGet ecosystem, config, OSV, and CLI foundations
+- [x] Milestone 2: Service index and registration filtering
+- [x] Milestone 3: Flat-container and package enforcement
+- [x] Milestone 4: Real .NET restore, docs, and regression
 
 ## Milestone 0: NuGet V3 Research and Restore Contract
 
@@ -145,6 +145,25 @@ Verification:
 ```bash
 git diff --check
 ```
+
+Status (2026-07-09): Complete. Inspected the Microsoft Learn service-index,
+registration-base-url, package-base-address, and package-versioning references,
+plus nuget.org's documented V3 index and observed `Newtonsoft.Json` restore
+graph. The proxy will advertise only `RegistrationsBaseUrl/3.6.0` at
+`/nuget/v3/registration-semver2/` and `PackageBaseAddress/3.0.0` at
+`/nuget/v3/flatcontainer/`; the service index is `/nuget/v3/index.json`.
+Registration index/page/leaf `@id`, `catalogEntry`, and `packageContent` links
+are rewritten to those surfaces. Flat-container index, `.nupkg`, and `.nuspec`
+use lower-invariant package IDs and normalized, lowercased versions. NuGet
+normalization removes leading zeroes, a zero fourth component, and SemVer 2
+build metadata; prerelease labels compare case-insensitively. Registration
+`published` is the age timestamp. nuget.org's `1900-01-01T00:00:00Z` unlisted
+sentinel is treated as missing publication time, never as an old allowed
+release. Flat-container discovery fetches one registration index and at most
+one page per version-list page (with a fixed bound) before policy evaluation;
+unsupported registration shapes fail closed. A policy denial is `403`; missing
+resources are `404`; malformed/upstream metadata is a deterministic `502`.
+Verified with `git diff --check` (pass).
 
 ## Milestone 1: NuGet Ecosystem, Config, OSV, and CLI Foundations
 
@@ -186,6 +205,29 @@ cargo test cli
 cargo test malicious
 cargo fmt --check
 ```
+
+Status (2026-07-09): Complete. Flat-container indexes are derived from filtered
+registration leaves and direct `.nupkg`/`.nuspec` requests re-evaluate policy
+before redirect or streaming delivery. Verified with focused NuGet unit tests
+and real-client redirect/proxy restore tests.
+
+Status (2026-07-09): Complete. The proxy service index advertises only owned
+registration and flat-container resources. Registration roots hydrate bounded
+upstream pages, filter every leaf by publication time and policy, recompute
+counts, and rewrite package-content and registration URLs. Proxy-owned root,
+page, and leaf routes filter their returned document before serialization.
+Verified with `cargo test nuget::tests`, `cargo fmt --check`, `cargo clippy
+--all-targets --all-features -- -D warnings`, and `git diff --check` (pass).
+
+Status (2026-07-09): Complete. Added the `NuGet` OSV ecosystem, strict
+`upstreams.nuget.service_index_url` configuration (defaulting to nuget.org),
+case-insensitive package ID normalization, and NuGet V3 version normalization
+for CLI identities, policy lists, URLs, and local storage. `check
+nuget:<id>@<version>` resolves a registration leaf and uses its publication
+timestamp; `eval` accepts the same identity. Local malicious sync now imports
+the canonical NuGet dump alongside npm and PyPI. Verified with `cargo test
+artifact::tests`, `cargo test config::tests`, `cargo test cli::tests`, `cargo
+test malicious::tests`, `cargo fmt --check`, and `git diff --check` (all pass).
 
 ## Milestone 2: Service Index and Registration Filtering
 
@@ -303,6 +345,12 @@ cargo run -- config validate --config examples/basic/osv-proxy.yaml
 git diff --check
 ```
 
+Status (2026-07-09): Complete. CI pins .NET SDK 8.0.128. Hermetic actual-listener
+tests use a local V3 upstream and only the proxy source, covering dependency
+restore, redirect and proxy delivery, fresh block, locked newly-blocked restore,
+and an explicit prerelease. Final verification commands are recorded in the
+checkpoint commit.
+
 ## Final Response Required
 
 Report:
@@ -314,4 +362,3 @@ Report:
 - supported V3 resources and remaining interoperability/performance risks;
 - confirmation that no merge, version bump, tag, release, publishing/search
   implementation, or edits to another ecosystem goal prompt were made.
-

@@ -7,6 +7,7 @@ use crate::malicious::{
     sync_malicious,
 };
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
+use crate::nuget::{self, NugetClient};
 use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
 use crate::response::RegistryResponse;
 use async_trait::async_trait;
@@ -327,6 +328,22 @@ fn go_error_response(error: &go::GoError) -> RegistryResponse {
     RegistryResponse::json(status, &serde_json::json!({"allowed": false, "reason": "go_upstream_error", "message": error.to_string()})).expect("static Go error response")
 }
 
+fn nuget_error_response(error: crate::nuget::NugetError) -> RegistryResponse {
+    let status = match &error {
+        crate::nuget::NugetError::VersionNotFound(_) => 404,
+        crate::nuget::NugetError::Upstream(error)
+            if matches!(
+                error.status().map(|status| status.as_u16()),
+                Some(404 | 410)
+            ) =>
+        {
+            404
+        }
+        _ => 502,
+    };
+    RegistryResponse::json(status, &serde_json::json!({"allowed": false, "reason": "nuget_upstream_error", "message": error.to_string()})).expect("static NuGet error response")
+}
+
 async fn route_http_request_with_accept_and_headers(
     config: &Config,
     checker: &dyn MaliciousChecker,
@@ -344,7 +361,75 @@ async fn route_http_request_with_accept_and_headers(
     let go_upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
     let cargo_upstream = CargoRegistryClient::new(config);
     let delivery = ArtifactDeliveryClient::new();
+    let nuget_upstream = NugetClient::new(&config.upstreams.nuget.service_index_url);
     let now = Utc::now();
+
+    if path.split('?').next().unwrap_or(path) == "/nuget/v3/index.json" {
+        return nuget::service_index_response(config)
+            .unwrap_or_else(|err| simple_response(502, &err.to_string()))
+            .into_http_response();
+    }
+    if let Some((package, suffix)) = parse_nuget_registration_route(path) {
+        return nuget::registration_resource_response(
+            config,
+            &nuget_upstream,
+            checker,
+            &package,
+            &suffix,
+            now,
+        )
+        .await
+        .unwrap_or_else(nuget_error_response)
+        .into_http_response();
+    }
+    if let Some(package) = parse_nuget_flat_index_route(path) {
+        return nuget::flat_container_index_response(
+            config,
+            &nuget_upstream,
+            checker,
+            &package,
+            now,
+        )
+        .await
+        .unwrap_or_else(nuget_error_response)
+        .into_http_response();
+    }
+    if let Some((package, version, filename)) = parse_nuget_flat_artifact_route(path) {
+        let result = async {
+            let artifact = nuget::lookup_artifact(&nuget_upstream, &package, &version).await?;
+            let decision = crate::policy::PolicyEngine::new(config)
+                .evaluate(&artifact, now, checker)
+                .await;
+            if !decision.allowed {
+                return Ok::<_, crate::nuget::NugetError>(
+                    RegistryResponse::json(
+                        403,
+                        &serde_json::to_value(&decision).unwrap_or_default(),
+                    )
+                    .unwrap_or_else(|_| simple_response(403, "policy denied"))
+                    .into_http_response(),
+                );
+            }
+            let mut upstream = artifact.upstream_url.ok_or_else(|| {
+                crate::nuget::NugetError::InvalidMetadata(
+                    "registration leaf has no packageContent".into(),
+                )
+            })?;
+            if filename.ends_with(".nuspec") {
+                upstream = upstream
+                    .rsplit_once('/')
+                    .map(|(base, _)| format!("{base}/{package}.nuspec"))
+                    .unwrap_or(upstream);
+            }
+            Ok(ArtifactDeliveryClient::new()
+                .deliver(config, upstream, Some(headers))
+                .await
+                .map_err(|err| crate::nuget::NugetError::InvalidMetadata(err.to_string()))?
+                .into_http_response())
+        }
+        .await;
+        return result.unwrap_or_else(|err| nuget_error_response(err).into_http_response());
+    }
 
     if let Some((module, route)) = go::parse_route(path) {
         return go::route_response(
@@ -502,6 +587,66 @@ enum PypiRoute {
         version: String,
         filename: String,
     },
+}
+
+fn parse_nuget_registration_route(path: &str) -> Option<(String, String)> {
+    let rest = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .strip_prefix("/nuget/v3/registration-semver2/")?;
+    let mut segments = rest.split('/');
+    let package = segments.next()?;
+    let suffix = segments.collect::<Vec<_>>().join("/");
+    (!package.is_empty() && !suffix.is_empty() && suffix.ends_with(".json"))
+        .then(|| (crate::artifact::normalize_nuget_name(package), suffix))
+}
+fn parse_nuget_flat_artifact_route(path: &str) -> Option<(String, String, String)> {
+    let segments = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .strip_prefix("/nuget/v3/flatcontainer/")?
+        .split('/')
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        [package, version, filename]
+            if !package.is_empty()
+                && !version.is_empty()
+                && crate::artifact::normalize_nuget_version(version)
+                    .ok()
+                    .is_some_and(|normalized| {
+                        *filename
+                            == format!(
+                                "{}.{}.nupkg",
+                                crate::artifact::normalize_nuget_name(package),
+                                normalized
+                            )
+                            || *filename
+                                == format!(
+                                    "{}.nuspec",
+                                    crate::artifact::normalize_nuget_name(package)
+                                )
+                    }) =>
+        {
+            Some((
+                crate::artifact::normalize_nuget_name(package),
+                crate::artifact::normalize_nuget_version(version).ok()?,
+                (*filename).to_string(),
+            ))
+        }
+        _ => None,
+    }
+}
+fn parse_nuget_flat_index_route(path: &str) -> Option<String> {
+    let package = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .strip_prefix("/nuget/v3/flatcontainer/")?
+        .strip_suffix("/index.json")?;
+    (!package.is_empty() && !package.contains('/'))
+        .then(|| crate::artifact::normalize_nuget_name(package))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1933,5 +2078,50 @@ INSERT INTO advisories (
     async fn clean_checker_uses_npm_artifacts() {
         let artifact = Artifact::package(Ecosystem::Npm, "lodash", "4.17.21", None);
         assert_eq!(artifact.identity(), "npm:lodash@4.17.21");
+    }
+
+    #[test]
+    fn nuget_error_mapper_returns_structured_not_found_and_gateway_errors() {
+        let missing = nuget_error_response(crate::nuget::NugetError::VersionNotFound(
+            "demo@1.0.0".into(),
+        ));
+        assert_eq!(missing.status, 404);
+        let missing_body: Value = serde_json::from_slice(&missing.body).unwrap();
+        assert_eq!(missing_body["reason"], "nuget_upstream_error");
+        assert_eq!(missing_body["allowed"], false);
+
+        let malformed = nuget_error_response(crate::nuget::NugetError::InvalidMetadata(
+            "bad fixture".into(),
+        ));
+        assert_eq!(malformed.status, 502);
+        let malformed_body: Value = serde_json::from_slice(&malformed.body).unwrap();
+        assert_eq!(malformed_body["reason"], "nuget_upstream_error");
+        assert_ne!(malformed.body, b"null");
+    }
+
+    #[tokio::test]
+    async fn nuget_route_preserves_upstream_not_found_as_structured_404() {
+        let (service_url, _request) = serve_http_once(
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+        )
+        .await;
+        let mut config = Config::default();
+        config.upstreams.nuget.service_index_url = service_url;
+        let response = router(config)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/nuget/v3/flatcontainer/demo/index.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["reason"], "nuget_upstream_error");
     }
 }

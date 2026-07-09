@@ -93,6 +93,7 @@ pub struct UpstreamsConfig {
     pub pypi: PypiUpstreamConfig,
     pub go: GoUpstreamConfig,
     pub cargo: CargoUpstreamConfig,
+    pub nuget: NugetUpstreamConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +142,19 @@ impl Default for GoUpstreamConfig {
     fn default() -> Self {
         Self {
             proxy_url: "https://proxy.golang.org".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NugetUpstreamConfig {
+    pub service_index_url: String,
+}
+impl Default for NugetUpstreamConfig {
+    fn default() -> Self {
+        Self {
+            service_index_url: "https://api.nuget.org/v3/index.json".to_string(),
         }
     }
 }

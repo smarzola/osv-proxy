@@ -6,6 +6,7 @@ pub mod config;
 pub mod go;
 pub mod malicious;
 pub mod npm;
+pub mod nuget;
 pub mod policy;
 pub mod pypi;
 pub mod response;

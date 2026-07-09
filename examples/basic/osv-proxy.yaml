@@ -7,6 +7,8 @@ upstreams:
     download_url: "https://static.crates.io/crates"
   go:
     proxy_url: "https://proxy.golang.org"
+  nuget:
+    service_index_url: "https://api.nuget.org/v3/index.json"
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"

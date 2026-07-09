@@ -12,6 +12,7 @@ pub enum Ecosystem {
     Go,
     #[serde(rename = "crates.io")]
     CratesIo,
+    Nuget,
 }
 
 impl Ecosystem {
@@ -21,6 +22,7 @@ impl Ecosystem {
             Ecosystem::Pypi => normalize_pypi_name(name),
             Ecosystem::Go => name.to_string(),
             Ecosystem::CratesIo => normalize_cargo_name(name),
+            Ecosystem::Nuget => normalize_nuget_name(name),
         }
     }
 
@@ -30,6 +32,7 @@ impl Ecosystem {
             Ecosystem::Pypi => "PyPI",
             Ecosystem::Go => "Go",
             Ecosystem::CratesIo => "crates.io",
+            Ecosystem::Nuget => "NuGet",
         }
     }
 }
@@ -41,6 +44,7 @@ impl fmt::Display for Ecosystem {
             Ecosystem::Pypi => write!(f, "pypi"),
             Ecosystem::Go => write!(f, "go"),
             Ecosystem::CratesIo => write!(f, "crates.io"),
+            Ecosystem::Nuget => write!(f, "nuget"),
         }
     }
 }
@@ -54,6 +58,7 @@ impl FromStr for Ecosystem {
             "pypi" | "python" | "python-package" => Ok(Ecosystem::Pypi),
             "go" | "golang" | "go-module" => Ok(Ecosystem::Go),
             "crates.io" | "cargo" | "crates-io" => Ok(Ecosystem::CratesIo),
+            "nuget" | "nuget.org" | "dotnet" => Ok(Ecosystem::Nuget),
             other => Err(ArtifactParseError::UnsupportedEcosystem(other.to_string())),
         }
     }
@@ -146,7 +151,7 @@ pub fn parse_package_identity(value: &str) -> Result<PackageIdentity, ArtifactPa
     Ok(PackageIdentity {
         ecosystem,
         name: ecosystem.normalize_name(name),
-        version: version.to_string(),
+        version: normalize_version(ecosystem, version)?,
     })
 }
 
@@ -171,12 +176,71 @@ pub fn normalize_cargo_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+pub fn normalize_nuget_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
+
+/// Normalizes the NuGet identity form used by V3 URLs and OSV. NuGet accepts
+/// one to four numeric components, strips build metadata, and treats a trailing
+/// zero revision as absent.
+pub fn normalize_nuget_version(value: &str) -> Result<String, ArtifactParseError> {
+    let value_without_build = value.split_once('+').map_or(value, |(base, _)| base);
+    let (core, prerelease) = value
+        .split_once('+')
+        .map_or(value, |(base, _)| base)
+        .split_once('-')
+        .map_or((value_without_build, None), |(a, b)| (a, Some(b)));
+    let mut parts = core
+        .split('.')
+        .map(|part| {
+            (!part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+                .then(|| part.parse::<u64>().ok())
+                .flatten()
+                .ok_or_else(|| ArtifactParseError::InvalidNugetVersion(value.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if parts.is_empty() || parts.len() > 4 {
+        return Err(ArtifactParseError::InvalidNugetVersion(value.to_string()));
+    }
+    while parts.len() < 3 {
+        parts.push(0);
+    }
+    if parts.len() == 4 && parts[3] == 0 {
+        parts.pop();
+    }
+    let mut normalized = parts
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    if let Some(prerelease) = prerelease {
+        if prerelease.is_empty()
+            || !prerelease
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-')
+        {
+            return Err(ArtifactParseError::InvalidNugetVersion(value.to_string()));
+        }
+        normalized.push('-');
+        normalized.push_str(&prerelease.to_ascii_lowercase());
+    }
+    Ok(normalized)
+}
+
+fn normalize_version(ecosystem: Ecosystem, value: &str) -> Result<String, ArtifactParseError> {
+    match ecosystem {
+        Ecosystem::Nuget => normalize_nuget_version(value),
+        _ => Ok(value.to_string()),
+    }
+}
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ArtifactParseError {
     #[error("unsupported ecosystem: {0}")]
     UnsupportedEcosystem(String),
     #[error("expected package identity in the form ecosystem:name@version: {0}")]
     InvalidIdentity(String),
+    #[error("invalid NuGet version: {0}")]
+    InvalidNugetVersion(String),
 }
 
 #[cfg(test)]
@@ -215,5 +279,23 @@ mod tests {
         assert_eq!(artifact.name, "my_crate");
         assert_eq!(artifact.identity(), "crates.io:my_crate@1.0.0");
         assert_eq!(artifact.ecosystem.osv_name(), "crates.io");
+    }
+
+    #[test]
+    fn normalizes_nuget_identity_and_version() {
+        let artifact = parse_identity("nuget:Newtonsoft.Json@01.00.0.0-RC.1+build", None).unwrap();
+        assert_eq!(artifact.identity(), "nuget:newtonsoft.json@1.0.0-rc.1");
+    }
+
+    #[test]
+    fn rejects_invalid_nuget_identity_version_without_emptying_it() {
+        assert_eq!(
+            parse_package_identity("nuget:demo@not-a-version").unwrap_err(),
+            ArtifactParseError::InvalidNugetVersion("not-a-version".to_string())
+        );
+        assert_eq!(
+            Artifact::package(Ecosystem::Nuget, "demo", "not-a-version", None).version,
+            "not-a-version"
+        );
     }
 }

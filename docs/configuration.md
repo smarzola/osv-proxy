@@ -56,12 +56,15 @@ upstreams:
     simple_url: "https://pypi.org/simple"
   go:
     proxy_url: "https://proxy.golang.org"
+  nuget:
+    service_index_url: "https://api.nuget.org/v3/index.json"
 ```
 
 - `npm.registry_url`: upstream npm registry metadata endpoint.
 - `pypi.simple_url`: upstream PyPI Simple API endpoint. Project pages are
   fetched as Simple JSON for policy evaluation.
 - `go.proxy_url`: upstream Go module proxy endpoint.
+- `nuget.service_index_url`: upstream NuGet V3 restore service index.
 
 Both upstream values have the public registry defaults shown above, so most
 local configs can omit this section.
