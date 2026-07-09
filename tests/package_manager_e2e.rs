@@ -17,6 +17,7 @@ use zip::{ZipWriter, write::SimpleFileOptions};
 const NPM_PACKAGE: &str = "osv-proxy-e2e-npm";
 const PYPI_PACKAGE: &str = "osv-proxy-e2e-pypi";
 const PYPI_MODULE: &str = "osv_proxy_e2e_pypi";
+const NUGET_ROOT: &str = "Fixture.Root";
 
 #[test]
 fn npm_install_uses_proxy_for_allowed_and_blocked_versions() {
@@ -132,6 +133,25 @@ fn uv_pip_install_uses_proxy_for_allowed_and_blocked_versions() {
         .unwrap();
     assert_failure("uv pip install blocked package", &blocked);
     assert!(!blocked_target.join(PYPI_MODULE).exists());
+}
+
+#[test]
+fn dotnet_restore_uses_redirecting_nuget_proxy_with_dependency() {
+    require_command("dotnet");
+    let workspace = TempWorkspace::new("dotnet-restore-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+    let mut config = Config::default();
+    config.upstreams.nuget.service_index_url = format!("{}/v3/index.json", upstream.base_url());
+    config.policy.osv.block_malicious = false;
+    config.policy.minimum_age = Duration::from_secs(0);
+    let proxy = start_axum_proxy(config);
+    let project = workspace.child("project"); fs::create_dir_all(&project).unwrap();
+    write_file(&project.join("project.csproj"), &format!("<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup><ItemGroup><PackageReference Include=\"{NUGET_ROOT}\" Version=\"1.0.0\" /></ItemGroup></Project>"));
+    write_file(&project.join("NuGet.Config"), &format!("<configuration><packageSources><clear /><add key=\"proxy\" value=\"{}/nuget/v3/index.json\" /></packageSources></configuration>", proxy.base_url()));
+    let output = Command::new("dotnet").args(["restore", "--configfile", "NuGet.Config", "--packages", workspace.child("packages").to_str().unwrap()]).current_dir(&project).output().unwrap();
+    assert_success("dotnet restore through NuGet proxy", &output);
+    assert!(workspace.child("packages/fixture.root/1.0.0").exists());
+    assert!(workspace.child("packages/fixture.dependency/1.0.0").exists());
 }
 
 struct FixtureArtifacts {
@@ -255,7 +275,7 @@ fn fixture_response(
         .unwrap();
     }
     if request.method == "GET" && path == "/v3/index.json" {
-        return RegistryResponse::json(200, &json!({"version":"3.0.0","resources":[{"@id":format!("{base_url}/registration/"),"@type":"RegistrationsBaseUrl/3.6.0"}]})).unwrap();
+        return RegistryResponse::json(200, &json!({"version":"3.0.0","resources":[{"@id":format!("{base_url}/registration/"),"@type":"RegistrationsBaseUrl/3.6.0"},{"@id":format!("{base_url}/flat/"),"@type":"PackageBaseAddress/3.0.0"}]})).unwrap();
     }
     if request.method == "GET" && path.starts_with("/registration/") {
         let id = path
@@ -267,6 +287,9 @@ fn fixture_response(
             ("1.0.0", None)
         };
         return RegistryResponse::json(200, &json!({"items":[{"count":1,"items":[{"catalogEntry":{"version":version,"published":"2020-01-01T00:00:00Z","dependencyGroups":dependency.map(|name| json!([{ "dependencies":[{"id":name,"range":"[1.0.0]"}]}])).unwrap_or(json!([]))},"packageContent":format!("{base_url}/packages/{id}.{version}.nupkg")}]}]})).unwrap();
+    }
+    if request.method == "GET" && path.starts_with("/flat/") && path.ends_with("/index.json") {
+        return RegistryResponse::json(200, &json!({"versions":["1.0.0"]})).unwrap();
     }
     if request.method == "GET" && path.starts_with("/packages/") {
         let name = path.trim_start_matches("/packages/");
