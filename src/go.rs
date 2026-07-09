@@ -14,7 +14,7 @@ use futures_util::{
 };
 use node_semver::Version;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::time::Duration;
 use thiserror::Error;
@@ -24,12 +24,13 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LIST_INFO_CONCURRENCY: usize = 16;
 const LIST_INFO_LIMIT: usize = 256;
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GoInfo {
     #[serde(rename = "Version")]
     pub version: String,
     #[serde(rename = "Time")]
-    pub time: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Error)]
@@ -42,11 +43,16 @@ pub enum GoError {
     UpstreamStatus(u16),
     #[error("invalid Go upstream response: {0}")]
     InvalidResponse(String),
+    #[error("Go version list exceeds supported metadata enrichment bound of {0}")]
+    ListTooLarge(usize),
+    #[error("Go upstream info version {actual} did not match requested version {requested}")]
+    VersionMismatch { requested: String, actual: String },
 }
 
 #[async_trait]
 pub trait GoProxyProvider: Send + Sync {
     async fn list(&self, module: &str) -> Result<Vec<String>, GoError>;
+    async fn latest(&self, module: &str) -> Result<GoInfo, GoError>;
     async fn info(&self, module: &str, version: &str) -> Result<GoInfo, GoError>;
     fn resource_url(&self, module: &str, version: &str, extension: &str)
     -> Result<String, GoError>;
@@ -108,6 +114,16 @@ impl GoProxyProvider for GoProxyClient {
             .await
             .map_err(|err| GoError::InvalidResponse(err.to_string()))
     }
+    async fn latest(&self, module: &str) -> Result<GoInfo, GoError> {
+        let response = self.client.get(self.url(module, "@latest")?).send().await?;
+        if !response.status().is_success() {
+            return Err(GoError::UpstreamStatus(response.status().as_u16()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|err| GoError::InvalidResponse(err.to_string()))
+    }
     fn resource_url(
         &self,
         module: &str,
@@ -123,7 +139,7 @@ impl GoProxyProvider for GoProxyClient {
 }
 
 pub fn artifact(module: &str, info: &GoInfo) -> Artifact {
-    Artifact::package(Ecosystem::Go, module, &info.version, Some(info.time))
+    Artifact::package(Ecosystem::Go, module, &info.version, info.time)
 }
 
 /// Go proxy escaping replaces each ASCII uppercase character with `!` plus its
@@ -199,6 +215,18 @@ pub fn validate_version(version: &str) -> Result<(), GoError> {
     Ok(())
 }
 
+/// OSV's Go records use semver values without Go's leading `v`; the proxy
+/// identity keeps the canonical Go spelling separately.
+pub fn osv_version(version: &str) -> Result<String, GoError> {
+    validate_version(version)?;
+    Ok(version
+        .strip_prefix('v')
+        .unwrap()
+        .strip_suffix("+incompatible")
+        .unwrap_or(version.strip_prefix('v').unwrap())
+        .to_string())
+}
+
 /// Comparison follows Go's canonical semver spelling, treating the permitted
 /// `+incompatible` suffix as metadata. Go pseudo versions are ordinary semver
 /// prereleases and therefore compare correctly with this parser.
@@ -240,17 +268,7 @@ pub async fn route_response(
             })
         }
         GoRoute::Latest => {
-            let selected = filtered_infos(config, upstream, checker, module, now)
-                .await?
-                .into_iter()
-                .max_by(|left, right| {
-                    compare_versions(&left.version, &right.version)
-                        .unwrap_or_else(|_| left.version.cmp(&right.version))
-                });
-            selected.map(|info| RegistryResponse::json(200, &serde_json::json!({"Version": info.version, "Time": info.time.to_rfc3339()})).map_err(|err| GoError::InvalidResponse(err.to_string()))).unwrap_or_else(|| Err(GoError::UpstreamStatus(404)))
-        }
-        GoRoute::Info(version) => {
-            let info = upstream.info(module, version).await?;
+            let info = upstream.latest(module).await?;
             let decision = PolicyEngine::new(config)
                 .evaluate(&artifact(module, &info), now, checker)
                 .await;
@@ -258,14 +276,35 @@ pub async fn route_response(
                 return RegistryResponse::json(403, &serde_json::to_value(decision).unwrap())
                     .map_err(|err| GoError::InvalidResponse(err.to_string()));
             }
-            RegistryResponse::json(
-                200,
-                &serde_json::json!({"Version": info.version, "Time": info.time.to_rfc3339()}),
-            )
-            .map_err(|err| GoError::InvalidResponse(err.to_string()))
+            RegistryResponse::json(200, &serde_json::to_value(info).unwrap())
+                .map_err(|err| GoError::InvalidResponse(err.to_string()))
+        }
+        GoRoute::Info(version) => {
+            let info = upstream.info(module, version).await?;
+            if info.version != version {
+                return Err(GoError::VersionMismatch {
+                    requested: version.into(),
+                    actual: info.version,
+                });
+            }
+            let decision = PolicyEngine::new(config)
+                .evaluate(&artifact(module, &info), now, checker)
+                .await;
+            if !decision.allowed {
+                return RegistryResponse::json(403, &serde_json::to_value(decision).unwrap())
+                    .map_err(|err| GoError::InvalidResponse(err.to_string()));
+            }
+            RegistryResponse::json(200, &serde_json::to_value(info).unwrap())
+                .map_err(|err| GoError::InvalidResponse(err.to_string()))
         }
         GoRoute::Content { version, extension } => {
             let info = upstream.info(module, version).await?;
+            if info.version != version {
+                return Err(GoError::VersionMismatch {
+                    requested: version.into(),
+                    actual: info.version,
+                });
+            }
             let decision = PolicyEngine::new(config)
                 .evaluate(&artifact(module, &info), now, checker)
                 .await;
@@ -298,6 +337,9 @@ async fn filtered_infos(
     now: DateTime<Utc>,
 ) -> Result<Vec<GoInfo>, GoError> {
     let versions = upstream.list(module).await?;
+    if versions.len() > LIST_INFO_LIMIT {
+        return Err(GoError::ListTooLarge(versions.len()));
+    }
     let mut pending = FuturesUnordered::new();
     let mut versions = versions.into_iter().take(LIST_INFO_LIMIT);
     for _ in 0..LIST_INFO_CONCURRENCY {
@@ -319,11 +361,38 @@ async fn filtered_infos(
     if let Some(error) = failed {
         return Err(error);
     }
+    let artifacts = infos
+        .iter()
+        .map(|info| artifact(module, info))
+        .collect::<Vec<_>>();
+    let policy = PolicyEngine::new(config);
+    let selected = artifacts
+        .iter()
+        .enumerate()
+        .filter(|(_, artifact)| policy.should_check_osv(artifact))
+        .map(|(index, artifact)| (index, artifact.clone()))
+        .collect::<Vec<_>>();
+    let checked = selected
+        .iter()
+        .map(|(_, artifact)| artifact.clone())
+        .collect::<Vec<_>>();
+    let results = checker
+        .check_many(&checked)
+        .await
+        .map_err(|err| GoError::InvalidResponse(err.to_string()))?;
+    if results.len() != checked.len() {
+        return Err(GoError::InvalidResponse(
+            "malicious batch result cardinality mismatch".into(),
+        ));
+    }
     let mut allowed = Vec::new();
-    for info in infos {
-        if PolicyEngine::new(config)
-            .evaluate(&artifact(module, &info), now, checker)
-            .await
+    for (index, info) in infos.into_iter().enumerate() {
+        let result = selected
+            .iter()
+            .position(|(original, _)| *original == index)
+            .map(|batch| Ok(results[batch].clone()));
+        if policy
+            .evaluate_with_malicious_result(&artifacts[index], now, result)
             .allowed
         {
             allowed.push(info);
@@ -393,10 +462,15 @@ mod tests {
         async fn info(&self, _: &str, version: &str) -> Result<GoInfo, GoError> {
             Ok(GoInfo {
                 version: version.into(),
-                time: DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
-                    .unwrap()
-                    .with_timezone(&Utc),
+                time: Some(
+                    DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                        .unwrap()
+                        .with_timezone(&Utc),
+                ),
             })
+        }
+        async fn latest(&self, _: &str) -> Result<GoInfo, GoError> {
+            self.info("", "v1.0.1").await
         }
         fn resource_url(
             &self,
@@ -430,6 +504,12 @@ mod tests {
             compare_versions("v2.0.0+incompatible", "v2.0.0").unwrap(),
             Ordering::Equal
         );
+    }
+
+    #[test]
+    fn maps_canonical_go_versions_to_osv_versions() {
+        assert_eq!(osv_version("v1.2.3").unwrap(), "1.2.3");
+        assert_eq!(osv_version("v2.0.0+incompatible").unwrap(), "2.0.0");
     }
 
     #[test]

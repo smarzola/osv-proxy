@@ -96,10 +96,10 @@ impl MaliciousChecker for OsvHttpClient {
             .post(url)
             .json(&OsvQueryRequest {
                 package: OsvPackage {
-                    name: &artifact.name,
-                    ecosystem: artifact.ecosystem.osv_name(),
+                    name: artifact.name.clone(),
+                    ecosystem: artifact.ecosystem.osv_name().to_string(),
                 },
-                version: &artifact.version,
+                version: osv_query_version(artifact),
             })
             .send()
             .await?
@@ -123,10 +123,10 @@ impl MaliciousChecker for OsvHttpClient {
             .iter()
             .map(|artifact| OsvQueryRequest {
                 package: OsvPackage {
-                    name: &artifact.name,
-                    ecosystem: artifact.ecosystem.osv_name(),
+                    name: artifact.name.clone(),
+                    ecosystem: artifact.ecosystem.osv_name().to_string(),
                 },
-                version: &artifact.version,
+                version: osv_query_version(artifact),
             })
             .collect::<Vec<_>>();
         let response = self
@@ -1033,7 +1033,7 @@ ORDER BY a.osv_id
             params![
                 artifact.ecosystem.osv_name(),
                 artifact.name,
-                artifact.version
+                osv_query_version(artifact)
             ],
             |row| {
                 let modified = row
@@ -1198,10 +1198,10 @@ fn range_matches_artifact(
             })
         }
         ("Go", "SEMVER") | ("Go", "ECOSYSTEM") => {
-            go::validate_version(&artifact.version)
+            let version = go::osv_version(&artifact.version)
                 .map_err(|err| range_error(artifact, err.to_string()))?;
             evaluate_range_events(range, artifact, |boundary| {
-                go::compare_versions(&artifact.version, boundary)
+                go::compare_versions(&format!("v{version}"), &format!("v{boundary}"))
                     .map_err(|err| range_error(artifact, err.to_string()))
             })
         }
@@ -1212,6 +1212,14 @@ fn range_matches_artifact(
                 artifact.ecosystem.osv_name()
             ),
         )),
+    }
+}
+
+fn osv_query_version(artifact: &Artifact) -> String {
+    if artifact.ecosystem == Ecosystem::Go {
+        go::osv_version(&artifact.version).unwrap_or_else(|_| artifact.version.clone())
+    } else {
+        artifact.version.clone()
     }
 }
 
@@ -1298,20 +1306,20 @@ fn sqlite_error(error: rusqlite::Error) -> MaliciousError {
 }
 
 #[derive(Debug, Serialize)]
-struct OsvQueryRequest<'a> {
-    package: OsvPackage<'a>,
-    version: &'a str,
+struct OsvQueryRequest {
+    package: OsvPackage,
+    version: String,
 }
 
 #[derive(Debug, Serialize)]
-struct OsvBatchQueryRequest<'a> {
-    queries: Vec<OsvQueryRequest<'a>>,
+struct OsvBatchQueryRequest {
+    queries: Vec<OsvQueryRequest>,
 }
 
 #[derive(Debug, Serialize)]
-struct OsvPackage<'a> {
-    name: &'a str,
-    ecosystem: &'a str,
+struct OsvPackage {
+    name: String,
+    ecosystem: String,
 }
 
 #[derive(Debug, Deserialize)]
