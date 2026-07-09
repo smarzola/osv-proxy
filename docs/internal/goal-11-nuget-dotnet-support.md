@@ -108,7 +108,7 @@ For every completed milestone:
 5. Record and report the commit hash before continuing.
 
 - [x] Milestone 0: NuGet V3 research and restore contract
-- [ ] Milestone 1: NuGet ecosystem, config, OSV, and CLI foundations
+- [x] Milestone 1: NuGet ecosystem, config, OSV, and CLI foundations
 - [ ] Milestone 2: Service index and registration filtering
 - [ ] Milestone 3: Flat-container and package enforcement
 - [ ] Milestone 4: Real .NET restore, docs, and regression
@@ -205,6 +205,16 @@ cargo test cli
 cargo test malicious
 cargo fmt --check
 ```
+
+Status (2026-07-09): Complete. Added the `NuGet` OSV ecosystem, strict
+`upstreams.nuget.service_index_url` configuration (defaulting to nuget.org),
+case-insensitive package ID normalization, and NuGet V3 version normalization
+for CLI identities, policy lists, URLs, and local storage. `check
+nuget:<id>@<version>` resolves a registration leaf and uses its publication
+timestamp; `eval` accepts the same identity. Local malicious sync now imports
+the canonical NuGet dump alongside npm and PyPI. Verified with `cargo test
+artifact::tests`, `cargo test config::tests`, `cargo test cli::tests`, `cargo
+test malicious::tests`, `cargo fmt --check`, and `git diff --check` (all pass).
 
 ## Milestone 2: Service Index and Registration Filtering
 

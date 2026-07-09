@@ -91,6 +91,7 @@ impl Default for ServerConfig {
 pub struct UpstreamsConfig {
     pub npm: NpmUpstreamConfig,
     pub pypi: PypiUpstreamConfig,
+    pub nuget: NugetUpstreamConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +112,20 @@ impl Default for NpmUpstreamConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct PypiUpstreamConfig {
     pub simple_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NugetUpstreamConfig {
+    pub service_index_url: String,
+}
+
+impl Default for NugetUpstreamConfig {
+    fn default() -> Self {
+        Self {
+            service_index_url: "https://api.nuget.org/v3/index.json".to_string(),
+        }
+    }
 }
 
 impl Default for PypiUpstreamConfig {
@@ -297,6 +312,7 @@ impl AllowlistEntry {
         match self.ecosystem {
             Ecosystem::Npm => self.name.clone(),
             Ecosystem::Pypi => normalize_pypi_name(&self.name),
+            Ecosystem::Nuget => self.ecosystem.normalize_name(&self.name),
         }
     }
 }
@@ -316,6 +332,7 @@ impl BlocklistEntry {
         match self.ecosystem {
             Ecosystem::Npm => self.name.clone(),
             Ecosystem::Pypi => normalize_pypi_name(&self.name),
+            Ecosystem::Nuget => self.ecosystem.normalize_name(&self.name),
         }
     }
 }

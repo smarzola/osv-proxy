@@ -346,7 +346,7 @@ pub async fn sync_malicious(
     SqliteMaliciousChecker::initialize(&config.sqlite_path)?;
     let mut connection = open_read_write_connection(&config.sqlite_path)?;
     let mut ecosystems = Vec::new();
-    for ecosystem in [Ecosystem::Npm, Ecosystem::Pypi] {
+    for ecosystem in [Ecosystem::Npm, Ecosystem::Pypi, Ecosystem::Nuget] {
         ecosystems.push(
             sync_ecosystem(
                 &mut connection,
@@ -2103,10 +2103,18 @@ INSERT INTO advisories (
     #[async_trait]
     impl OsvDumpClient for FixtureDumpClient {
         async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, MaliciousError> {
-            self.responses
-                .get(url)
-                .cloned()
-                .ok_or_else(|| MaliciousError::Sync(format!("missing fixture response for {url}")))
+            if let Some(response) = self.responses.get(url) {
+                return Ok(response.clone());
+            }
+            if url == all_zip_url(Ecosystem::Nuget) {
+                return Ok(zip_bytes([]));
+            }
+            if url == modified_id_csv_url(Ecosystem::Nuget) {
+                return Ok(Vec::new());
+            }
+            Err(MaliciousError::Sync(format!(
+                "missing fixture response for {url}"
+            )))
         }
     }
 
