@@ -234,12 +234,22 @@ pub async fn registration_resource_response(
     };
     filter_registration(config, checker, &package, &mut root, now).await?;
     rewrite_registration_urls(config, &package, &mut root);
+    if root
+        .get("items")
+        .and_then(Value::as_array)
+        .is_none_or(Vec::is_empty)
+    {
+        return Err(NugetError::VersionNotFound(suffix.to_string()));
+    }
     let result = root["items"][0]["items"].clone();
     if suffix.ends_with(".json")
         && !suffix.contains("page/")
         && result.as_array().is_some_and(|items| items.len() == 1)
     {
         return Ok(RegistryResponse::json(200, &result[0])?);
+    }
+    if root["items"][0].is_null() {
+        return Err(NugetError::VersionNotFound(suffix.to_string()));
     }
     Ok(RegistryResponse::json(200, &root["items"][0])?)
 }
