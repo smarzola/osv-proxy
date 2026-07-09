@@ -393,6 +393,16 @@ Status note 2026-07-09:
   `cargo test --test package_manager_e2e` (3 passed), `cargo test` (151 unit,
   3 package-manager tests, doctests passed), and config validation passed.
 
+Repair note 2026-07-09:
+
+- Sparse index filtering now batches all OSV-eligible Cargo artifacts into one
+  `check_many` call, validates cardinality, and passes batch failures/missing
+  results to the policy engine so configured fail-closed behavior is preserved.
+- Denied direct Cargo artifacts now serialize the full policy decision with
+  HTTP 403, including `reason`, `rule_id`, `source`, and policy timestamps when
+  present. A proxy-mode regression verifies the direct handler returns that
+  body and never contacts the configured upstream artifact listener.
+
 ## Final Response Required
 
 Report:

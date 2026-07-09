@@ -2,7 +2,7 @@ use crate::artifact::{Artifact, ArtifactHashes, Ecosystem, normalize_cargo_name}
 use crate::artifacts::{ArtifactDeliveryError, ArtifactDeliveryOptions, ArtifactDeliveryResponse};
 use crate::config::Config;
 use crate::malicious::MaliciousChecker;
-use crate::policy::PolicyEngine;
+use crate::policy::{Decision, PolicyEngine};
 use crate::response::RegistryResponse;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -127,21 +127,22 @@ pub async fn index_response(
 ) -> Result<RegistryResponse, CargoError> {
     let name = normalize_cargo_name(name);
     let raw = provider.fetch_index(&sparse_path(&name)?).await?;
-    let mut retained = Vec::new();
+    let mut lines = Vec::new();
+    let mut artifacts = Vec::new();
     for line in raw.lines() {
         if line.trim().is_empty() {
             continue;
         }
         let record = parse_record(line)?;
-        let artifact = record_to_artifact(config, &name, record)?;
-        if PolicyEngine::new(config)
-            .evaluate(&artifact, now, checker)
-            .await
-            .allowed
-        {
-            retained.push(line);
-        }
+        lines.push(line);
+        artifacts.push(record_to_artifact(config, &name, record)?);
     }
+    let decisions = evaluate_artifacts(config, checker, &artifacts, now).await;
+    let retained = lines
+        .into_iter()
+        .zip(decisions)
+        .filter_map(|(line, decision)| decision.allowed.then_some(line))
+        .collect::<Vec<_>>();
     let body = if retained.is_empty() {
         Vec::new()
     } else {
@@ -199,7 +200,7 @@ pub async fn artifact_delivery_response(
         .evaluate(&artifact, now, checker)
         .await;
     if !decision.allowed {
-        return Err(CargoError::Blocked(artifact.identity()));
+        return Err(CargoError::Denied(Box::new(decision)));
     }
     delivery
         .client
@@ -213,6 +214,79 @@ pub async fn artifact_delivery_response(
         )
         .await
         .map_err(CargoError::Delivery)
+}
+
+pub async fn artifact_response(
+    config: &Config,
+    provider: &dyn CargoIndexProvider,
+    checker: &dyn MaliciousChecker,
+    name: &str,
+    version: &str,
+    now: DateTime<Utc>,
+) -> RegistryResponse {
+    let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+    match artifact_delivery_response(
+        config,
+        provider,
+        checker,
+        name,
+        version,
+        now,
+        ArtifactDeliveryOptions::new(&delivery),
+    )
+    .await
+    {
+        Ok(response) => response.into_registry_response().await,
+        Err(error) => error_response(&error),
+    }
+}
+
+async fn evaluate_artifacts(
+    config: &Config,
+    checker: &dyn MaliciousChecker,
+    artifacts: &[Artifact],
+    now: DateTime<Utc>,
+) -> Vec<Decision> {
+    let policy = PolicyEngine::new(config);
+    let indexed = artifacts
+        .iter()
+        .enumerate()
+        .filter(|(_, artifact)| policy.should_check_osv(artifact))
+        .map(|(index, artifact)| (index, artifact.clone()))
+        .collect::<Vec<_>>();
+    let checked = indexed
+        .iter()
+        .map(|(_, artifact)| artifact.clone())
+        .collect::<Vec<_>>();
+    let results = if checked.is_empty() {
+        Ok(Vec::new())
+    } else {
+        match checker.check_many(&checked).await {
+            Ok(results) if results.len() == checked.len() => Ok(results),
+            Ok(results) => Err(format!(
+                "malicious batch returned {} results for {} artifacts",
+                results.len(),
+                checked.len()
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    artifacts
+        .iter()
+        .enumerate()
+        .map(|(index, artifact)| {
+            let result = indexed
+                .iter()
+                .position(|(artifact_index, _)| *artifact_index == index)
+                .map(|batch_index| match &results {
+                    Ok(results) => results.get(batch_index).cloned().ok_or_else(|| {
+                        format!("malicious batch result missing for {}", artifact.identity())
+                    }),
+                    Err(error) => Err(error.clone()),
+                });
+            policy.evaluate_with_malicious_result(artifact, now, result)
+        })
+        .collect()
 }
 
 fn parse_records(raw: &str) -> Result<Vec<IndexRecord>, CargoError> {
@@ -270,11 +344,18 @@ fn record_to_artifact(
 
 pub fn error_response(error: &CargoError) -> RegistryResponse {
     let status = match error {
-        CargoError::Blocked(_) => 403,
+        CargoError::Denied(_) => 403,
         CargoError::VersionNotFound(_) => 404,
         CargoError::Request(_) | CargoError::Delivery(_) => 502,
         _ => 502,
     };
+    if let CargoError::Denied(decision) = error {
+        return RegistryResponse::json(
+            403,
+            &serde_json::to_value(decision).expect("decision should serialize"),
+        )
+        .expect("Cargo denial should serialize");
+    }
     RegistryResponse::json(
         status,
         &serde_json::json!({ "error": "cargo_registry_error", "message": error.to_string() }),
@@ -292,8 +373,8 @@ pub enum CargoError {
     InvalidIndex(String),
     #[error("Cargo crate version not found: {0}")]
     VersionNotFound(String),
-    #[error("Cargo artifact blocked by current policy: {0}")]
-    Blocked(String),
+    #[error("Cargo artifact blocked by current policy")]
+    Denied(Box<Decision>),
     #[error("Cargo artifact delivery failed: {0}")]
     Delivery(ArtifactDeliveryError),
 }
@@ -306,6 +387,9 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Duration as ChronoDuration;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+    use tokio::time::{Duration as TokioDuration, timeout};
 
     struct StaticIndex(HashMap<String, String>);
 
@@ -325,6 +409,24 @@ mod tests {
     impl MaliciousChecker for CleanChecker {
         async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
             Ok(Vec::new())
+        }
+    }
+
+    struct BatchChecker {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MaliciousChecker for BatchChecker {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            panic!("Cargo index filtering must use check_many")
+        }
+        async fn check_many(
+            &self,
+            artifacts: &[Artifact],
+        ) -> Result<Vec<Vec<MaliciousHit>>, MaliciousError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![Vec::new(); artifacts.len()])
         }
     }
     #[test]
@@ -363,20 +465,18 @@ mod tests {
             "de/mo/demo".to_string(),
             format!("{old_line}\n{new_line}\n"),
         )]));
-        let response = index_response(
-            &Config::default(),
-            &upstream,
-            &CleanChecker,
-            "demo",
-            Utc::now(),
-        )
-        .await
-        .unwrap();
+        let checker = BatchChecker {
+            calls: AtomicUsize::new(0),
+        };
+        let response = index_response(&Config::default(), &upstream, &checker, "demo", Utc::now())
+            .await
+            .unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(
             String::from_utf8(response.body).unwrap(),
             format!("{old_line}\n")
         );
+        assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -423,17 +523,28 @@ mod tests {
             versions: vec!["1.0.0".to_string()],
             reason: "fixture".to_string(),
         });
-        let client = crate::artifacts::ArtifactDeliveryClient::new();
-        let result = artifact_delivery_response(
+        config.artifacts.behavior = crate::config::ArtifactBehavior::Proxy;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.upstreams.cargo.download_url =
+            format!("http://{}/not-contacted", listener.local_addr().unwrap());
+        let response = artifact_response(
             &config,
             &upstream,
             &CleanChecker,
             "demo",
             "1.0.0",
             Utc::now(),
-            ArtifactDeliveryOptions::new(&client),
         )
         .await;
-        assert!(matches!(result, Err(CargoError::Blocked(_))));
+        assert_eq!(response.status, 403);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["allowed"], false);
+        assert_eq!(body["reason"], "manually_blocked");
+        assert_eq!(body["rule_id"], "manual:blocklist:demo");
+        assert!(
+            timeout(TokioDuration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
     }
 }
