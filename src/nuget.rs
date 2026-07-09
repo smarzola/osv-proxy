@@ -203,7 +203,7 @@ pub async fn registration_resource_response(
     suffix: &str,
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, NugetError> {
-    if suffix == "index.json" {
+    if suffix == "index.json" || suffix.starts_with("page/") {
         return registration_response(config, provider, checker, package, now).await;
     }
     let index = provider.fetch_service_index().await?;
@@ -460,12 +460,12 @@ fn rewrite_registration_urls(config: &Config, package: &str, document: &mut Valu
         );
     }
     if let Some(items) = document.get_mut("items").and_then(Value::as_array_mut) {
-        for page in items {
+        for (page_index, page) in items.iter_mut().enumerate() {
             if let Some(object) = page.as_object_mut() {
                 object.insert(
                     "@id".into(),
                     Value::String(format!(
-                        "{base}/nuget/v3/registration-semver2/{package}/page.json"
+                        "{base}/nuget/v3/registration-semver2/{package}/page/{page_index}.json"
                     )),
                 );
             }
