@@ -668,7 +668,35 @@ mod tests {
                 .unwrap()
                 .contains("/flatcontainer/demo/1.0.0/")
         );
+        assert!(
+            leaf["registration"]
+                .as_str()
+                .unwrap()
+                .ends_with("/demo/index.json")
+        );
         assert!(!leaf.to_string().contains("https://upstream"));
+    }
+    #[tokio::test]
+    async fn blocked_direct_leaf_is_not_found() {
+        let mut config = Config::default();
+        config.policy.osv.block_malicious = false;
+        config.blocklist.push(crate::config::BlocklistEntry {
+            ecosystem: Ecosystem::Nuget,
+            name: "demo".into(),
+            versions: vec!["1.0.0".into()],
+            reason: "test".into(),
+        });
+        let error = registration_resource_response(
+            &config,
+            &provider(),
+            &Clean,
+            "demo",
+            "1.0.0.json",
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, NugetError::VersionNotFound(_)));
     }
     #[test]
     fn service_index_owns_only_restore_resources() {
