@@ -1,6 +1,6 @@
 # osv-proxy
 
-`osv-proxy` is a package-registry security proxy for npm, PyPI, and Cargo/crates.io that combines
+`osv-proxy` is a package-registry security proxy for npm, PyPI, Cargo/crates.io, and Go modules that combines
 the [OSV vulnerability database](https://osv.dev/) with local policy.
 
 It sits between package managers and public registries, filters package metadata
@@ -25,6 +25,7 @@ Implemented now:
 
 - npm metadata filtering and tarball delivery.
 - PyPI Simple JSON-backed filtering, HTML/JSON responses, and file delivery.
+- Go module proxy filtering for `@v/list`, `@latest`, `.info`, `.mod`, and `.zip`.
 - YAML config loading and validation.
 - `serve`, `check`, `eval`, `config validate`, and `malicious sync`
   commands.
@@ -106,6 +107,19 @@ Use `uv` with the proxy:
 uv pip install --index-url http://127.0.0.1:8080/pypi/simple/ requests
 ```
 
+Use Go modules with the proxy:
+
+```sh
+GOPROXY=http://127.0.0.1:8080/go GONOSUMDB='*' go mod download
+```
+
+For a mandatory policy gate, use a single proxy URL. `GOPROXY` values such as
+`http://127.0.0.1:8080/go,direct` or a second public proxy allow Go to fall
+back after upstream `404`/`410` responses and can bypass this proxy. Keep
+private-module patterns out of `GONOPROXY`/`GOPRIVATE` when the proxy must
+enforce policy. `osv-proxy` returns `403` for policy denials, which Go treats
+as terminal rather than a fallback signal.
+
 ## Check a Package
 
 `check` fetches upstream registry metadata, builds the same canonical artifact
@@ -130,6 +144,7 @@ Package identities use this form:
 npm:lodash@4.17.21
 npm:@babel/core@7.24.0
 pypi:requests@2.32.3
+go:github.com/pkg/errors@v0.9.1
 ```
 
 If upstream metadata is missing or malformed, `check` exits non-zero rather than
@@ -164,7 +179,7 @@ artifacts:
   behavior: redirect
 ```
 
-The npm registry, PyPI Simple API, and OSV API default to their public URLs.
+The npm registry, PyPI Simple API, Go module proxy, and OSV API default to their public URLs.
 Set `upstreams` or `policy.osv.api_url` only when using a mirror, fixture, or
 private gateway.
 

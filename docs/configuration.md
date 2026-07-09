@@ -31,7 +31,7 @@ Validate it with:
 cargo run -- config validate --config examples/basic/osv-proxy.yaml
 ```
 
-The npm registry, PyPI Simple API, and OSV API default to their public URLs.
+The npm registry, PyPI Simple API, Go module proxy, and OSV API default to their public URLs.
 Configure them only when routing through a mirror, fixture, or private gateway.
 
 ## Server
@@ -54,11 +54,14 @@ upstreams:
     registry_url: "https://registry.npmjs.org"
   pypi:
     simple_url: "https://pypi.org/simple"
+  go:
+    proxy_url: "https://proxy.golang.org"
 ```
 
 - `npm.registry_url`: upstream npm registry metadata endpoint.
 - `pypi.simple_url`: upstream PyPI Simple API endpoint. Project pages are
   fetched as Simple JSON for policy evaluation.
+- `go.proxy_url`: upstream Go module proxy endpoint.
 
 Both upstream values have the public registry defaults shown above, so most
 local configs can omit this section.

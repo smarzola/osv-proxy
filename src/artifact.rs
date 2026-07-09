@@ -9,6 +9,7 @@ use thiserror::Error;
 pub enum Ecosystem {
     Npm,
     Pypi,
+    Go,
     #[serde(rename = "crates.io")]
     CratesIo,
 }
@@ -18,6 +19,7 @@ impl Ecosystem {
         match self {
             Ecosystem::Npm => name.to_string(),
             Ecosystem::Pypi => normalize_pypi_name(name),
+            Ecosystem::Go => name.to_string(),
             Ecosystem::CratesIo => normalize_cargo_name(name),
         }
     }
@@ -26,6 +28,7 @@ impl Ecosystem {
         match self {
             Ecosystem::Npm => "npm",
             Ecosystem::Pypi => "PyPI",
+            Ecosystem::Go => "Go",
             Ecosystem::CratesIo => "crates.io",
         }
     }
@@ -36,6 +39,7 @@ impl fmt::Display for Ecosystem {
         match self {
             Ecosystem::Npm => write!(f, "npm"),
             Ecosystem::Pypi => write!(f, "pypi"),
+            Ecosystem::Go => write!(f, "go"),
             Ecosystem::CratesIo => write!(f, "crates.io"),
         }
     }
@@ -48,6 +52,7 @@ impl FromStr for Ecosystem {
         match value.to_ascii_lowercase().as_str() {
             "npm" => Ok(Ecosystem::Npm),
             "pypi" | "python" | "python-package" => Ok(Ecosystem::Pypi),
+            "go" | "golang" | "go-module" => Ok(Ecosystem::Go),
             "crates.io" | "cargo" | "crates-io" => Ok(Ecosystem::CratesIo),
             other => Err(ArtifactParseError::UnsupportedEcosystem(other.to_string())),
         }

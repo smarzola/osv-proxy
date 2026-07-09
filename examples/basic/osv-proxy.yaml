@@ -5,6 +5,8 @@ upstreams:
   cargo:
     sparse_index_url: "https://index.crates.io"
     download_url: "https://static.crates.io/crates"
+  go:
+    proxy_url: "https://proxy.golang.org"
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"

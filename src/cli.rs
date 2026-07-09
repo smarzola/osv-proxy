@@ -1,6 +1,7 @@
 use crate::artifact::{Artifact, Ecosystem, parse_identity, parse_package_identity};
 use crate::cargo::{CargoIndexProvider, CargoRegistryClient};
 use crate::config::Config;
+use crate::go::{self, GoProxyClient, GoProxyProvider};
 use crate::malicious::{
     HttpOsvDumpClient, MaliciousChecker, configured_malicious_checker, sync_malicious,
 };
@@ -198,6 +199,13 @@ async fn registry_check_with_upstreams(
         Ecosystem::Pypi => {
             crate::pypi::lookup_artifacts(config, pypi_upstream, &identity.name, &identity.version)
                 .await?
+        }
+        Ecosystem::Go => {
+            let upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
+            vec![go::artifact(
+                &identity.name,
+                &upstream.info(&identity.name, &identity.version).await?,
+            )]
         }
         Ecosystem::CratesIo => vec![
             crate::cargo::lookup_artifact(

@@ -112,11 +112,11 @@ For every completed milestone:
 4. Commit implementation, tests, docs, and the status note together.
 5. Record and report the commit hash before continuing.
 
-- [ ] Milestone 0: Protocol and performance contract
-- [ ] Milestone 1: Go ecosystem, config, OSV, and CLI foundations
-- [ ] Milestone 2: Discovery and metadata filtering
-- [ ] Milestone 3: Immutable module content enforcement
-- [ ] Milestone 4: Real Go compatibility, docs, and regression
+- [x] Milestone 0: Protocol and performance contract
+- [x] Milestone 1: Go ecosystem, config, OSV, and CLI foundations
+- [x] Milestone 2: Discovery and metadata filtering
+- [x] Milestone 3: Immutable module content enforcement
+- [x] Milestone 4: Real Go compatibility, docs, and regression
 
 ## Milestone 0: Protocol and Performance Contract
 
@@ -148,6 +148,27 @@ Verification:
 ```bash
 git diff --check
 ```
+
+Status (2026-07-09): Complete. Inspected the Go module proxy and module-path
+specification and fetched `proxy.golang.org/github.com/pkg/errors` responses:
+`@v/list` is newline-delimited versions with no timestamps; `@latest` and
+`@v/v0.9.1.info` are `{ "Version", "Time" }` JSON; `.mod` is text and `.zip`
+is `application/zip`. The adapter will use Go's `!` uppercase escaping on each
+path segment and version, reject decoded traversal/non-canonical request
+components, and retain Go module paths case-sensitively. `GET /go/<module>/@v/list`
+will fetch a bounded prefix of at most 256 list entries, then concurrently fetch
+their `.info` metadata with a semaphore bound of 16 and a 5-second request
+timeout. It will evaluate entries after collecting results, sort by Go-semver
+order, de-duplicate exact versions, and fail closed for an incomplete selected
+window; older pages are intentionally not advertised without a metadata cache.
+`@latest` derives from exactly that filtered set. A direct `.info`, `.mod`, or
+`.zip` obtains trusted `.info`, re-evaluates policy, and returns structured
+`403` on denial; only upstream `404`/`410` permit GOPROXY fallback. `.mod` and
+`.zip` responses are redirected or streamed byte-for-byte with upstream
+content headers, preserving `go.sum` checksum assumptions. Ran `git diff
+--check` successfully. Local Go is available at `/opt/homebrew/bin/go` despite
+the initial prompt snapshot stating otherwise; real-client tests will therefore
+run locally as well as in CI.
 
 ## Milestone 1: Go Ecosystem, Config, OSV, and CLI Foundations
 
@@ -186,6 +207,43 @@ cargo test cli
 cargo test malicious
 cargo fmt --check
 ```
+
+Status (2026-07-09): Complete. `.mod` and `.zip` routes first retrieve trusted
+`.info`, rebuild the canonical Go artifact, and evaluate current policy before
+artifact delivery; denied direct requests receive policy JSON with terminal
+403. Allowed content uses the established redirect/proxy delivery path without
+changing bytes or weakening forwarded cache/range headers. Invalid module and
+version components, traversal, and unsupported suffixes are rejected before
+upstream URL construction. Ran `cargo test go_modules`, `cargo test artifacts`,
+`cargo test server`, and `cargo fmt --check`; the sandbox blocks loopback
+listeners, so server/artifact proxy fixtures require host-mode verification.
+Focused coverage confirms a blocked direct ZIP is denied before the delivery
+client can contact its URL; allowed responses retain redirect/proxy byte
+delivery. Ran `cargo test go_modules`, `cargo test artifacts`, `cargo test
+server`, and `cargo fmt --check` successfully in host mode.
+
+Status (2026-07-09): Complete. Added the `/go/<module>/@v/list`, `@latest`,
+and version `.info` adapter routes. Discovery evaluates each candidate's trusted
+`.info` timestamp before exposing it, omits denied/missing-metadata entries,
+de-duplicates then Go-semver sorts the output, and computes latest from the
+same filtered candidate window. The 256-entry window prevents unbounded list
+fan-out; `.info` enrichment uses at most 16 in-flight requests and preserves a
+deterministic sorted/de-duplicated response after collection. A single `.info`
+failure fails the whole discovery response closed. Exact `.info`
+requests independently re-evaluate policy and return structured terminal 403.
+Ran `cargo test go_modules`, `cargo test server`, `cargo check --offline`, and
+`cargo fmt --check` successfully. Also fixed the PyPI local-policy test's stale
+wall-clock fixture by giving that test an explicit age gap.
+
+Status (2026-07-09): Complete. Added the case-sensitive `Go` ecosystem,
+`upstreams.go.proxy_url` (defaulting to `https://proxy.golang.org`), Go
+identities for `check` and `eval`, Go OSV API names, and independent local-dump
+sync state. The dedicated adapter validates and escapes module paths, accepts
+canonical `v` versions including pseudo versions and `+incompatible`, and uses
+Go-semver comparison for observed `SEMVER`/`ECOSYSTEM` local range records.
+Existing `cargo test config`, `cargo test cli`, and all non-listener malicious
+tests passed; listener-based tests need the host execution mode because this
+sandbox denies loopback binds. `cargo fmt --check` passed.
 
 ## Milestone 2: Discovery and Metadata Filtering
 
@@ -302,6 +360,20 @@ git diff --check
 
 ## Final Response Required
 
+Status (2026-07-09): Complete. Added a hermetic Go-client integration test that
+builds a local module-proxy fixture, runs `go mod download` through
+`GOPROXY=<local>/go`, uses `GOSUMDB=off`/`GONOSUMDB=*`, and verifies `go.sum`
+creation without Git, public registries, OSV, or sum.golang.org. CI installs Go
+1.24 before `cargo test --locked`, so this coverage cannot be silently omitted.
+README, client configuration, configuration reference, and registry behavior
+now document Go support plus the mandatory-gate warning: a single `GOPROXY`
+value is required because `,direct`, another proxy, `GONOPROXY`, or `GOPRIVATE`
+can bypass a gate after fallback-eligible upstream errors. Policy denials use
+terminal 403. Ran `cargo fmt --check`, `cargo test --offline` (148 unit and 3
+integration tests), `cargo clippy --offline --all-targets --all-features -- -D
+warnings`, `cargo run --offline -- config validate --config
+examples/basic/osv-proxy.yaml`, and `git diff --check` successfully.
+
 Report:
 
 - target state achieved or gaps;
@@ -311,4 +383,3 @@ Report:
 - measured/bounded list-enrichment behavior and remaining performance risks;
 - confirmation that no merge, version bump, tag, release, Git implementation,
   or edits to another ecosystem goal prompt were made.
-

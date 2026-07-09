@@ -922,6 +922,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "futures-util",
  "humantime",
  "node-semver",
  "pep440_rs",

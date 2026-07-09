@@ -5,6 +5,7 @@ use osv_proxy::server;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Cursor;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -12,10 +13,84 @@ use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use zip::ZipWriter;
+use zip::write::SimpleFileOptions;
 
 const NPM_PACKAGE: &str = "osv-proxy-e2e-npm";
 const PYPI_PACKAGE: &str = "osv-proxy-e2e-pypi";
 const PYPI_MODULE: &str = "osv_proxy_e2e_pypi";
+const GO_MODULE: &str = "example.com/fixture";
+
+#[test]
+fn go_mod_download_uses_hermetic_proxy() {
+    require_command("go");
+    let workspace = TempWorkspace::new("go-mod-download-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+    let proxy = start_proxy(upstream.base_url());
+    let project = workspace.child("go-client");
+    fs::create_dir_all(&project).unwrap();
+    write_file(
+        &project.join("go.mod"),
+        "module client.example/test\n\ngo 1.24\n\nrequire example.com/fixture v1.0.0\n",
+    );
+    let output = Command::new("go")
+        .arg("mod")
+        .arg("download")
+        .arg("example.com/fixture")
+        .current_dir(&project)
+        .env("GOPROXY", format!("{}/go", proxy.base_url()))
+        .env("GOSUMDB", "off")
+        .env("GONOSUMDB", "*")
+        .env("GONOPROXY", "")
+        .env("GOPRIVATE", "")
+        .env("GOMODCACHE", workspace.child("go-cache"))
+        .output()
+        .unwrap();
+    assert_success("go mod download through proxy", &output);
+    assert!(project.join("go.sum").exists());
+}
+
+#[test]
+fn go_mod_download_denials_are_terminal_for_fresh_and_locked_state() {
+    require_command("go");
+    let workspace = TempWorkspace::new("go-mod-denial-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+    let allowed = start_proxy(upstream.base_url());
+    let blocked = start_go_proxy(upstream.base_url(), true, ArtifactBehavior::Redirect);
+    let project = workspace.child("go-client");
+    fs::create_dir_all(&project).unwrap();
+    write_file(
+        &project.join("go.mod"),
+        "module client.example/test\n\ngo 1.24\n\nrequire example.com/fixture v1.0.0\n",
+    );
+    assert_success(
+        "seed locked Go module",
+        &go_download(&project, &allowed, workspace.child("seed-cache")),
+    );
+    assert!(project.join("go.sum").exists());
+    let fresh = go_download(&project, &blocked, workspace.child("fresh-cache"));
+    assert_policy_denial("fresh blocked Go module", &fresh);
+    let locked = go_download(&project, &blocked, workspace.child("locked-cache"));
+    assert_policy_denial("locked blocked Go module", &locked);
+}
+
+#[test]
+fn go_mod_download_works_with_proxy_artifact_mode() {
+    require_command("go");
+    let workspace = TempWorkspace::new("go-mod-proxy-mode-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+    let proxy = start_go_proxy(upstream.base_url(), false, ArtifactBehavior::Proxy);
+    let project = workspace.child("go-client");
+    fs::create_dir_all(&project).unwrap();
+    write_file(
+        &project.join("go.mod"),
+        "module client.example/test\n\ngo 1.24\n\nrequire example.com/fixture v1.0.0\n",
+    );
+    assert_success(
+        "Go module download in proxy artifact mode",
+        &go_download(&project, &proxy, workspace.child("proxy-cache")),
+    );
+}
 const CARGO_PACKAGE: &str = "osv-proxy-e2e-cargo";
 
 #[test]
@@ -211,10 +286,18 @@ fn start_fixture_upstream(fixture: FixtureArtifacts) -> TestServer {
 }
 
 fn start_proxy(upstream_base_url: String) -> TestServer {
-    start_proxy_with_behavior(upstream_base_url, ArtifactBehavior::Redirect)
+    start_go_proxy(upstream_base_url, false, ArtifactBehavior::Redirect)
 }
 
 fn start_proxy_with_behavior(upstream_base_url: String, behavior: ArtifactBehavior) -> TestServer {
+    start_go_proxy(upstream_base_url, false, behavior)
+}
+
+fn start_go_proxy(
+    upstream_base_url: String,
+    block_go: bool,
+    behavior: ArtifactBehavior,
+) -> TestServer {
     start_http_server(move |proxy_base_url| {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -228,16 +311,25 @@ fn start_proxy_with_behavior(upstream_base_url: String, behavior: ArtifactBehavi
             config.server.public_base_url = proxy_base_url.clone();
             config.upstreams.npm.registry_url = upstream_base_url.clone();
             config.upstreams.pypi.simple_url = format!("{upstream_base_url}/simple");
+            config.upstreams.go.proxy_url = upstream_base_url.clone();
             config.upstreams.cargo.sparse_index_url = upstream_base_url.clone();
             config.upstreams.cargo.download_url = format!("{upstream_base_url}/cargo-files");
-            config.artifacts.behavior = behavior;
             config.policy.osv.api_url = upstream_base_url.clone();
+            config.artifacts.behavior = behavior;
             config.blocklist.push(BlocklistEntry {
                 ecosystem: Ecosystem::Npm,
                 name: NPM_PACKAGE.to_string(),
                 versions: vec!["1.0.1".to_string()],
                 reason: "package-manager e2e blocked npm version".to_string(),
             });
+            if block_go {
+                config.blocklist.push(BlocklistEntry {
+                    ecosystem: Ecosystem::Go,
+                    name: GO_MODULE.to_string(),
+                    versions: vec!["v1.0.0".to_string()],
+                    reason: "package-manager e2e blocked Go version".to_string(),
+                });
+            }
             config.blocklist.push(BlocklistEntry {
                 ecosystem: Ecosystem::CratesIo,
                 name: CARGO_PACKAGE.to_string(),
@@ -259,6 +351,35 @@ fn start_proxy_with_behavior(upstream_base_url: String, behavior: ArtifactBehavi
             ))
         })
     })
+}
+
+fn go_download(project: &Path, proxy: &TestServer, cache: PathBuf) -> Output {
+    Command::new("go")
+        .arg("mod")
+        .arg("download")
+        .arg(GO_MODULE)
+        .current_dir(project)
+        .env("GOPROXY", format!("{}/go", proxy.base_url()))
+        .env("GOSUMDB", "off")
+        .env("GONOSUMDB", "*")
+        .env("GONOPROXY", "")
+        .env("GOPRIVATE", "")
+        .env("GOMODCACHE", cache)
+        .output()
+        .unwrap()
+}
+
+fn assert_policy_denial(context: &str, output: &Output) {
+    assert_failure(context, output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("403"),
+        "{context} did not fail with terminal policy denial: {stderr}"
+    );
+    assert!(
+        !stderr.contains("direct"),
+        "{context} attempted direct fallback: {stderr}"
+    );
 }
 
 fn fixture_response(
@@ -300,6 +421,31 @@ fn fixture_response(
     }
 
     if request.method == "GET" {
+        if path == format!("/{GO_MODULE}/@v/list") {
+            return RegistryResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: b"v1.0.0\n".to_vec(),
+            };
+        }
+        if path == format!("/{GO_MODULE}/@latest") || path == format!("/{GO_MODULE}/@v/v1.0.0.info")
+        {
+            return RegistryResponse::json(
+                200,
+                &json!({"Version":"v1.0.0","Time":"2020-01-01T00:00:00Z"}),
+            )
+            .unwrap();
+        }
+        if path == format!("/{GO_MODULE}/@v/v1.0.0.mod") {
+            return RegistryResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "text/plain".into())],
+                body: b"module example.com/fixture\n\ngo 1.24\n".to_vec(),
+            };
+        }
+        if path == format!("/{GO_MODULE}/@v/v1.0.0.zip") {
+            return binary_response("application/zip", go_module_zip());
+        }
         if path == "/config.json" {
             return RegistryResponse::json(
                 200,
@@ -360,6 +506,24 @@ fn fixture_response(
         }),
     )
     .unwrap()
+}
+
+fn go_module_zip() -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let prefix = "example.com/fixture@v1.0.0/";
+    writer
+        .start_file(format!("{prefix}go.mod"), SimpleFileOptions::default())
+        .unwrap();
+    writer
+        .write_all(b"module example.com/fixture\n\ngo 1.24\n")
+        .unwrap();
+    writer
+        .start_file(format!("{prefix}fixture.go"), SimpleFileOptions::default())
+        .unwrap();
+    writer
+        .write_all(b"package fixture\n\nconst Value = 1\n")
+        .unwrap();
+    writer.finish().unwrap().into_inner()
 }
 
 fn npm_version_metadata(base_url: &str, version: &str) -> serde_json::Value {

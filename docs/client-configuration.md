@@ -42,3 +42,14 @@ uv pip install --index-url http://127.0.0.1:8080/pypi/simple/ requests
 ```sh
 poetry source add osv-proxy http://127.0.0.1:8080/pypi/simple/
 ```
+
+## Go modules
+
+```sh
+export GOPROXY=http://127.0.0.1:8080/go
+export GONOSUMDB='*'
+```
+
+Use one proxy URL when this is a mandatory policy control. Appending `,direct`
+or another proxy allows fallback after `404`/`410` and can bypass the gate.
+Policy denials are `403`, deliberately terminal for Go proxy fallback.

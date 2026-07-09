@@ -1,5 +1,6 @@
 use crate::artifact::{Artifact, Ecosystem};
 use crate::config::{Config, LocalOsvConfig, LocalOsvStaleBehavior, OsvSource};
+use crate::go;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use node_semver as npm_semver;
@@ -96,10 +97,10 @@ impl MaliciousChecker for OsvHttpClient {
             .post(url)
             .json(&OsvQueryRequest {
                 package: OsvPackage {
-                    name: &artifact.name,
-                    ecosystem: artifact.ecosystem.osv_name(),
+                    name: artifact.name.clone(),
+                    ecosystem: artifact.ecosystem.osv_name().to_string(),
                 },
-                version: &artifact.version,
+                version: osv_query_version(artifact),
             })
             .send()
             .await?
@@ -123,10 +124,10 @@ impl MaliciousChecker for OsvHttpClient {
             .iter()
             .map(|artifact| OsvQueryRequest {
                 package: OsvPackage {
-                    name: &artifact.name,
-                    ecosystem: artifact.ecosystem.osv_name(),
+                    name: artifact.name.clone(),
+                    ecosystem: artifact.ecosystem.osv_name().to_string(),
                 },
-                version: &artifact.version,
+                version: osv_query_version(artifact),
             })
             .collect::<Vec<_>>();
         let response = self
@@ -347,7 +348,12 @@ pub async fn sync_malicious(
     SqliteMaliciousChecker::initialize(&config.sqlite_path)?;
     let mut connection = open_read_write_connection(&config.sqlite_path)?;
     let mut ecosystems = Vec::new();
-    for ecosystem in [Ecosystem::Npm, Ecosystem::Pypi, Ecosystem::CratesIo] {
+    for ecosystem in [
+        Ecosystem::Npm,
+        Ecosystem::Pypi,
+        Ecosystem::Go,
+        Ecosystem::CratesIo,
+    ] {
         ecosystems.push(
             sync_ecosystem(
                 &mut connection,
@@ -1033,7 +1039,7 @@ ORDER BY a.osv_id
             params![
                 artifact.ecosystem.osv_name(),
                 artifact.name,
-                artifact.version
+                osv_query_version(artifact)
             ],
             |row| {
                 let modified = row
@@ -1197,6 +1203,14 @@ fn range_matches_artifact(
                 compare_pypi_version(&version, boundary, artifact)
             })
         }
+        ("Go", "SEMVER") | ("Go", "ECOSYSTEM") => {
+            let version = go::osv_version(&artifact.version)
+                .map_err(|err| range_error(artifact, err.to_string()))?;
+            evaluate_range_events(range, artifact, |boundary| {
+                go::compare_versions(&format!("v{version}"), &format!("v{boundary}"))
+                    .map_err(|err| range_error(artifact, err.to_string()))
+            })
+        }
         ("crates.io", "SEMVER" | "ECOSYSTEM") => {
             let version = cargo_semver::parse(&artifact.version).map_err(|err| {
                 range_error(
@@ -1215,6 +1229,14 @@ fn range_matches_artifact(
                 artifact.ecosystem.osv_name()
             ),
         )),
+    }
+}
+
+fn osv_query_version(artifact: &Artifact) -> String {
+    if artifact.ecosystem == Ecosystem::Go {
+        go::osv_version(&artifact.version).unwrap_or_else(|_| artifact.version.clone())
+    } else {
+        artifact.version.clone()
     }
 }
 
@@ -1315,20 +1337,20 @@ fn sqlite_error(error: rusqlite::Error) -> MaliciousError {
 }
 
 #[derive(Debug, Serialize)]
-struct OsvQueryRequest<'a> {
-    package: OsvPackage<'a>,
-    version: &'a str,
+struct OsvQueryRequest {
+    package: OsvPackage,
+    version: String,
 }
 
 #[derive(Debug, Serialize)]
-struct OsvBatchQueryRequest<'a> {
-    queries: Vec<OsvQueryRequest<'a>>,
+struct OsvBatchQueryRequest {
+    queries: Vec<OsvQueryRequest>,
 }
 
 #[derive(Debug, Serialize)]
-struct OsvPackage<'a> {
-    name: &'a str,
-    ecosystem: &'a str,
+struct OsvPackage {
+    name: String,
+    ecosystem: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2137,10 +2159,21 @@ INSERT INTO advisories (
     #[async_trait]
     impl OsvDumpClient for FixtureDumpClient {
         async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, MaliciousError> {
-            self.responses
-                .get(url)
-                .cloned()
-                .ok_or_else(|| MaliciousError::Sync(format!("missing fixture response for {url}")))
+            if let Some(response) = self.responses.get(url) {
+                return Ok(response.clone());
+            }
+            // Go was added after the existing npm/PyPI fixtures. Empty Go
+            // snapshots keep those fixtures focused while exercising its
+            // independent local-sync state machine.
+            if url.contains("/Go/all.zip") {
+                return Ok(zip_bytes([]));
+            }
+            if url.contains("/Go/modified_id.csv") {
+                return Ok(Vec::new());
+            }
+            Err(MaliciousError::Sync(format!(
+                "missing fixture response for {url}"
+            )))
         }
     }
 

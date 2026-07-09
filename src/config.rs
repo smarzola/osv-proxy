@@ -1,4 +1,4 @@
-use crate::artifact::{Ecosystem, normalize_pypi_name};
+use crate::artifact::Ecosystem;
 use chrono::Duration as ChronoDuration;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -91,6 +91,7 @@ impl Default for ServerConfig {
 pub struct UpstreamsConfig {
     pub npm: NpmUpstreamConfig,
     pub pypi: PypiUpstreamConfig,
+    pub go: GoUpstreamConfig,
     pub cargo: CargoUpstreamConfig,
 }
 
@@ -128,6 +129,20 @@ impl Default for NpmUpstreamConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct PypiUpstreamConfig {
     pub simple_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GoUpstreamConfig {
+    pub proxy_url: String,
+}
+
+impl Default for GoUpstreamConfig {
+    fn default() -> Self {
+        Self {
+            proxy_url: "https://proxy.golang.org".to_string(),
+        }
+    }
 }
 
 impl Default for PypiUpstreamConfig {
@@ -311,11 +326,7 @@ pub struct AllowlistEntry {
 
 impl AllowlistEntry {
     pub fn normalized_name(&self) -> String {
-        match self.ecosystem {
-            Ecosystem::Npm => self.name.clone(),
-            Ecosystem::Pypi => normalize_pypi_name(&self.name),
-            Ecosystem::CratesIo => self.ecosystem.normalize_name(&self.name),
-        }
+        self.ecosystem.normalize_name(&self.name)
     }
 }
 
@@ -331,11 +342,7 @@ pub struct BlocklistEntry {
 
 impl BlocklistEntry {
     pub fn normalized_name(&self) -> String {
-        match self.ecosystem {
-            Ecosystem::Npm => self.name.clone(),
-            Ecosystem::Pypi => normalize_pypi_name(&self.name),
-            Ecosystem::CratesIo => self.ecosystem.normalize_name(&self.name),
-        }
+        self.ecosystem.normalize_name(&self.name)
     }
 }
 
