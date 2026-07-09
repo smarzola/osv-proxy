@@ -327,7 +327,63 @@ async fn filter_registration(
         .get_mut("items")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| NugetError::InvalidMetadata("registration items must be an array".into()))?;
-    for page in items.iter_mut() {
+    let mut artifacts = Vec::new();
+    for (page_index, page) in items.iter().enumerate() {
+        for (leaf_index, leaf) in page
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| NugetError::InvalidMetadata("registration page has no items".into()))?
+            .iter()
+            .enumerate()
+        {
+            let catalog = leaf.get("catalogEntry").unwrap_or(leaf);
+            let version = catalog
+                .get("version")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    NugetError::InvalidMetadata("registration leaf has no version".into())
+                })?;
+            artifacts.push((
+                page_index,
+                leaf_index,
+                Artifact::package(
+                    Ecosystem::Nuget,
+                    package,
+                    version,
+                    catalog
+                        .get("published")
+                        .and_then(Value::as_str)
+                        .and_then(parse_published),
+                ),
+            ));
+        }
+    }
+    let policy = PolicyEngine::new(config);
+    let selected = artifacts
+        .iter()
+        .filter(|(_, _, artifact)| policy.should_check_osv(artifact))
+        .cloned()
+        .collect::<Vec<_>>();
+    let checked = checker
+        .check_many(
+            &selected
+                .iter()
+                .map(|(_, _, artifact)| artifact.clone())
+                .collect::<Vec<_>>(),
+        )
+        .await
+        .map_err(|err| NugetError::InvalidMetadata(format!("malicious batch failed: {err}")))?;
+    if checked.len() != selected.len() {
+        return Err(NugetError::InvalidMetadata(
+            "malicious batch returned wrong result count".into(),
+        ));
+    }
+    let results = selected
+        .into_iter()
+        .zip(checked)
+        .map(|((page, leaf, _), hits)| ((page, leaf), hits))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (page_index, page) in items.iter_mut().enumerate() {
         let leaves = page
             .get_mut("items")
             .and_then(Value::as_array_mut)
@@ -337,22 +393,15 @@ async fn filter_registration(
                 )
             })?;
         let mut kept = Vec::new();
-        for leaf in leaves.drain(..) {
-            let catalog = leaf.get("catalogEntry").unwrap_or(&leaf);
-            let version = catalog
-                .get("version")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    NugetError::InvalidMetadata("registration leaf has no version".into())
-                })?;
-            let published = catalog
-                .get("published")
-                .and_then(Value::as_str)
-                .and_then(parse_published);
-            let artifact = Artifact::package(Ecosystem::Nuget, package, version, published);
-            if PolicyEngine::new(config)
-                .evaluate(&artifact, now, checker)
-                .await
+        for (leaf_index, leaf) in leaves.drain(..).enumerate() {
+            let artifact = &artifacts
+                .iter()
+                .find(|(page, leaf, _)| *page == page_index && *leaf == leaf_index)
+                .expect("collected leaf")
+                .2;
+            let result = results.get(&(page_index, leaf_index)).cloned().map(Ok);
+            if policy
+                .evaluate_with_malicious_result(artifact, now, result.map(|hits| hits))
                 .allowed
             {
                 kept.push(leaf);
