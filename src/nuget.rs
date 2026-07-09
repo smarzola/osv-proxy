@@ -203,8 +203,23 @@ pub async fn registration_resource_response(
     suffix: &str,
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, NugetError> {
-    if suffix == "index.json" || suffix.starts_with("page/") {
+    if suffix == "index.json" {
         return registration_response(config, provider, checker, package, now).await;
+    }
+    if let Some(index) = suffix
+        .strip_prefix("page/")
+        .and_then(|value| value.strip_suffix(".json"))
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        let root = registration_response(config, provider, checker, package, now).await?;
+        let root: Value = serde_json::from_slice(&root.body)?;
+        let page = root
+            .get("items")
+            .and_then(Value::as_array)
+            .and_then(|pages| pages.get(index))
+            .cloned()
+            .ok_or_else(|| NugetError::VersionNotFound(format!("page {index}")))?;
+        return Ok(RegistryResponse::json(200, &page)?);
     }
     let index = provider.fetch_service_index().await?;
     let base = registration_base(&index)?.trim_end_matches('/');
