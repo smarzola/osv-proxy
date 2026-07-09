@@ -328,6 +328,22 @@ fn go_error_response(error: &go::GoError) -> RegistryResponse {
     RegistryResponse::json(status, &serde_json::json!({"allowed": false, "reason": "go_upstream_error", "message": error.to_string()})).expect("static Go error response")
 }
 
+fn nuget_error_response(error: crate::nuget::NugetError) -> RegistryResponse {
+    let status = match &error {
+        crate::nuget::NugetError::VersionNotFound(_) => 404,
+        crate::nuget::NugetError::Upstream(error)
+            if matches!(
+                error.status().map(|status| status.as_u16()),
+                Some(404 | 410)
+            ) =>
+        {
+            404
+        }
+        _ => 502,
+    };
+    RegistryResponse::json(status, &serde_json::json!({"allowed": false, "reason": "nuget_upstream_error", "message": error.to_string()})).expect("static NuGet error response")
+}
+
 async fn route_http_request_with_accept_and_headers(
     config: &Config,
     checker: &dyn MaliciousChecker,
@@ -363,7 +379,7 @@ async fn route_http_request_with_accept_and_headers(
             now,
         )
         .await
-        .unwrap_or_else(|err| simple_response(502, &err.to_string()))
+        .unwrap_or_else(nuget_error_response)
         .into_http_response();
     }
     if let Some(package) = parse_nuget_flat_index_route(path) {
@@ -375,7 +391,7 @@ async fn route_http_request_with_accept_and_headers(
             now,
         )
         .await
-        .unwrap_or_else(|err| simple_response(502, &err.to_string()))
+        .unwrap_or_else(nuget_error_response)
         .into_http_response();
     }
     if let Some((package, version, filename)) = parse_nuget_flat_artifact_route(path) {
@@ -412,8 +428,7 @@ async fn route_http_request_with_accept_and_headers(
                 .into_http_response())
         }
         .await;
-        return result
-            .unwrap_or_else(|err| simple_response(502, &err.to_string()).into_http_response());
+        return result.unwrap_or_else(|err| nuget_error_response(err).into_http_response());
     }
 
     if let Some((module, route)) = go::parse_route(path) {
