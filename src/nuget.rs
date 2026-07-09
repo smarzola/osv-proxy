@@ -604,6 +604,25 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("page count exceeds"));
     }
+    #[tokio::test]
+    async fn rewritten_page_route_returns_page_shape() {
+        let mut config = Config::default();
+        config.policy.osv.block_malicious = false;
+        let response = registration_resource_response(
+            &config,
+            &provider(),
+            &Clean,
+            "demo",
+            "page/0.json",
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        let page: Value = serde_json::from_slice(&response.body).unwrap();
+        assert!(page.get("items").and_then(Value::as_array).is_some());
+        assert!(page["@id"].as_str().unwrap().ends_with("/page/0.json"));
+        assert!(!page.to_string().contains("https://upstream"));
+    }
     #[test]
     fn service_index_owns_only_restore_resources() {
         let response = service_index_response(&Config::default()).unwrap();
