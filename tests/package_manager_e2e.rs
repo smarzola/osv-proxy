@@ -1,5 +1,5 @@
 use osv_proxy::artifact::Ecosystem;
-use osv_proxy::config::{BlocklistEntry, Config};
+use osv_proxy::config::{ArtifactBehavior, BlocklistEntry, Config};
 use osv_proxy::response::RegistryResponse;
 use osv_proxy::server;
 use serde_json::json;
@@ -48,6 +48,48 @@ fn go_mod_download_uses_hermetic_proxy() {
         .unwrap();
     assert_success("go mod download through proxy", &output);
     assert!(project.join("go.sum").exists());
+}
+
+#[test]
+fn go_mod_download_denials_are_terminal_for_fresh_and_locked_state() {
+    require_command("go");
+    let workspace = TempWorkspace::new("go-mod-denial-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+    let allowed = start_proxy(upstream.base_url());
+    let blocked = start_go_proxy(upstream.base_url(), true, ArtifactBehavior::Redirect);
+    let project = workspace.child("go-client");
+    fs::create_dir_all(&project).unwrap();
+    write_file(
+        &project.join("go.mod"),
+        "module client.example/test\n\ngo 1.24\n\nrequire example.com/fixture v1.0.0\n",
+    );
+    assert_success(
+        "seed locked Go module",
+        &go_download(&project, &allowed, workspace.child("seed-cache")),
+    );
+    assert!(project.join("go.sum").exists());
+    let fresh = go_download(&project, &blocked, workspace.child("fresh-cache"));
+    assert_policy_denial("fresh blocked Go module", &fresh);
+    let locked = go_download(&project, &blocked, workspace.child("locked-cache"));
+    assert_policy_denial("locked blocked Go module", &locked);
+}
+
+#[test]
+fn go_mod_download_works_with_proxy_artifact_mode() {
+    require_command("go");
+    let workspace = TempWorkspace::new("go-mod-proxy-mode-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+    let proxy = start_go_proxy(upstream.base_url(), false, ArtifactBehavior::Proxy);
+    let project = workspace.child("go-client");
+    fs::create_dir_all(&project).unwrap();
+    write_file(
+        &project.join("go.mod"),
+        "module client.example/test\n\ngo 1.24\n\nrequire example.com/fixture v1.0.0\n",
+    );
+    assert_success(
+        "Go module download in proxy artifact mode",
+        &go_download(&project, &proxy, workspace.child("proxy-cache")),
+    );
 }
 
 #[test]
@@ -189,6 +231,14 @@ fn start_fixture_upstream(fixture: FixtureArtifacts) -> TestServer {
 }
 
 fn start_proxy(upstream_base_url: String) -> TestServer {
+    start_go_proxy(upstream_base_url, false, ArtifactBehavior::Redirect)
+}
+
+fn start_go_proxy(
+    upstream_base_url: String,
+    block_go: bool,
+    behavior: ArtifactBehavior,
+) -> TestServer {
     start_http_server(move |proxy_base_url| {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -204,12 +254,21 @@ fn start_proxy(upstream_base_url: String) -> TestServer {
             config.upstreams.pypi.simple_url = format!("{upstream_base_url}/simple");
             config.upstreams.go.proxy_url = upstream_base_url.clone();
             config.policy.osv.api_url = upstream_base_url.clone();
+            config.artifacts.behavior = behavior;
             config.blocklist.push(BlocklistEntry {
                 ecosystem: Ecosystem::Npm,
                 name: NPM_PACKAGE.to_string(),
                 versions: vec!["1.0.1".to_string()],
                 reason: "package-manager e2e blocked npm version".to_string(),
             });
+            if block_go {
+                config.blocklist.push(BlocklistEntry {
+                    ecosystem: Ecosystem::Go,
+                    name: GO_MODULE.to_string(),
+                    versions: vec!["v1.0.0".to_string()],
+                    reason: "package-manager e2e blocked Go version".to_string(),
+                });
+            }
             config.blocklist.push(BlocklistEntry {
                 ecosystem: Ecosystem::Pypi,
                 name: PYPI_PACKAGE.to_string(),
@@ -225,6 +284,35 @@ fn start_proxy(upstream_base_url: String) -> TestServer {
             ))
         })
     })
+}
+
+fn go_download(project: &Path, proxy: &TestServer, cache: PathBuf) -> Output {
+    Command::new("go")
+        .arg("mod")
+        .arg("download")
+        .arg(GO_MODULE)
+        .current_dir(project)
+        .env("GOPROXY", format!("{}/go", proxy.base_url()))
+        .env("GOSUMDB", "off")
+        .env("GONOSUMDB", "*")
+        .env("GONOPROXY", "")
+        .env("GOPRIVATE", "")
+        .env("GOMODCACHE", cache)
+        .output()
+        .unwrap()
+}
+
+fn assert_policy_denial(context: &str, output: &Output) {
+    assert_failure(context, output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("403"),
+        "{context} did not fail with terminal policy denial: {stderr}"
+    );
+    assert!(
+        !stderr.contains("direct"),
+        "{context} attempted direct fallback: {stderr}"
+    );
 }
 
 fn fixture_response(
