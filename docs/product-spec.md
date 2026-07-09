@@ -1,6 +1,6 @@
 # Product Specification
 
-`osv-proxy` is a policy-enforcing package registry proxy for npm and PyPI.
+`osv-proxy` is a policy-enforcing package registry proxy for npm, PyPI, and read-only Cargo sparse source replacement.
 
 ```text
 npm / pnpm / yarn / bun / pip / uv / poetry

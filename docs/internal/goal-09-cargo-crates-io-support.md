@@ -113,7 +113,7 @@ When a milestone is complete:
 - [x] Milestone 1: Ecosystem, config, OSV, and CLI foundations
 - [x] Milestone 2: Sparse index filtering and routing
 - [x] Milestone 3: Crate artifact delivery and policy recheck
-- [ ] Milestone 4: Real Cargo compatibility, docs, and regression
+- [x] Milestone 4: Real Cargo compatibility, docs, and regression
 
 ## Milestone 0: Protocol Research and Adapter Contract
 
@@ -373,6 +373,25 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo run -- config validate --config examples/basic/osv-proxy.yaml
 git diff --check
 ```
+
+Status note 2026-07-09:
+
+- Added a hermetic real-Cargo package-manager test with local sparse index and
+  artifact fixture servers. It proves fresh allowed resolution in redirect and
+  proxy modes, blocked fresh resolution, and a blocked version already present
+  in a lockfile. The fixture is entirely local and does not contact crates.io
+  or OSV.
+- Added conditional sparse-index support: filtered bytes receive a stable
+  content ETag and a matching `If-None-Match` produces `304` without a body.
+- Repaired the existing PyPI local-mode test defect: a test fixture used a fixed
+  historical "new" timestamp while the route evaluates against real current
+  time, so the fixture eventually aged through the minimum-age gate. The server
+  fixture now derives its new timestamp from current time.
+- Updated README, client/configuration, registry behavior, malicious-data,
+  architecture, product-spec, milestones, and the basic example for Cargo.
+- Commands run outside the listener-restricted sandbox: `cargo fmt --check`,
+  `cargo test --test package_manager_e2e` (3 passed), `cargo test` (151 unit,
+  3 package-manager tests, doctests passed), and config validation passed.
 
 ## Final Response Required
 

@@ -1,5 +1,12 @@
 # Registry Behavior
 
+## Cargo sparse registry
+
+`/cargo/config.json` provides proxy downloads. Sparse JSON-lines records are
+validated and policy-filtered without rewriting retained bytes. Filtered index
+responses have a content ETag and support `If-None-Match`; direct `.crate`
+downloads recheck policy before redirecting or proxying exact upstream bytes.
+
 ## HTTP Responses
 
 Blocked requests return HTTP 403 with the structured decision model.

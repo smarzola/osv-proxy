@@ -147,10 +147,41 @@ pub async fn index_response(
     } else {
         format!("{}\n", retained.join("\n")).into_bytes()
     };
+    let etag = format!("\"{:016x}\"", stable_hash(&body));
     Ok(RegistryResponse {
         status: 200,
-        headers: vec![("content-type".to_string(), "text/plain".to_string())],
+        headers: vec![
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("etag".to_string(), etag),
+        ],
         body,
+    })
+}
+
+pub fn apply_if_none_match(
+    mut response: RegistryResponse,
+    if_none_match: Option<&str>,
+) -> RegistryResponse {
+    let etag = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+        .map(|(_, value)| value.as_str());
+    if if_none_match.is_some_and(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .any(|candidate| candidate == "*" || Some(candidate) == etag)
+    }) {
+        response.status = 304;
+        response.body.clear();
+    }
+    response
+}
+
+fn stable_hash(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
     })
 }
 
@@ -368,6 +399,18 @@ mod tests {
                 .to_string()
                 .contains("invalid Cargo sparse-index record")
         );
+    }
+
+    #[test]
+    fn conditional_index_response_returns_304_for_its_etag() {
+        let response = RegistryResponse {
+            status: 200,
+            headers: vec![("etag".to_string(), "\"abc\"".to_string())],
+            body: b"index".to_vec(),
+        };
+        let response = apply_if_none_match(response, Some("\"abc\""));
+        assert_eq!(response.status, 304);
+        assert!(response.body.is_empty());
     }
 
     #[tokio::test]

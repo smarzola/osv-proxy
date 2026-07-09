@@ -3,6 +3,11 @@
 `osv-proxy` uses YAML configuration. Unknown keys fail validation so policy
 typos do not silently change install behavior.
 
+Cargo defaults to `https://index.crates.io` for `upstreams.cargo.sparse_index_url`
+and `https://static.crates.io/crates` for `upstreams.cargo.download_url`.
+Optional sparse-record `pubtime` uses the existing age policy; missing values
+follow `policy.missing_publish_time`.
+
 ## Example
 
 ```yaml

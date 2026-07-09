@@ -307,12 +307,15 @@ async fn route_http_request_with_accept_and_headers(
 
     match parse_cargo_route(path) {
         Some(CargoRoute::Config) => cargo::config_response(config).into_http_response(),
-        Some(CargoRoute::Index { name }) => {
+        Some(CargoRoute::Index { name }) => cargo::apply_if_none_match(
             cargo::index_response(config, &cargo_upstream, checker, &name, now)
                 .await
-                .unwrap_or_else(|err| cargo::error_response(&err))
-                .into_http_response()
-        }
+                .unwrap_or_else(|err| cargo::error_response(&err)),
+            headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok()),
+        )
+        .into_http_response(),
         Some(CargoRoute::Artifact { name, version }) => cargo::artifact_delivery_response(
             config,
             &cargo_upstream,
@@ -746,7 +749,7 @@ mod tests {
     }
 
     fn new_time() -> DateTime<Utc> {
-        now() - ChronoDuration::hours(12)
+        Utc::now() - ChronoDuration::hours(12)
     }
 
     fn pypi_file(filename: &str, url: &str, upload_time: Option<DateTime<Utc>>) -> SimpleFile {
