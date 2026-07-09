@@ -4,6 +4,9 @@
 with `MAL-`. CVEs, GHSAs, and general vulnerability advisories are ignored for
 blocking because they are not package-malicious decisions.
 
+Cargo uses the exact OSV ecosystem `crates.io`; local sync health and range
+evaluation are independent from npm and PyPI.
+
 ## Sources
 
 `policy.osv.source: live` calls the OSV API during policy evaluation:

@@ -91,6 +91,23 @@ impl Default for ServerConfig {
 pub struct UpstreamsConfig {
     pub npm: NpmUpstreamConfig,
     pub pypi: PypiUpstreamConfig,
+    pub cargo: CargoUpstreamConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CargoUpstreamConfig {
+    pub sparse_index_url: String,
+    pub download_url: String,
+}
+
+impl Default for CargoUpstreamConfig {
+    fn default() -> Self {
+        Self {
+            sparse_index_url: "https://index.crates.io".to_string(),
+            download_url: "https://static.crates.io/crates".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,6 +314,7 @@ impl AllowlistEntry {
         match self.ecosystem {
             Ecosystem::Npm => self.name.clone(),
             Ecosystem::Pypi => normalize_pypi_name(&self.name),
+            Ecosystem::CratesIo => self.ecosystem.normalize_name(&self.name),
         }
     }
 }
@@ -316,6 +334,7 @@ impl BlocklistEntry {
         match self.ecosystem {
             Ecosystem::Npm => self.name.clone(),
             Ecosystem::Pypi => normalize_pypi_name(&self.name),
+            Ecosystem::CratesIo => self.ecosystem.normalize_name(&self.name),
         }
     }
 }
@@ -428,6 +447,21 @@ policy:
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
+    }
+
+    #[test]
+    fn cargo_upstream_defaults_and_strict_keys_validate() {
+        let config = load("upstreams:\n  cargo:\n    sparse_index_url: https://index.example\n    download_url: https://downloads.example\n").unwrap();
+        assert_eq!(
+            config.upstreams.cargo.sparse_index_url,
+            "https://index.example"
+        );
+        assert_eq!(
+            config.upstreams.cargo.download_url,
+            "https://downloads.example"
+        );
+        let err = load("upstreams:\n  cargo:\n    typo: true\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
     }
 
     #[test]

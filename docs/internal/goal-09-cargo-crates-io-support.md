@@ -109,11 +109,11 @@ When a milestone is complete:
 4. Commit code, tests, docs, and the status update together.
 5. Record and report the commit hash before starting the next milestone.
 
-- [ ] Milestone 0: Protocol research and adapter contract
-- [ ] Milestone 1: Ecosystem, config, OSV, and CLI foundations
-- [ ] Milestone 2: Sparse index filtering and routing
-- [ ] Milestone 3: Crate artifact delivery and policy recheck
-- [ ] Milestone 4: Real Cargo compatibility, docs, and regression
+- [x] Milestone 0: Protocol research and adapter contract
+- [x] Milestone 1: Ecosystem, config, OSV, and CLI foundations
+- [x] Milestone 2: Sparse index filtering and routing
+- [x] Milestone 3: Crate artifact delivery and policy recheck
+- [x] Milestone 4: Real Cargo compatibility, docs, and regression
 
 ## Milestone 0: Protocol Research and Adapter Contract
 
@@ -145,6 +145,35 @@ Verification:
 ```bash
 git diff --check
 ```
+
+Status note 2026-07-09:
+
+- Reviewed Cargo's primary registry-index and source-replacement documentation,
+  the live crates.io sparse `config.json`, recent `serde` sparse records, and
+  the crates.io OSV dump endpoint. The live configuration advertises
+  `https://static.crates.io/crates`; observed index records are JSON lines with
+  `name`, `vers`, `cksum`, dependency metadata, `yanked`, and optional UTC
+  `pubtime` fields.
+- The adapter contract is read-only: `GET /cargo/config.json` returns a proxy
+  download template, `GET /cargo/<sparse-path>` fetches and filters one
+  lower-case sparse index file, and `GET /cargo/api/v1/crates/<name>/<version>/download`
+  re-reads the canonical record, rechecks policy, then redirects or streams the
+  untouched upstream crate. Sparse paths are verified against Cargo's documented
+  name-to-path mapping before upstream access.
+- Filtering parses each JSON line only to construct policy context and then
+  emits the original line unchanged when allowed. `pubtime` is parsed as UTC;
+  a missing value is passed through as `None` so the configured
+  `missing_publish_time` decision applies. Malformed records fail closed.
+- Cargo's sparse protocol caches metadata using ETag or Last-Modified and may
+  issue conditional requests. The adapter will forward useful validators where
+  possible, but never caches or rewrites retained record bytes. The documented
+  source replacement model requires a subset of crates.io, so filtering is
+  compatible with lockfiles only while their selected versions remain allowed.
+- Commands run: `curl --fail --silent --show-error https://index.crates.io/config.json`
+  (passed), the same command for `https://index.crates.io/se/rd/serde` (passed,
+  observed current `pubtime` records), `curl --fail --silent --show-error --head
+  https://storage.googleapis.com/osv-vulnerabilities/crates.io/all.zip` (passed,
+  HTTP 200), and `git diff --check` (passed).
 
 ## Milestone 1: Ecosystem, Config, OSV, and CLI Foundations
 
@@ -184,6 +213,49 @@ cargo test cli
 cargo test malicious
 cargo fmt --check
 ```
+
+Status note 2026-07-09:
+
+- Added Cargo artifact delivery at `/cargo/api/v1/crates/<name>/<version>/download`.
+  Each request resolves its canonical sparse record, verifies its name/version,
+  builds the checksum-bearing artifact context, and reevaluates current policy
+  before delegating to the shared redirect/proxy delivery layer.
+- Blocked direct requests return structured 403 before the delivery client can
+  fetch bytes. Allowed redirects/proxy streams retain the upstream `.crate`
+  URL and bytes unchanged.
+- Commands run: `cargo test cargo` passed (7 tests), `cargo fmt --check`
+  passed, and `git diff --check` passed.
+
+Status note 2026-07-09:
+
+- Implemented the `/cargo/` sparse surface: a read-only `config.json`, canonical
+  path validation, upstream sparse record retrieval, deterministic JSON-lines
+  filtering, and fail-closed malformed-record errors. Retained lines are emitted
+  byte-for-byte with their original ordering and forward-compatible fields.
+- `pubtime` drives the existing minimum-age policy; absent `pubtime` reaches the
+  configured missing-time behavior. The adapter has no metadata cache and
+  performs bounded sequential policy work.
+- Commands run outside the listener-restricted sandbox: `cargo test cargo`
+  passed (6 tests) and `cargo fmt --check` passed. `cargo test server --
+  --test-threads=1` passed 25/26 tests; the sole failure is the existing
+  time-relative PyPI local-mode expectation that assumes a too-young fixture
+  remains blocked after its timestamp ages past the configured gate.
+
+Status note 2026-07-09:
+
+- Added canonical `crates.io` identities, lower-case Cargo name normalization,
+  strict `upstreams.cargo` sparse-index/download configuration, and a
+  registry-backed Cargo check path that constructs canonical artifacts with the
+  sparse index checksum and optional `pubtime`.
+- Added `crates.io` to live OSV requests and independent local dump-sync health.
+  Local range evaluation now uses Cargo SemVer ordering for both observed
+  `SEMVER` and `ECOSYSTEM` range records, including prereleases.
+- Commands run outside the listener-restricted sandbox: `cargo test cargo`
+  passed (4 tests), `cargo test config` passed (34 tests), `cargo test cli`
+  passed (34 tests), `cargo test malicious -- --test-threads=1` passed (40
+  tests), and `cargo fmt --check` passed. A broad `cargo test artifact` run
+  passed its Cargo/normalization tests but exposed a pre-existing time-sensitive
+  PyPI local-mode assertion; it is deferred to the full-regression milestone.
 
 ## Milestone 2: Sparse Index Filtering and Routing
 
@@ -302,6 +374,35 @@ cargo run -- config validate --config examples/basic/osv-proxy.yaml
 git diff --check
 ```
 
+Status note 2026-07-09:
+
+- Added a hermetic real-Cargo package-manager test with local sparse index and
+  artifact fixture servers. It proves fresh allowed resolution in redirect and
+  proxy modes, blocked fresh resolution, and a blocked version already present
+  in a lockfile. The fixture is entirely local and does not contact crates.io
+  or OSV.
+- Added conditional sparse-index support: filtered bytes receive a stable
+  content ETag and a matching `If-None-Match` produces `304` without a body.
+- Repaired the existing PyPI local-mode test defect: a test fixture used a fixed
+  historical "new" timestamp while the route evaluates against real current
+  time, so the fixture eventually aged through the minimum-age gate. The server
+  fixture now derives its new timestamp from current time.
+- Updated README, client/configuration, registry behavior, malicious-data,
+  architecture, product-spec, milestones, and the basic example for Cargo.
+- Commands run outside the listener-restricted sandbox: `cargo fmt --check`,
+  `cargo test --test package_manager_e2e` (3 passed), `cargo test` (151 unit,
+  3 package-manager tests, doctests passed), and config validation passed.
+
+Repair note 2026-07-09:
+
+- Sparse index filtering now batches all OSV-eligible Cargo artifacts into one
+  `check_many` call, validates cardinality, and passes batch failures/missing
+  results to the policy engine so configured fail-closed behavior is preserved.
+- Denied direct Cargo artifacts now serialize the full policy decision with
+  HTTP 403, including `reason`, `rule_id`, `source`, and policy timestamps when
+  present. A proxy-mode regression verifies the direct handler returns that
+  body and never contacts the configured upstream artifact listener.
+
 ## Final Response Required
 
 Report:
@@ -313,4 +414,3 @@ Report:
 - protocol or performance risks that remain;
 - explicit confirmation that you did not merge, tag, release, or modify another
   ecosystem goal prompt.
-

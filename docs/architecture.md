@@ -2,6 +2,9 @@
 
 The first implementation should stay pragmatic. Splitting into crates is useful, but avoid over-engineering before the HTTP and policy paths are working.
 
+Cargo is a dedicated sparse-index adapter that produces canonical artifacts for
+the ecosystem-neutral policy engine and uses shared artifact delivery.
+
 ## Suggested Workspace Layout
 
 ```text
