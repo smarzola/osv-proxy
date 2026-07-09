@@ -315,8 +315,12 @@ async fn route_http_request_with_accept_and_headers(
                 .await;
             if !decision.allowed {
                 return Ok::<_, crate::nuget::NugetError>(
-                    simple_response(403, &serde_json::to_string(&decision).unwrap_or_default())
-                        .into_http_response(),
+                    RegistryResponse::json(
+                        403,
+                        &serde_json::to_value(&decision).unwrap_or_default(),
+                    )
+                    .unwrap_or_else(|_| simple_response(403, "policy denied"))
+                    .into_http_response(),
                 );
             }
             let mut upstream = artifact.upstream_url.ok_or_else(|| {
@@ -480,7 +484,21 @@ fn parse_nuget_flat_artifact_route(path: &str) -> Option<(String, String, String
         [package, version, filename]
             if !package.is_empty()
                 && !version.is_empty()
-                && (filename.ends_with(".nupkg") || filename.ends_with(".nuspec")) =>
+                && crate::artifact::normalize_nuget_version(version)
+                    .ok()
+                    .is_some_and(|normalized| {
+                        *filename
+                            == format!(
+                                "{}.{}.nupkg",
+                                crate::artifact::normalize_nuget_name(package),
+                                normalized
+                            )
+                            || *filename
+                                == format!(
+                                    "{}.nuspec",
+                                    crate::artifact::normalize_nuget_name(package)
+                                )
+                    }) =>
         {
             Some((
                 crate::artifact::normalize_nuget_name(package),

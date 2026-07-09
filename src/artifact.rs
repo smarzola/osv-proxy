@@ -95,8 +95,7 @@ impl Artifact {
         Self {
             ecosystem,
             name: normalized_name,
-            version: normalize_version(ecosystem, &version.into())
-                .unwrap_or_else(|_| "".to_string()),
+            version: version.into(),
             filename: None,
             upstream_url: None,
             published_at,
@@ -263,5 +262,17 @@ mod tests {
     fn normalizes_nuget_identity_and_version() {
         let artifact = parse_identity("nuget:Newtonsoft.Json@01.00.0.0-RC.1+build", None).unwrap();
         assert_eq!(artifact.identity(), "nuget:newtonsoft.json@1.0.0-rc.1");
+    }
+
+    #[test]
+    fn rejects_invalid_nuget_identity_version_without_emptying_it() {
+        assert_eq!(
+            parse_package_identity("nuget:demo@not-a-version").unwrap_err(),
+            ArtifactParseError::InvalidNugetVersion("not-a-version".to_string())
+        );
+        assert_eq!(
+            Artifact::package(Ecosystem::Nuget, "demo", "not-a-version", None).version,
+            "not-a-version"
+        );
     }
 }
