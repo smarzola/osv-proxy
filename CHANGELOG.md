@@ -5,6 +5,20 @@ source for GitHub release notes.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-11
+
+### Added
+
+- Add RubyGems Compact Index support for Bundler, including policy-filtered gem
+  metadata, RubyGems-compatible version ordering, and live or local OSV checks.
+- Protect `.gem` artifact delivery through policy-aware redirects or proxying.
+- Add hermetic Bundler coverage for dependencies, platforms, prereleases, fresh
+  installs, and locked-version denials.
+
+### Changed
+
+- Provision Ruby 3.3.8 and Bundler 2.5.23 in CI and tagged release tests.
+
 ## [0.5.0] - 2026-07-11
 
 ### Added
