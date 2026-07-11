@@ -94,6 +94,7 @@ pub struct UpstreamsConfig {
     pub go: GoUpstreamConfig,
     pub cargo: CargoUpstreamConfig,
     pub nuget: NugetUpstreamConfig,
+    pub rubygems: RubyGemsUpstreamConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +164,20 @@ impl Default for PypiUpstreamConfig {
     fn default() -> Self {
         Self {
             simple_url: "https://pypi.org/simple".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RubyGemsUpstreamConfig {
+    pub registry_url: String,
+}
+
+impl Default for RubyGemsUpstreamConfig {
+    fn default() -> Self {
+        Self {
+            registry_url: "https://rubygems.org".to_string(),
         }
     }
 }
@@ -904,6 +919,23 @@ upstreams:
             r#"
 upstreams:
   pypi:
+    typo: true
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rubygems_upstream_defaults_and_strict_keys_validate() {
+        assert_eq!(
+            Config::default().upstreams.rubygems.registry_url,
+            "https://rubygems.org"
+        );
+        let err = load(
+            r#"
+upstreams:
+  rubygems:
     typo: true
 "#,
         )

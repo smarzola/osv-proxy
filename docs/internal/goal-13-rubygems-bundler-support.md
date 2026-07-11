@@ -144,7 +144,7 @@ The goal is complete only when:
 
 ## Milestones
 
-- [ ] Milestone 1: RubyGems identity, configuration, OSV, and CLI foundations
+- [x] Milestone 1: RubyGems identity, configuration, OSV, and CLI foundations
 - [ ] Milestone 2: Policy-filtered Compact Index with cache/range semantics
 - [ ] Milestone 3: Protected `.gem` delivery and deterministic error mapping
 - [ ] Milestone 4: Real Bundler workflows, documentation, and full regression
@@ -206,7 +206,19 @@ cargo fmt --check
 git diff --check
 ```
 
-Status: Not started.
+Status (2026-07-11): Complete. Added canonical `RubyGems` ecosystem identity
+and aliases, strict upstream configuration, registry-backed exact-version lookup
+across all non-yanked platform variants, canonical filename/URI/SHA validation,
+local dump synchronization, and ecosystem-range evaluation with RubyGems
+`Gem::Version` ordering. Arbitrarily large numeric segments are supported.
+Adversarial review found two blockers: mixed separator grammar accepted invalid
+versions and name validation rejected valid trailing punctuation. Both were
+verified against installed RubyGems, repaired, regression-tested, and the
+re-review reported no blocking findings. Malformed upstream versions now fail
+closed. Verification: `cargo test artifact::tests` (7 passed), `cargo test
+config::tests` (33 passed), `cargo test cli::tests` (14 passed), `cargo test
+malicious::tests` (51 passed), `cargo test rubygems::tests` (5 passed), `cargo
+fmt --check` (passed), and `git diff --check` (passed).
 
 ## Milestone 2: Policy-Filtered Compact Index
 

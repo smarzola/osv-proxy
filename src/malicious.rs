@@ -707,6 +707,7 @@ pub async fn sync_osv(
         Ecosystem::Go,
         Ecosystem::CratesIo,
         Ecosystem::Nuget,
+        Ecosystem::RubyGems,
     ] {
         ecosystems.push(
             sync_ecosystem(
@@ -2045,6 +2046,10 @@ fn range_matches_artifact(range: &StoredRange, artifact: &Artifact) -> Result<bo
         ("NuGet", "ECOSYSTEM") => evaluate_range_events(range, artifact, |boundary| {
             compare_nuget_version(&artifact.version, boundary, artifact)
         }),
+        ("RubyGems", "ECOSYSTEM") => evaluate_range_events(range, artifact, |boundary| {
+            crate::rubygems::compare_versions(&artifact.version, boundary)
+                .map_err(|err| range_error(artifact, err.to_string()))
+        }),
         (_, range_type) => Err(range_error(
             artifact,
             format!(
@@ -2916,6 +2921,7 @@ mod tests {
         assert_eq!(npm.ecosystem.osv_name(), "npm");
         assert_eq!(pypi.ecosystem.osv_name(), "PyPI");
         assert_eq!(pypi.name, "requests");
+        assert_eq!(Ecosystem::RubyGems.osv_name(), "RubyGems");
     }
 
     #[test]
@@ -3455,6 +3461,49 @@ INSERT INTO advisories (
         assert!(
             checker
                 .check(&Artifact::package(Ecosystem::Pypi, "demo", "2.0", None))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_checker_handles_rubygems_ecosystem_ranges() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "RubyGems");
+        insert_range_advisory_with_events(
+            &connection,
+            "GHSA-ruby-range",
+            "RubyGems",
+            "demo",
+            "ECOSYSTEM",
+            &[("introduced", "1.0.0.a"), ("fixed", "1.0.0")],
+        );
+        let checker = checker_for(&db);
+
+        assert_eq!(
+            checker
+                .check(&Artifact::package(
+                    Ecosystem::RubyGems,
+                    "demo",
+                    "1.0.0.rc1",
+                    None,
+                ))
+                .await
+                .unwrap()[0]
+                .osv_id,
+            "GHSA-ruby-range"
+        );
+        assert!(
+            checker
+                .check(&Artifact::package(
+                    Ecosystem::RubyGems,
+                    "demo",
+                    "1.0.0",
+                    None,
+                ))
                 .await
                 .unwrap()
                 .is_empty()
@@ -4059,6 +4108,12 @@ INSERT INTO advisories (
                 return Ok(zip_bytes([]));
             }
             if url.contains("/NuGet/modified_id.csv") {
+                return Ok(Vec::new());
+            }
+            if url.contains("/RubyGems/all.zip") {
+                return Ok(zip_bytes([]));
+            }
+            if url.contains("/RubyGems/modified_id.csv") {
                 return Ok(Vec::new());
             }
             Err(OsvError::Sync(format!(
