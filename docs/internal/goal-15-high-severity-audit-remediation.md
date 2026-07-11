@@ -24,10 +24,12 @@ When this goal is complete:
   destinations or follow unvalidated redirects, while explicitly configured
   local/private test or operator upstreams remain usable;
 - request handling reuses registry/artifact HTTP clients across requests;
-- local SQLite evaluation does not block Tokio workers and batch range work
+- local SQLite evaluation, Maven XML parsing, and material local OSV
+  range/version CPU work do not run on Tokio workers, and batch range work
   scales by package/range rather than version times range;
 - failure syncing one ecosystem does not prevent attempts for the remaining
-  ecosystems, and background failures retry sooner than the normal interval;
+  ecosystems, background failures retry sooner than the normal interval, and
+  overlapping sync runs are prevented;
 - the audit records the remediation evidence and no high-severity item remains
   open.
 
@@ -101,14 +103,17 @@ The goal is complete only when:
    dependency graph, and CI/tag validation enforce the dependency gate.
 2. All upstream body readers enforce documented byte ceilings during streaming
    (not only after allocation), with oversize tests for declared and chunked
-   bodies.
+   bodies; large OSV archives use bounded streaming storage rather than a
+   whole-body in-memory allocation.
 3. Artifact proxy egress validates schemes, destinations after DNS resolution,
    and redirects; untrusted loopback/private/link-local destinations fail
    before contact, while explicitly configured private origins work.
 4. Application state owns reusable ecosystem and artifact clients; request
    routing does not construct unused Reqwest clients.
-5. Local SQLite checks execute on bounded blocking workers, open/reuse reads
-   safely, and batch range query-count complexity is package/range based.
+5. Local SQLite checks, Maven XML parsing, and material local OSV range/version
+   evaluation execute behind bounded blocking/concurrency boundaries with
+   deterministic error propagation; reads are opened/reused safely and batch
+   range query-count complexity is package/range based.
 6. OSV sync attempts every ecosystem independently, records each failure,
    preserves successful generations, returns an aggregate outcome, and applies
    bounded retry/backoff behavior in background mode.
@@ -150,7 +155,8 @@ Acceptance criteria:
   parsing tests cover adversarial namespace/attribute shapes within limits.
 - One bounded streaming response mechanism protects every registry metadata,
   live OSV response, and OSV dump fetch path with clear ecosystem limits and
-  structured errors.
+  structured errors; OSV archives stream to bounded temporary storage instead
+  of being accumulated as a single in-memory HTTP body.
 - CI and release validation run Clippy and RustSec audit checks.
 
 Likely touchpoints: `Cargo.toml`, `Cargo.lock`, HTTP adapter modules,
@@ -202,8 +208,10 @@ Acceptance criteria:
 
 - `AppState` owns and routes through shared clients without constructing all
   clients per request;
-- SQLite work runs through a bounded blocking boundary with deterministic error
-  propagation;
+- SQLite work, Maven XML deserialization, and material local OSV range/version
+  evaluation run through bounded blocking boundaries with deterministic error
+  propagation, with regression evidence that request futures yield while that
+  work is occupied;
 - local batch evaluation loads package ranges/events once and evaluates all
   requested versions without N+1 range-event queries;
 - tests or instrumentation assert client reuse and bounded query behavior.
@@ -230,6 +238,8 @@ Acceptance criteria:
 
 - one sync run attempts all seven ecosystems and reports per-ecosystem success
   or failure without exposing partial generations;
+- concurrent explicit/background sync entry is serialized or rejected so
+  generation work for the same store cannot overlap;
 - background mode retries failures with bounded exponential backoff and jitter
   or an equivalently bounded deterministic test seam, while successful normal
   cycles respect `sync_interval`;
