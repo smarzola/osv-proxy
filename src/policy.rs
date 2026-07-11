@@ -27,6 +27,7 @@ pub enum DecisionReason {
     Allowlisted,
     TooYoung,
     Malicious,
+    Vulnerable,
     ManuallyBlocked,
     MissingPublishTime,
     Unknown,
@@ -251,6 +252,22 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
+    #[test]
+    fn vulnerable_reason_serializes_without_changing_existing_names() {
+        assert_eq!(
+            serde_json::to_string(&DecisionReason::Vulnerable).unwrap(),
+            r#""vulnerable""#
+        );
+        assert_eq!(
+            serde_json::to_string(&DecisionReason::Malicious).unwrap(),
+            r#""malicious""#
+        );
+        assert_eq!(
+            serde_json::to_string(&DecisionReason::TooYoung).unwrap(),
+            r#""too_young""#
+        );
+    }
+
     struct FakeChecker {
         hits: Vec<MaliciousHit>,
         fail: bool,
@@ -273,6 +290,7 @@ mod tests {
                     summary: None,
                     source: "osv".to_string(),
                     modified: None,
+                    effective_severity: None,
                 }],
                 fail: false,
                 calls: AtomicU32::new(0),

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use node_semver as npm_semver;
 use pep440_rs as pep440;
+use polycvss::{Score as CvssScore, Vector as CvssVector, Version as CvssVersion};
 use reqwest::Client;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use semver::Version as cargo_semver;
@@ -25,7 +26,7 @@ const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const OSV_DUMP_BASE_URL: &str = "https://storage.googleapis.com/osv-vulnerabilities";
 
 #[async_trait]
-pub trait MaliciousChecker: Send + Sync {
+pub trait OsvChecker: Send + Sync {
     async fn check(&self, artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError>;
 
     async fn check_many(
@@ -40,6 +41,8 @@ pub trait MaliciousChecker: Send + Sync {
     }
 }
 
+pub use OsvChecker as MaliciousChecker;
+
 pub fn configured_malicious_checker(config: &Config) -> Arc<dyn MaliciousChecker> {
     match config.policy.osv.source {
         OsvSource::Live => Arc::new(OsvHttpClient::new(&config.policy.osv.api_url)),
@@ -47,12 +50,92 @@ pub fn configured_malicious_checker(config: &Config) -> Arc<dyn MaliciousChecker
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MaliciousHit {
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OsvFinding {
     pub osv_id: String,
     pub summary: Option<String>,
     pub source: String,
     pub modified: Option<DateTime<Utc>>,
+    pub effective_severity: Option<OsvEffectiveSeverity>,
+}
+
+pub type MaliciousHit = OsvFinding;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OsvSeverity {
+    #[serde(rename = "type")]
+    pub severity_type: String,
+    #[serde(rename = "score")]
+    pub vector: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OsvEffectiveSeverity {
+    pub severity_type: String,
+    pub vector: String,
+    pub base_score: f64,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error("invalid {severity_type} vector {vector}: {message}")]
+pub struct OsvSeverityError {
+    pub severity_type: String,
+    pub vector: String,
+    pub message: String,
+}
+
+pub fn effective_osv_severity(
+    top_level: &[OsvSeverity],
+    matching_package: Option<&[OsvSeverity]>,
+) -> Result<Option<OsvEffectiveSeverity>, OsvSeverityError> {
+    let selected = matching_package
+        .filter(|severity| !severity.is_empty())
+        .unwrap_or(top_level);
+    let mut effective: Option<OsvEffectiveSeverity> = None;
+    for severity in selected {
+        if !matches!(
+            severity.severity_type.as_str(),
+            "CVSS_V2" | "CVSS_V3" | "CVSS_V4"
+        ) {
+            continue;
+        }
+        let vector = severity
+            .vector
+            .parse::<CvssVector>()
+            .map_err(|error| OsvSeverityError {
+                severity_type: severity.severity_type.clone(),
+                vector: severity.vector.clone(),
+                message: error.to_string(),
+            })?;
+        let version_matches_type = matches!(
+            (severity.severity_type.as_str(), CvssVersion::from(vector)),
+            ("CVSS_V2", CvssVersion::V20)
+                | ("CVSS_V3", CvssVersion::V30 | CvssVersion::V31)
+                | ("CVSS_V4", CvssVersion::V40)
+        );
+        if !version_matches_type {
+            return Err(OsvSeverityError {
+                severity_type: severity.severity_type.clone(),
+                vector: severity.vector.clone(),
+                message: "vector version does not match severity type".to_string(),
+            });
+        }
+        let candidate = OsvEffectiveSeverity {
+            severity_type: severity.severity_type.clone(),
+            vector: severity.vector.clone(),
+            base_score: f64::from(CvssScore::from(vector)),
+        };
+        let replace = effective.as_ref().is_none_or(|current| {
+            candidate.base_score > current.base_score
+                || (candidate.base_score == current.base_score
+                    && (&candidate.severity_type, &candidate.vector)
+                        < (&current.severity_type, &current.vector))
+        });
+        if replace {
+            effective = Some(candidate);
+        }
+    }
+    Ok(effective)
 }
 
 #[derive(Debug, Error)]
@@ -163,6 +246,7 @@ fn hits_from_vulns(vulns: Vec<OsvVulnerability>) -> Vec<MaliciousHit> {
             summary: vuln.summary,
             source: "osv".to_string(),
             modified: vuln.modified,
+            effective_severity: None,
         })
         .collect()
 }
@@ -1059,6 +1143,7 @@ ORDER BY a.osv_id
                     summary: row.get(1)?,
                     source: row.get(2)?,
                     modified,
+                    effective_severity: None,
                 })
             },
         )
@@ -1135,6 +1220,7 @@ ORDER BY a.osv_id, ar.id
                         summary: row.get(2)?,
                         source: row.get(3)?,
                         modified,
+                        effective_severity: None,
                     },
                     row.get::<_, String>(5)?,
                 ))
@@ -1440,6 +1526,121 @@ mod tests {
     use std::time::Duration;
     use tempfile::tempdir;
     use zip::{ZipWriter, write::SimpleFileOptions};
+
+    fn severity(severity_type: &str, vector: &str) -> OsvSeverity {
+        OsvSeverity {
+            severity_type: severity_type.to_string(),
+            vector: vector.to_string(),
+        }
+    }
+
+    #[test]
+    fn effective_severity_supports_cvss_v2_v3_and_v4() {
+        let cases = [
+            ("CVSS_V2", "AV:A/AC:H/Au:N/C:C/I:C/A:C", 6.8),
+            (
+                "CVSS_V3",
+                "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+                9.8,
+            ),
+            (
+                "CVSS_V4",
+                "CVSS:4.0/AV:L/AC:H/AT:N/PR:N/UI:P/VC:L/VI:L/VA:L/SC:H/SI:H/SA:H",
+                5.2,
+            ),
+        ];
+        for (severity_type, vector, expected) in cases {
+            let effective = effective_osv_severity(&[severity(severity_type, vector)], None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(effective.severity_type, severity_type);
+            assert_eq!(effective.vector, vector);
+            assert_eq!(effective.base_score, expected);
+        }
+    }
+
+    #[test]
+    fn effective_severity_uses_highest_recognized_vector() {
+        let effective = effective_osv_severity(
+            &[
+                severity("CVSS_V2", "AV:A/AC:H/Au:N/C:C/I:C/A:C"),
+                severity("CVSS_V3", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+            ],
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(effective.base_score, 9.8);
+        assert_eq!(effective.severity_type, "CVSS_V3");
+    }
+
+    #[test]
+    fn package_severity_overrides_top_level_and_empty_package_falls_back() {
+        let top = [severity(
+            "CVSS_V3",
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+        )];
+        let package = [severity("CVSS_V2", "AV:A/AC:H/Au:N/C:C/I:C/A:C")];
+        assert_eq!(
+            effective_osv_severity(&top, Some(&package))
+                .unwrap()
+                .unwrap()
+                .base_score,
+            6.8
+        );
+        assert_eq!(
+            effective_osv_severity(&top, Some(&[]))
+                .unwrap()
+                .unwrap()
+                .base_score,
+            9.8
+        );
+    }
+
+    #[test]
+    fn missing_and_unknown_severity_are_unscored() {
+        assert_eq!(effective_osv_severity(&[], None).unwrap(), None);
+        assert_eq!(
+            effective_osv_severity(&[severity("GHSA", "HIGH")], None).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_recognized_severity_is_an_error() {
+        let error =
+            effective_osv_severity(&[severity("CVSS_V3", "CVSS:3.1/AV:BROKEN")], None).unwrap_err();
+        assert_eq!(error.severity_type, "CVSS_V3");
+        assert_eq!(error.vector, "CVSS:3.1/AV:BROKEN");
+    }
+
+    #[test]
+    fn recognized_severity_rejects_a_mismatched_vector_version() {
+        let error = effective_osv_severity(
+            &[severity(
+                "CVSS_V4",
+                "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            )],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.severity_type, "CVSS_V4");
+        assert!(error.message.contains("does not match"));
+    }
+
+    #[test]
+    fn equal_scores_use_deterministic_type_and_vector_tie_breaks() {
+        let a = severity("CVSS_V3", "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H");
+        let b = severity(
+            "CVSS_V3",
+            "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H/E:X",
+        );
+        let forward = effective_osv_severity(&[a.clone(), b.clone()], None)
+            .unwrap()
+            .unwrap();
+        let reverse = effective_osv_severity(&[b, a], None).unwrap().unwrap();
+        assert_eq!(forward, reverse);
+    }
 
     #[test]
     fn parses_osv_response_without_vulns_as_empty() {

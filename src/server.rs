@@ -876,6 +876,7 @@ mod tests {
                     summary: Some("malicious fixture".to_string()),
                     source: "osv".to_string(),
                     modified: None,
+                    effective_severity: None,
                 }])
             } else {
                 Ok(Vec::new())

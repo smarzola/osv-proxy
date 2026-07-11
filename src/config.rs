@@ -197,6 +197,8 @@ pub enum MissingPublishTime {
 #[serde(default, deny_unknown_fields)]
 pub struct OsvConfig {
     pub block_malicious: bool,
+    pub block_vulnerabilities: bool,
+    pub minimum_cvss_score: f64,
     pub source: OsvSource,
     pub api_url: String,
     pub on_error: OsvErrorBehavior,
@@ -207,6 +209,8 @@ impl Default for OsvConfig {
     fn default() -> Self {
         Self {
             block_malicious: true,
+            block_vulnerabilities: true,
+            minimum_cvss_score: 0.0,
             source: OsvSource::Live,
             api_url: "https://api.osv.dev".to_string(),
             on_error: OsvErrorBehavior::Block,
@@ -217,6 +221,13 @@ impl Default for OsvConfig {
 
 impl OsvConfig {
     fn validate(&self) -> Result<(), ConfigError> {
+        if !self.minimum_cvss_score.is_finite() || !(0.0..=10.0).contains(&self.minimum_cvss_score)
+        {
+            return Err(ConfigError::Invalid(
+                "policy.osv.minimum_cvss_score must be a finite value from 0.0 through 10.0"
+                    .to_string(),
+            ));
+        }
         self.local.validate()
     }
 }
@@ -421,6 +432,8 @@ mod tests {
             MissingPublishTime::Block
         );
         assert!(config.policy.osv.block_malicious);
+        assert!(config.policy.osv.block_vulnerabilities);
+        assert_eq!(config.policy.osv.minimum_cvss_score, 0.0);
         assert_eq!(config.policy.osv.source, OsvSource::Live);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
@@ -464,10 +477,48 @@ policy:
         .unwrap();
 
         assert!(!config.policy.osv.block_malicious);
+        assert!(config.policy.osv.block_vulnerabilities);
+        assert_eq!(config.policy.osv.minimum_cvss_score, 0.0);
         assert_eq!(config.policy.osv.source, OsvSource::Live);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
+    }
+
+    #[test]
+    fn vulnerability_policy_round_trips_through_yaml() {
+        let config = load(
+            r#"
+policy:
+  osv:
+    block_vulnerabilities: false
+    minimum_cvss_score: 7.5
+"#,
+        )
+        .unwrap();
+        assert!(!config.policy.osv.block_vulnerabilities);
+        assert_eq!(config.policy.osv.minimum_cvss_score, 7.5);
+
+        let encoded = serde_yaml::to_string(&config).unwrap();
+        let decoded: Config = serde_yaml::from_str(&encoded).unwrap();
+        decoded.validate().unwrap();
+        assert!(!decoded.policy.osv.block_vulnerabilities);
+        assert_eq!(decoded.policy.osv.minimum_cvss_score, 7.5);
+    }
+
+    #[test]
+    fn validates_minimum_cvss_score_inclusive_finite_range() {
+        for value in [0.0, 10.0] {
+            let mut config = Config::default();
+            config.policy.osv.minimum_cvss_score = value;
+            config.validate().unwrap();
+        }
+        for value in [-0.1, 10.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut config = Config::default();
+            config.policy.osv.minimum_cvss_score = value;
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains("minimum_cvss_score"));
+        }
     }
 
     #[test]
