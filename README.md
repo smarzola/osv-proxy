@@ -1,7 +1,7 @@
 # osv-proxy
 
 `osv-proxy` is a package-registry security proxy for npm, PyPI,
-Cargo/crates.io, Go modules, and NuGet restore. It combines the
+Cargo/crates.io, Go modules, NuGet restore, and RubyGems/Bundler. It combines the
 [OSV vulnerability database](https://osv.dev/) with local policy.
 
 It sits between package managers and public registries, filters package metadata
@@ -30,6 +30,8 @@ Implemented now:
 - Go module proxy filtering for `@v/list`, `@latest`, `.info`, `.mod`, and `.zip`.
 - NuGet V3 restore service discovery, registration filtering, flat-container
   version enumeration, and protected `.nupkg`/`.nuspec` delivery.
+- RubyGems Compact Index filtering and protected `.gem` delivery for modern
+  Bundler installs.
 - YAML config loading and validation.
 - `serve`, `check`, `eval`, `config validate`, `osv sync`, and the compatibility
   `malicious sync` commands.
@@ -124,6 +126,16 @@ private-module patterns out of `GONOPROXY`/`GOPRIVATE` when the proxy must
 enforce policy. `osv-proxy` returns `403` for policy denials, which Go treats
 as terminal rather than a fallback signal.
 
+Use the proxy as the sole Bundler source in `Gemfile`:
+
+```ruby
+source "http://127.0.0.1:8080/rubygems/"
+```
+
+RubyGems support targets modern Bundler Compact Index installs. Standalone
+legacy `gem install` index protocols, search, publishing, yanking, private
+registry authentication, and gem hosting are unsupported.
+
 ## Check a Package
 
 `check` fetches upstream registry metadata, builds the same canonical artifact
@@ -149,6 +161,7 @@ npm:lodash@4.17.21
 npm:@babel/core@7.24.0
 pypi:requests@2.32.3
 go:github.com/pkg/errors@v0.9.1
+rubygems:rails@8.0.2
 ```
 
 If upstream metadata is missing or malformed, `check` exits non-zero rather than
@@ -185,7 +198,8 @@ artifacts:
   behavior: redirect
 ```
 
-The npm registry, PyPI Simple API, Go module proxy, and OSV API default to their public URLs.
+The npm registry, PyPI Simple API, Go module proxy, NuGet service index,
+RubyGems registry, and OSV API default to their public URLs.
 Set `upstreams` or `policy.osv.api_url` only when using a mirror, fixture, or
 private gateway.
 
@@ -273,7 +287,7 @@ cargo test e2e
 ```
 
 Run only the package-manager end-to-end tests. These start local fixture
-registries and a local proxy, then run npm, uv/pip, Cargo, Go, and .NET clients
+registries and a local proxy, then run npm, uv/pip, Cargo, Go, .NET, and Bundler clients
 against the proxy:
 
 ```sh

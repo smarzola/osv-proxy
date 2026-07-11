@@ -33,7 +33,8 @@ Validate it with:
 cargo run -- config validate --config examples/basic/osv-proxy.yaml
 ```
 
-The npm registry, PyPI Simple API, Go module proxy, and OSV API default to their public URLs.
+The npm registry, PyPI Simple API, Go module proxy, NuGet service index,
+RubyGems registry, and OSV API default to their public URLs.
 Configure them only when routing through a mirror, fixture, or private gateway.
 
 ## Server
@@ -45,8 +46,8 @@ server:
 ```
 
 - `bind`: local socket address for the HTTP server.
-- `public_base_url`: URL used when rewriting npm tarballs and PyPI file links
-  back through `osv-proxy`.
+- `public_base_url`: URL used when advertising or rewriting proxy-owned package
+  metadata and artifact links.
 
 ## Upstreams
 
@@ -60,6 +61,8 @@ upstreams:
     proxy_url: "https://proxy.golang.org"
   nuget:
     service_index_url: "https://api.nuget.org/v3/index.json"
+  rubygems:
+    registry_url: "https://rubygems.org"
 ```
 
 - `npm.registry_url`: upstream npm registry metadata endpoint.
@@ -67,8 +70,10 @@ upstreams:
   fetched as Simple JSON for policy evaluation.
 - `go.proxy_url`: upstream Go module proxy endpoint.
 - `nuget.service_index_url`: upstream NuGet V3 restore service index.
+- `rubygems.registry_url`: upstream RubyGems registry root used for Compact
+  Index metadata, version metadata, and canonical gem downloads.
 
-Both upstream values have the public registry defaults shown above, so most
+All upstream values have public registry defaults, so most
 local configs can omit this section.
 
 ## Artifacts
@@ -177,7 +182,7 @@ Populate or refresh the SQLite database explicitly with:
 osv-proxy osv sync --config /path/to/osv-proxy.yaml
 ```
 
-The sync command downloads npm, PyPI, Go, crates.io, and NuGet OSV GCS dumps,
+The sync command downloads npm, PyPI, Go, crates.io, NuGet, and RubyGems OSV GCS dumps,
 stores all advisories locally, and updates generation-scoped health state.
 `malicious sync` is a compatibility alias. Full advisory storage is materially
 larger than the former malicious-only database. Missing, corrupt,

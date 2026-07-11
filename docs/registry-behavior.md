@@ -10,7 +10,7 @@ downloads recheck policy before redirecting or proxying exact upstream bytes.
 Under the default OSV policy, metadata omits versions matching either `MAL-*`
 or other active advisories at the inclusive CVSS threshold. Direct npm
 tarballs, PyPI files, Cargo crates, Go `.mod`/`.zip` files, and NuGet
-`.nupkg`/`.nuspec` requests rebuild the canonical artifact and re-run the same
+`.nupkg`/`.nuspec` requests, plus RubyGems `.gem` requests, rebuild the canonical artifact and re-run the same
 policy before fetching package bytes. Denials use `reason: malicious` for
 `MAL-*` and `reason: vulnerable` for other advisories. An exact allowlist with
 `bypass_osv: true` is the only OSV bypass.
@@ -190,6 +190,28 @@ the canonical artifact and re-evaluate policy; denials are terminal `403`.
 Allowed `.mod` and `.zip` bytes are redirected or streamed unchanged, so Go's
 module checksum verification remains valid. A missing upstream module remains
 `404`/`410`, which is the only response class that permits GOPROXY fallback.
+
+## RubyGems / Bundler routes
+
+Supported read-only Compact Index routes:
+
+- `GET /rubygems/versions`
+- `GET /rubygems/info/{gem}`
+- `GET /rubygems/gems/{filename}.gem`
+
+The global versions index preserves upstream Compact Index behavior. Per-gem
+info correlates every version/platform line with bounded upstream version
+metadata, validates its checksum and publication time, batch-evaluates policy,
+and removes denied variants without rewriting retained lines. Filtered bodies
+require cache revalidation and own their ETag, SHA-256 Digest/Repr-Digest, and
+byte-range responses.
+
+Direct gem downloads resolve the requested filename to exactly one validated
+name/version/platform tuple and re-run policy before redirect or proxy delivery.
+Ambiguous or inconsistent metadata fails closed. The proxy validates registry
+metadata and its advertised SHA-256; it does not independently rehash streamed
+CDN bytes. Legacy Marshal indexes, standalone `gem install`, dependency/search
+APIs, publishing, yanking, authentication, and gem hosting are unsupported.
 
 ## Artifact Modes
 

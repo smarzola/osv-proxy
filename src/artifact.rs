@@ -13,6 +13,8 @@ pub enum Ecosystem {
     #[serde(rename = "crates.io")]
     CratesIo,
     Nuget,
+    #[serde(rename = "rubygems")]
+    RubyGems,
 }
 
 impl Ecosystem {
@@ -23,6 +25,7 @@ impl Ecosystem {
             Ecosystem::Go => name.to_string(),
             Ecosystem::CratesIo => normalize_cargo_name(name),
             Ecosystem::Nuget => normalize_nuget_name(name),
+            Ecosystem::RubyGems => name.to_string(),
         }
     }
 
@@ -33,6 +36,7 @@ impl Ecosystem {
             Ecosystem::Go => "Go",
             Ecosystem::CratesIo => "crates.io",
             Ecosystem::Nuget => "NuGet",
+            Ecosystem::RubyGems => "RubyGems",
         }
     }
 }
@@ -45,6 +49,7 @@ impl fmt::Display for Ecosystem {
             Ecosystem::Go => write!(f, "go"),
             Ecosystem::CratesIo => write!(f, "crates.io"),
             Ecosystem::Nuget => write!(f, "nuget"),
+            Ecosystem::RubyGems => write!(f, "rubygems"),
         }
     }
 }
@@ -59,6 +64,7 @@ impl FromStr for Ecosystem {
             "go" | "golang" | "go-module" => Ok(Ecosystem::Go),
             "crates.io" | "cargo" | "crates-io" => Ok(Ecosystem::CratesIo),
             "nuget" | "nuget.org" | "dotnet" => Ok(Ecosystem::Nuget),
+            "rubygems" | "rubygem" | "ruby" | "gem" => Ok(Ecosystem::RubyGems),
             other => Err(ArtifactParseError::UnsupportedEcosystem(other.to_string())),
         }
     }
@@ -285,6 +291,20 @@ mod tests {
     fn normalizes_nuget_identity_and_version() {
         let artifact = parse_identity("nuget:Newtonsoft.Json@01.00.0.0-RC.1+build", None).unwrap();
         assert_eq!(artifact.identity(), "nuget:newtonsoft.json@1.0.0-rc.1");
+    }
+
+    #[test]
+    fn parses_rubygems_identity_and_aliases() {
+        for identity in [
+            "rubygems:rails@8.0.2",
+            "ruby:rails@8.0.2",
+            "gem:rails@8.0.2",
+        ] {
+            let parsed = parse_package_identity(identity).unwrap();
+            assert_eq!(parsed.ecosystem, Ecosystem::RubyGems);
+            assert_eq!(parsed.name, "rails");
+            assert_eq!(parsed.version, "8.0.2");
+        }
     }
 
     #[test]

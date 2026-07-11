@@ -9,6 +9,7 @@ use crate::npm::{NpmMetadataProvider, NpmRegistryClient};
 use crate::nuget::NugetClient;
 use crate::policy::{Decision, PolicyEngine};
 use crate::pypi::{PypiSimpleClient, PypiSimpleProvider};
+use crate::rubygems::RubyGemsClient;
 use crate::server;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -248,6 +249,10 @@ async fn registry_check_with_upstreams(
             )
             .await?,
         ],
+        Ecosystem::RubyGems => {
+            let upstream = RubyGemsClient::new(&config.upstreams.rubygems.registry_url);
+            crate::rubygems::lookup_artifacts(&upstream, &identity.name, &identity.version).await?
+        }
     };
     let artifacts = evaluate_artifacts(config, artifacts, now, checker).await;
     Ok(CheckOutput {

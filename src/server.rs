@@ -9,6 +9,7 @@ use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
 use crate::nuget::{self, NugetClient};
 use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
 use crate::response::RegistryResponse;
+use crate::rubygems::{self, CompactIndexProvider, RubyGemsClient};
 use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
@@ -128,6 +129,43 @@ pub async fn route_request_with_accept(
     let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
     let go_upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
     let checker = configured_malicious_checker(config);
+    let rubygems_upstream = RubyGemsClient::new(&config.upstreams.rubygems.registry_url);
+    if let Some(route) = parse_rubygems_route(path) {
+        let headers = HeaderMap::new();
+        return match route {
+            RubyGemsRoute::Versions => rubygems_upstream
+                .fetch_versions_index(None)
+                .await
+                .unwrap_or_else(|error| rubygems::error_response(&error)),
+            RubyGemsRoute::Info { name } => rubygems::compact_info_response(
+                config,
+                &rubygems_upstream,
+                &rubygems_upstream,
+                checker.as_ref(),
+                &name,
+                Utc::now(),
+                &headers,
+            )
+            .await
+            .unwrap_or_else(|error| rubygems::error_response(&error)),
+            RubyGemsRoute::Artifact { filename } => {
+                let delivery = ArtifactDeliveryClient::new();
+                match rubygems::artifact_delivery_response(
+                    config,
+                    &rubygems_upstream,
+                    checker.as_ref(),
+                    &filename,
+                    Utc::now(),
+                    ArtifactDeliveryOptions::new(&delivery),
+                )
+                .await
+                {
+                    Ok(response) => response.into_registry_response().await,
+                    Err(error) => rubygems::error_response(&error),
+                }
+            }
+        };
+    }
     if let Some((module, route)) = go::parse_route(path) {
         let delivery = ArtifactDeliveryClient::new();
         return go::route_response(
@@ -361,7 +399,41 @@ async fn route_http_request_with_accept_and_headers(
     let cargo_upstream = CargoRegistryClient::new(config);
     let delivery = ArtifactDeliveryClient::new();
     let nuget_upstream = NugetClient::new(&config.upstreams.nuget.service_index_url);
+    let rubygems_upstream = RubyGemsClient::new(&config.upstreams.rubygems.registry_url);
     let now = Utc::now();
+
+    if let Some(route) = parse_rubygems_route(path) {
+        return match route {
+            RubyGemsRoute::Versions => rubygems_upstream
+                .fetch_versions_index(Some(headers))
+                .await
+                .unwrap_or_else(|error| rubygems::error_response(&error))
+                .into_http_response(),
+            RubyGemsRoute::Info { name } => rubygems::compact_info_response(
+                config,
+                &rubygems_upstream,
+                &rubygems_upstream,
+                checker,
+                &name,
+                now,
+                headers,
+            )
+            .await
+            .unwrap_or_else(|error| rubygems::error_response(&error))
+            .into_http_response(),
+            RubyGemsRoute::Artifact { filename } => rubygems::artifact_delivery_response(
+                config,
+                &rubygems_upstream,
+                checker,
+                &filename,
+                now,
+                ArtifactDeliveryOptions::with_request_headers(&delivery, headers),
+            )
+            .await
+            .map(|response| response.into_http_response())
+            .unwrap_or_else(|error| rubygems::error_response(&error).into_http_response()),
+        };
+    }
 
     if path.split('?').next().unwrap_or(path) == "/nuget/v3/index.json" {
         return nuget::service_index_response(config)
@@ -586,6 +658,34 @@ enum PypiRoute {
         version: String,
         filename: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RubyGemsRoute {
+    Versions,
+    Info { name: String },
+    Artifact { filename: String },
+}
+
+fn parse_rubygems_route(path: &str) -> Option<RubyGemsRoute> {
+    let path = path.split('?').next().unwrap_or(path);
+    if path == "/rubygems/versions" {
+        return Some(RubyGemsRoute::Versions);
+    }
+    if let Some(name) = path.strip_prefix("/rubygems/info/") {
+        let name = percent_decode_segment(name)?;
+        if !name.contains('/') && rubygems::validate_name(&name).is_ok() {
+            return Some(RubyGemsRoute::Info { name });
+        }
+        return None;
+    }
+    if let Some(filename) = path.strip_prefix("/rubygems/gems/") {
+        let filename = percent_decode_segment(filename)?;
+        if !filename.is_empty() && !filename.contains('/') && filename.ends_with(".gem") {
+            return Some(RubyGemsRoute::Artifact { filename });
+        }
+    }
+    None
 }
 
 fn parse_nuget_registration_route(path: &str) -> Option<(String, String)> {
@@ -1080,6 +1180,28 @@ mod tests {
                 filename: "demo-1.0.0.tar.gz".to_string()
             })
         );
+    }
+
+    #[test]
+    fn parses_only_owned_rubygems_read_routes() {
+        assert_eq!(
+            parse_rubygems_route("/rubygems/versions"),
+            Some(RubyGemsRoute::Versions)
+        );
+        assert_eq!(
+            parse_rubygems_route("/rubygems/info/demo%2Dgem"),
+            Some(RubyGemsRoute::Info {
+                name: "demo-gem".into()
+            })
+        );
+        assert_eq!(
+            parse_rubygems_route("/rubygems/gems/demo-1.0.0.gem"),
+            Some(RubyGemsRoute::Artifact {
+                filename: "demo-1.0.0.gem".into()
+            })
+        );
+        assert_eq!(parse_rubygems_route("/rubygems/api/v1/gems"), None);
+        assert_eq!(parse_rubygems_route("/rubygems/info/../secret"), None);
     }
 
     #[tokio::test]
