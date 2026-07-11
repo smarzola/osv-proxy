@@ -1,7 +1,7 @@
 # OSV Advisory Data
 
-`osv-proxy` evaluates active OSV records for npm, PyPI, Go, crates.io, and
-NuGet. `MAL-*` records are classified as known malicious packages. Other IDs
+`osv-proxy` evaluates active OSV records for npm, PyPI, Go, crates.io, NuGet,
+and RubyGems. `MAL-*` records are classified as known malicious packages. Other IDs
 are vulnerabilities and are evaluated against `policy.osv.minimum_cvss_score`.
 
 Live mode queries OSV during metadata filtering and repeats the check before an

@@ -3,7 +3,7 @@
 ## OSV Vulnerability Severity Policy
 
 The current implementation blocks active OSV vulnerabilities by default across
-npm, PyPI, Cargo, Go, and NuGet. It supports inclusive CVSS thresholds,
+npm, PyPI, Cargo, Go, NuGet, and RubyGems. It supports inclusive CVSS thresholds,
 unscored and malformed-severity behavior, bounded live detail hydration, and a
 generation-scoped all-advisory SQLite store. `osv sync` is canonical;
 `malicious sync` is retained as an alias. See [policy](policy.md) and
@@ -11,6 +11,10 @@ generation-scoped all-advisory SQLite store. `osv sync` is canonical;
 
 Cargo/crates.io sparse replacement filters index records, rechecks policy at
 artifact delivery, and supports redirect or proxy artifact behavior.
+
+RubyGems support filters the Bundler Compact Index, rechecks direct `.gem`
+downloads, and supports redirect or proxy artifact behavior. Legacy Marshal
+indexes and publishing are outside the supported surface.
 
 ## First End-to-End Target
 

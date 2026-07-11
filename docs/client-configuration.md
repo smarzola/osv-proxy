@@ -62,3 +62,17 @@ dotnet restore --source http://127.0.0.1:8080/nuget/v3/index.json
 
 NuGet support is restore-scoped; search, publishing, symbols, and
 authentication are unsupported.
+
+## Ruby / Bundler
+
+Use the proxy as the only source in `Gemfile`:
+
+```ruby
+source "http://127.0.0.1:8080/rubygems/"
+```
+
+Then run `bundle install` normally. Do not configure a fallback mirror or an
+additional public source when the proxy is a mandatory policy gate. Support is
+limited to modern Bundler Compact Index restore; legacy RubyGems Marshal
+indexes, standalone `gem install`, search, publishing, yanking, authentication,
+and private registry hosting are unsupported.

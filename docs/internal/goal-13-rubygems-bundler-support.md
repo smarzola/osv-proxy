@@ -147,7 +147,7 @@ The goal is complete only when:
 - [x] Milestone 1: RubyGems identity, configuration, OSV, and CLI foundations
 - [x] Milestone 2: Policy-filtered Compact Index with cache/range semantics
 - [x] Milestone 3: Protected `.gem` delivery and deterministic error mapping
-- [ ] Milestone 4: Real Bundler workflows, documentation, and full regression
+- [x] Milestone 4: Real Bundler workflows, documentation, and full regression
 
 ### Checkpoint Protocol
 
@@ -259,8 +259,9 @@ Status (2026-07-11): Complete. Added owned `/rubygems/versions` and
 range responses; per-gem info correlates bounded Compact Index records with the
 exact version/platform metadata set, validates checksums and publication times,
 batch-evaluates policy, and fails closed on malformed, duplicate, missing, or
-ambiguous correlation. Filtered bodies own strong SHA-256 ETags, Digest and
-Repr-Digest, mandatory-revalidation cache policy, and correct full,
+ambiguous correlation. Filtered bodies own Compact Index-compatible content
+ETags plus SHA-256 Digest and Repr-Digest, mandatory-revalidation cache policy,
+and correct full,
 `If-None-Match`, `Range`, `If-Range`, `206`, `304`, and `416` behavior. A live
 read-only `rack` check found 178 API keys and 178 compact records with no set
 differences. Adversarial review found stale-freshness reuse from `max-age=60`
@@ -360,7 +361,25 @@ cargo run -- config validate --config examples/basic/osv-proxy.yaml
 git diff --check
 ```
 
-Status: Not started.
+Status (2026-07-11): Complete. Added hermetic generated `.gem` fixtures and a
+real Bundler test through the production Axum path covering dependency restore,
+the current local native platform, prerelease, redirect and proxy delivery,
+fresh denial, locked denial, and a sole proxy source with no rubygems.org
+fallback. Local Bundler 1.17 exposed that Compact Index ETags must match the MD5
+of the representation; filtered ETags now follow that protocol contract while
+Digest/Repr-Digest remain SHA-256. CI provisions Ruby 3.3.8 and Bundler 2.5.23
+without a skip path. README and operator docs cover configuration, routes, CLI,
+OSV data, supported behavior, legacy/publish/authentication non-goals, and the
+fact that streamed CDN bytes are not rehashed. Adversarial review found that
+redirect and proxy initially shared an install cache, allowing proxy delivery
+to go unexercised. The modes now use isolated project, HOME, installed-gem, and
+artifact-cache paths; the real test passed again and re-review reported no
+blocking findings. Verification: `cargo test --test package_manager_e2e` (12
+passed), `cargo fmt --check` (passed), `cargo test` (222 unit tests and 12
+package-manager tests passed), `cargo clippy --all-targets --all-features -- -D
+warnings` (passed after one formatting-only lint repair), `cargo run -- config
+validate --config examples/basic/osv-proxy.yaml` (passed), and `git diff
+--check` (passed).
 
 ## Final Verification
 

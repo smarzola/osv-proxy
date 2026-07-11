@@ -280,19 +280,19 @@ fn validate_compact_attributes(line: &str, metadata: &GemVersion) -> Result<(), 
     let mut checksum = None;
     let mut created_at = None;
     for attribute in attributes.split(',') {
-        if let Some(value) = attribute.strip_prefix("checksum:") {
-            if checksum.replace(value).is_some() {
-                return Err(RubyGemsError::InvalidMetadata(
-                    "compact info has duplicate checksum".into(),
-                ));
-            }
+        if let Some(value) = attribute.strip_prefix("checksum:")
+            && checksum.replace(value).is_some()
+        {
+            return Err(RubyGemsError::InvalidMetadata(
+                "compact info has duplicate checksum".into(),
+            ));
         }
-        if let Some(value) = attribute.strip_prefix("created_at:") {
-            if created_at.replace(value).is_some() {
-                return Err(RubyGemsError::InvalidMetadata(
-                    "compact info has duplicate created_at".into(),
-                ));
-            }
+        if let Some(value) = attribute.strip_prefix("created_at:")
+            && created_at.replace(value).is_some()
+        {
+            return Err(RubyGemsError::InvalidMetadata(
+                "compact info has duplicate created_at".into(),
+            ));
         }
     }
     let checksum = checksum
@@ -363,11 +363,7 @@ async fn evaluate_artifacts(
 
 fn filtered_representation_response(body: Vec<u8>, headers: &HeaderMap) -> RegistryResponse {
     let digest = Sha256::digest(&body);
-    let digest_hex = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let etag = format!("\"{digest_hex}\"");
+    let etag = format!("\"{:x}\"", md5::compute(&body));
     let repr_digest = format!(
         "sha-256=\"{}\"",
         base64::engine::general_purpose::STANDARD.encode(digest)

@@ -43,6 +43,13 @@ jobs:
         with:
           go-version: '1.24.0'
 
+      - name: Install Ruby and Bundler
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3.8'
+          bundler: '2.5.23'
+          bundler-cache: false
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:

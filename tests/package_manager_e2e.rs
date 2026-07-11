@@ -21,6 +21,176 @@ const PYPI_PACKAGE: &str = "osv-proxy-e2e-pypi";
 const PYPI_MODULE: &str = "osv_proxy_e2e_pypi";
 const GO_MODULE: &str = "example.com/fixture";
 const NUGET_ROOT: &str = "Fixture.Root";
+const RUBYGEMS_ROOT: &str = "osv-proxy-e2e-ruby";
+const RUBYGEMS_DEPENDENCY: &str = "osv-proxy-e2e-ruby-dependency";
+const RUBYGEMS_PLATFORM: &str = "osv-proxy-e2e-ruby-platform";
+const RUBYGEMS_PRERELEASE: &str = "osv-proxy-e2e-ruby-prerelease";
+
+#[test]
+fn bundler_install_uses_proxy_for_resolution_delivery_and_denials() {
+    require_command("ruby");
+    require_command("gem");
+    require_command("bundle");
+    let workspace = TempWorkspace::new("bundler-install-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create_with_rubygems(workspace.path()));
+
+    for behavior in [ArtifactBehavior::Redirect, ArtifactBehavior::Proxy] {
+        let proxy = start_axum_proxy(rubygems_e2e_config(
+            &upstream,
+            behavior,
+            false,
+            RUBYGEMS_ROOT,
+            "1.0.0",
+        ));
+        let project = workspace.child(match behavior {
+            ArtifactBehavior::Redirect => "ruby-redirect",
+            _ => "ruby-proxy",
+        });
+        write_gemfile(
+            &project,
+            &proxy,
+            &[(RUBYGEMS_ROOT, "1.0.0"), (RUBYGEMS_PLATFORM, "1.0.0")],
+        );
+        let cache = workspace.child(match behavior {
+            ArtifactBehavior::Redirect => "ruby-install-cache-redirect",
+            _ => "ruby-install-cache-proxy",
+        });
+        let output = run_bundle_install(&project, cache, false);
+        assert_success("Bundler dependency/platform install", &output);
+        let lock = fs::read_to_string(project.join("Gemfile.lock")).unwrap();
+        assert!(lock.contains(RUBYGEMS_DEPENDENCY));
+        assert!(lock.contains(RUBYGEMS_PLATFORM));
+    }
+
+    let prerelease_proxy = start_axum_proxy(rubygems_e2e_config(
+        &upstream,
+        ArtifactBehavior::Redirect,
+        false,
+        RUBYGEMS_PRERELEASE,
+        "1.1.0.pre.1",
+    ));
+    let prerelease = workspace.child("ruby-prerelease");
+    write_gemfile(
+        &prerelease,
+        &prerelease_proxy,
+        &[(RUBYGEMS_PRERELEASE, "1.1.0.pre.1")],
+    );
+    assert_success(
+        "Bundler prerelease install",
+        &run_bundle_install(&prerelease, workspace.child("ruby-prerelease-cache"), false),
+    );
+
+    let blocked_proxy = start_axum_proxy(rubygems_e2e_config(
+        &upstream,
+        ArtifactBehavior::Redirect,
+        true,
+        RUBYGEMS_ROOT,
+        "1.0.1",
+    ));
+    let fresh = workspace.child("ruby-blocked-fresh");
+    write_gemfile(&fresh, &blocked_proxy, &[(RUBYGEMS_ROOT, "1.0.1")]);
+    assert_bundler_denial(
+        "fresh blocked Bundler install",
+        &run_bundle_install(&fresh, workspace.child("ruby-blocked-fresh-cache"), false),
+    );
+
+    let allowed_proxy = start_axum_proxy(rubygems_e2e_config(
+        &upstream,
+        ArtifactBehavior::Redirect,
+        false,
+        RUBYGEMS_ROOT,
+        "1.0.1",
+    ));
+    let locked = workspace.child("ruby-blocked-locked");
+    write_gemfile(&locked, &allowed_proxy, &[(RUBYGEMS_ROOT, "1.0.1")]);
+    assert_success(
+        "seed Bundler lockfile",
+        &run_bundle_install(&locked, workspace.child("ruby-lock-seed-cache"), false),
+    );
+    replace_file_text(
+        &locked.join("Gemfile"),
+        &allowed_proxy.base_url(),
+        &blocked_proxy.base_url(),
+    );
+    replace_file_text(
+        &locked.join("Gemfile.lock"),
+        &allowed_proxy.base_url(),
+        &blocked_proxy.base_url(),
+    );
+    assert_bundler_denial(
+        "locked blocked Bundler install",
+        &run_bundle_install(&locked, workspace.child("ruby-blocked-lock-cache"), true),
+    );
+}
+
+fn rubygems_e2e_config(
+    upstream: &TestServer,
+    behavior: ArtifactBehavior,
+    block: bool,
+    package: &str,
+    version: &str,
+) -> Config {
+    let mut config = Config::default();
+    config.upstreams.rubygems.registry_url = upstream.base_url();
+    config.policy.osv.api_url = upstream.base_url();
+    config.policy.minimum_age = Duration::from_secs(0);
+    config.artifacts.behavior = behavior;
+    if !block {
+        config.allowlist.push(AllowlistEntry {
+            ecosystem: Ecosystem::RubyGems,
+            name: package.into(),
+            version: version.into(),
+            bypass_age_gate: false,
+            bypass_osv: true,
+            reason: "exercise allowed Bundler path separately".into(),
+        });
+        config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
+    }
+    config
+}
+
+fn write_gemfile(project: &Path, proxy: &TestServer, gems: &[(&str, &str)]) {
+    fs::create_dir_all(project).unwrap();
+    let mut body = format!("source \"{}/rubygems/\"\n", proxy.base_url());
+    for (name, version) in gems {
+        body.push_str(&format!("gem \"{name}\", \"= {version}\"\n"));
+    }
+    write_file(&project.join("Gemfile"), &body);
+}
+
+fn run_bundle_install(project: &Path, cache: PathBuf, locked: bool) -> Output {
+    let home = project.join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&cache).unwrap();
+    let mut command = Command::new("bundle");
+    command.args(["install", "--jobs", "1", "--retry", "0", "--verbose"]);
+    if locked {
+        command.arg("--deployment");
+    }
+    command
+        .current_dir(project)
+        .env("HOME", &home)
+        .env("BUNDLE_USER_HOME", home.join(".bundle"))
+        .env("BUNDLE_PATH", cache.join("gems"))
+        .env("BUNDLE_CACHE_PATH", cache.join("cache"))
+        .env("BUNDLE_DISABLE_VERSION_CHECK", "true")
+        .output()
+        .unwrap()
+}
+
+fn assert_bundler_denial(context: &str, output: &Output) {
+    assert_failure(context, output);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined.contains("https://rubygems.org"),
+        "{context} used fallback: {combined}"
+    );
+}
 
 #[test]
 fn dotnet_restore_uses_redirecting_nuget_proxy_with_dependency() {
@@ -429,6 +599,28 @@ struct FixtureArtifacts {
     pypi_wheels: HashMap<String, Vec<u8>>,
     nuget_packages: HashMap<String, Vec<u8>>,
     cargo_crates: HashMap<String, Vec<u8>>,
+    rubygems: Vec<RubyGemFixture>,
+}
+
+#[derive(Clone)]
+struct RubyGemFixture {
+    name: String,
+    version: String,
+    platform: String,
+    created_at: String,
+    dependencies: Vec<(String, String)>,
+    bytes: Vec<u8>,
+    sha256: String,
+}
+
+impl RubyGemFixture {
+    fn filename(&self) -> String {
+        if self.platform == "ruby" {
+            format!("{}-{}.gem", self.name, self.version)
+        } else {
+            format!("{}-{}-{}.gem", self.name, self.version, self.platform)
+        }
+    }
 }
 
 impl FixtureArtifacts {
@@ -438,7 +630,14 @@ impl FixtureArtifacts {
             pypi_wheels: create_pypi_wheels(root),
             nuget_packages: create_nuget_packages(),
             cargo_crates: create_cargo_crates(root),
+            rubygems: Vec::new(),
         }
+    }
+
+    fn create_with_rubygems(root: &Path) -> Self {
+        let mut fixture = Self::create(root);
+        fixture.rubygems = create_rubygems(root);
+        fixture
     }
 }
 
@@ -588,6 +787,75 @@ fn fixture_response(
     }
     if request.method == "GET" && path == "/v1/vulns/GHSA-e2e-vulnerable" {
         return RegistryResponse::json(200, &e2e_vulnerability()).unwrap();
+    }
+
+    if request.method == "GET" && path == "/versions" {
+        let mut names = fixture
+            .rubygems
+            .iter()
+            .map(|gem| gem.name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        let mut body = "created_at: 2026-07-01T00:00:00Z\n---\n".to_string();
+        for name in names {
+            let info = rubygems_info(fixture, name);
+            let versions = fixture
+                .rubygems
+                .iter()
+                .filter(|gem| gem.name == name)
+                .map(|gem| {
+                    if gem.platform == "ruby" {
+                        gem.version.clone()
+                    } else {
+                        format!("{}-{}", gem.version, gem.platform)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            body.push_str(&format!(
+                "{name} {versions} {:x}\n",
+                md5::compute(info.as_bytes())
+            ));
+        }
+        return text_response(body);
+    }
+    if request.method == "GET"
+        && let Some(name) = path.strip_prefix("/info/")
+        && fixture.rubygems.iter().any(|gem| gem.name == name)
+    {
+        return text_response(rubygems_info(fixture, name));
+    }
+    if request.method == "GET"
+        && let Some(name) = path
+            .strip_prefix("/api/v1/versions/")
+            .and_then(|name| name.strip_suffix(".json"))
+        && fixture.rubygems.iter().any(|gem| gem.name == name)
+    {
+        let versions = fixture
+            .rubygems
+            .iter()
+            .filter(|gem| gem.name == name)
+            .map(|gem| {
+                json!({
+                    "number": gem.version,
+                    "platform": gem.platform,
+                    "created_at": gem.created_at,
+                    "sha": gem.sha256,
+                    "prerelease": gem.version.chars().any(|character| character.is_ascii_alphabetic())
+                })
+            })
+            .collect::<Vec<_>>();
+        return RegistryResponse::json(200, &json!(versions)).unwrap();
+    }
+    if request.method == "GET"
+        && let Some(filename) = path.strip_prefix("/downloads/")
+        && let Some(gem) = fixture
+            .rubygems
+            .iter()
+            .find(|gem| gem.filename() == filename)
+    {
+        return binary_response("application/octet-stream", gem.bytes.clone());
     }
 
     if request.method == "GET" && path == format!("/{NPM_PACKAGE}") {
@@ -746,6 +1014,7 @@ fn is_e2e_vulnerable_query(query: &serde_json::Value) -> bool {
     version == "1.0.1"
         || (ecosystem == "Go" && name == GO_MODULE && version == "1.0.0")
         || (ecosystem == "NuGet" && name.eq_ignore_ascii_case(NUGET_ROOT) && version == "1.0.0")
+        || (ecosystem == "RubyGems" && name == RUBYGEMS_ROOT && version == "1.0.1")
 }
 
 fn go_module_zip() -> Vec<u8> {
@@ -784,6 +1053,139 @@ fn pypi_file_metadata(base_url: &str, version: &str) -> serde_json::Value {
         "hashes": {},
         "upload-time": "2026-06-01T00:00:00Z"
     })
+}
+
+fn rubygems_info(fixture: &FixtureArtifacts, name: &str) -> String {
+    let mut body = "---\n".to_string();
+    for gem in fixture.rubygems.iter().filter(|gem| gem.name == name) {
+        let key = if gem.platform == "ruby" {
+            gem.version.clone()
+        } else {
+            format!("{}-{}", gem.version, gem.platform)
+        };
+        let dependencies = gem
+            .dependencies
+            .iter()
+            .map(|(name, requirement)| format!("{name}:{requirement}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        body.push_str(&format!(
+            "{key} {dependencies}|checksum:{},ruby:>= 2.6.0,created_at:{}\n",
+            gem.sha256, gem.created_at
+        ));
+    }
+    body
+}
+
+fn create_rubygems(root: &Path) -> Vec<RubyGemFixture> {
+    let platform_output = Command::new("ruby")
+        .args(["-rrubygems", "-e", "print Gem::Platform.local.to_s"])
+        .output()
+        .unwrap();
+    assert_success("detect local RubyGems platform", &platform_output);
+    let local_platform = String::from_utf8(platform_output.stdout).unwrap();
+    [
+        (
+            RUBYGEMS_DEPENDENCY,
+            "1.0.0",
+            "ruby",
+            Vec::<(&str, &str)>::new(),
+        ),
+        (
+            RUBYGEMS_ROOT,
+            "1.0.0",
+            "ruby",
+            vec![(RUBYGEMS_DEPENDENCY, "= 1.0.0")],
+        ),
+        (
+            RUBYGEMS_ROOT,
+            "1.0.1",
+            "ruby",
+            vec![(RUBYGEMS_DEPENDENCY, "= 1.0.0")],
+        ),
+        (
+            RUBYGEMS_PLATFORM,
+            "1.0.0",
+            local_platform.as_str(),
+            Vec::new(),
+        ),
+        (RUBYGEMS_PRERELEASE, "1.1.0.pre.1", "ruby", Vec::new()),
+    ]
+    .into_iter()
+    .map(|(name, version, platform, dependencies)| {
+        build_rubygem(root, name, version, platform, dependencies)
+    })
+    .collect()
+}
+
+fn build_rubygem(
+    root: &Path,
+    name: &str,
+    version: &str,
+    platform: &str,
+    dependencies: Vec<(&str, &str)>,
+) -> RubyGemFixture {
+    let directory = root.join(format!("rubygem-{name}-{version}-{platform}"));
+    fs::create_dir_all(directory.join("lib")).unwrap();
+    let module = name.replace('-', "_");
+    write_file(
+        &directory.join("lib").join(format!("{module}.rb")),
+        &format!(
+            "module {}; VERSION = \"{version}\"; end\n",
+            ruby_constant(name)
+        ),
+    );
+    let dependency_lines = dependencies
+        .iter()
+        .map(|(dependency, requirement)| {
+            format!("  spec.add_runtime_dependency \"{dependency}\", \"{requirement}\"\n")
+        })
+        .collect::<String>();
+    write_file(
+        &directory.join("fixture.gemspec"),
+        &format!(
+            "Gem::Specification.new do |spec|\n  spec.name = \"{name}\"\n  spec.version = \"{version}\"\n  spec.summary = \"osv-proxy fixture\"\n  spec.authors = [\"test\"]\n  spec.files = [\"lib/{module}.rb\"]\n  spec.require_paths = [\"lib\"]\n  spec.platform = Gem::Platform.new(\"{platform}\")\n{dependency_lines}end\n"
+        ),
+    );
+    let expected_filename = if platform == "ruby" {
+        format!("{name}-{version}.gem")
+    } else {
+        format!("{name}-{version}-{platform}.gem")
+    };
+    let output_path = directory.join(&expected_filename);
+    let output = Command::new("gem")
+        .args(["build", "fixture.gemspec", "--output"])
+        .arg(&output_path)
+        .current_dir(&directory)
+        .output()
+        .unwrap();
+    assert_success("build RubyGem fixture", &output);
+    let bytes = fs::read(&output_path).unwrap();
+    RubyGemFixture {
+        name: name.into(),
+        version: version.into(),
+        platform: platform.into(),
+        created_at: "2026-01-01T00:00:00Z".into(),
+        dependencies: dependencies
+            .into_iter()
+            .map(|(name, requirement)| (name.into(), requirement.into()))
+            .collect(),
+        sha256: sha256_hex(&bytes),
+        bytes,
+    }
+}
+
+fn ruby_constant(name: &str) -> String {
+    name.split(['-', '_', '.'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            characters
+                .next()
+                .map(|first| format!("{}{}", first.to_ascii_uppercase(), characters.as_str()))
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 fn create_npm_tarballs(root: &Path) -> HashMap<String, Vec<u8>> {
@@ -1116,6 +1518,19 @@ fn binary_response(content_type: &str, body: Vec<u8>) -> RegistryResponse {
     }
 }
 
+fn text_response(body: String) -> RegistryResponse {
+    let etag = format!("\"{:x}\"", md5::compute(body.as_bytes()));
+    RegistryResponse {
+        status: 200,
+        headers: vec![
+            ("content-type".into(), "text/plain; charset=utf-8".into()),
+            ("etag".into(), etag),
+            ("accept-ranges".into(), "bytes".into()),
+        ],
+        body: body.into_bytes(),
+    }
+}
+
 struct TempWorkspace {
     path: PathBuf,
 }
@@ -1151,6 +1566,11 @@ fn write_file(path: &Path, contents: &str) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, contents).unwrap();
+}
+
+fn replace_file_text(path: &Path, from: &str, to: &str) {
+    let contents = fs::read_to_string(path).unwrap();
+    write_file(path, &contents.replace(from, to));
 }
 
 fn require_command(name: &str) {
