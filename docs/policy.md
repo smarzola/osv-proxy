@@ -14,6 +14,7 @@ pub struct Decision {
     pub source: Option<String>,
     pub published_at: Option<DateTime<Utc>>,
     pub eligible_at: Option<DateTime<Utc>>,
+    pub cvss_score: Option<f64>,
 }
 
 pub enum DecisionReason {
@@ -21,11 +22,14 @@ pub enum DecisionReason {
     Allowlisted,
     TooYoung,
     Malicious,
+    Vulnerable,
     ManuallyBlocked,
     MissingPublishTime,
     Unknown,
 }
 ```
+
+Optional fields are omitted from JSON when absent.
 
 Allowed decision:
 
@@ -51,6 +55,20 @@ Blocked decision:
 }
 ```
 
+Scored vulnerability decision:
+
+```json
+{
+  "allowed": false,
+  "reason": "vulnerable",
+  "package": "npm:some-package@1.2.3",
+  "message": "Blocked by OSV vulnerability GHSA-abcd-1234 with CVSS base score 9.8",
+  "rule_id": "GHSA-abcd-1234",
+  "source": "osv",
+  "cvss_score": 9.8
+}
+```
+
 ## Evaluation Order
 
 1. Build canonical `Artifact`.
@@ -60,12 +78,12 @@ Blocked decision:
 5. If a `MAL-*` record matches and malicious blocking is enabled, block as `malicious`.
 6. If another active advisory meets the vulnerability threshold, block as `vulnerable`.
 7. Check manual local blocklist.
-7. If manually blocked, block.
-8. If allowlist has `bypass_age_gate=true`, skip age gate.
-9. Otherwise apply minimum age gate.
-10. If package is too young, block.
-11. If publish time is missing, follow `missing_publish_time` config.
-12. Otherwise allow.
+8. If manually blocked, block.
+9. If allowlist has `bypass_age_gate=true`, skip age gate.
+10. Otherwise apply minimum age gate.
+11. If package is too young, block.
+12. If publish time is missing, follow `missing_publish_time` config.
+13. Otherwise allow.
 
 Allowlist entries are exact-version only.
 
@@ -140,6 +158,12 @@ unscored matching advisories block. At positive thresholds they do not.
 Malformed recognized vectors follow `on_error`. Set
 `block_vulnerabilities: false` to preserve malicious-only behavior without
 vulnerability detail hydration.
+
+`on_error` applies to checker failures, missing batch results, pagination
+failures, and malformed recognized severity vectors. With `block`, policy emits
+an OSV error decision; with `allow`, that error does not itself block. This is
+separate from a valid OSV finding: a matching finding is evaluated by its
+classification and threshold even when other advisory lookups fail.
 
 OSV is checked during policy evaluation. The default OSV API URL is
 `https://api.osv.dev`; override `policy.osv.api_url` only when routing through a

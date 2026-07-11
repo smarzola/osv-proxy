@@ -32,6 +32,34 @@ Malicious block:
 }
 ```
 
+Scored vulnerability block:
+
+```json
+{
+  "allowed": false,
+  "reason": "vulnerable",
+  "package": "npm:some-package@1.2.3",
+  "message": "Blocked by OSV vulnerability GHSA-abcd-1234 with CVSS base score 9.8",
+  "source": "osv",
+  "rule_id": "GHSA-abcd-1234",
+  "cvss_score": 9.8
+}
+```
+
+Unscored vulnerability block at the default zero threshold (`cvss_score` is
+omitted when absent):
+
+```json
+{
+  "allowed": false,
+  "reason": "vulnerable",
+  "package": "pypi:some-package@1.2.3",
+  "message": "Blocked by OSV vulnerability GHSA-wxyz-5678",
+  "source": "osv",
+  "rule_id": "GHSA-wxyz-5678"
+}
+```
+
 Age-gate block:
 
 ```json

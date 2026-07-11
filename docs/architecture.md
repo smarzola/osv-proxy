@@ -1,157 +1,67 @@
 # Architecture
 
-The first implementation should stay pragmatic. Splitting into crates is useful, but avoid over-engineering before the HTTP and policy paths are working.
+`osv-proxy` is currently one Rust crate with ecosystem adapters around one
+canonical artifact and policy model.
 
-Cargo is a dedicated sparse-index adapter that produces canonical artifacts for
-the ecosystem-neutral policy engine and uses shared artifact delivery.
-
-## Suggested Workspace Layout
+## Current Components
 
 ```text
-osv-proxy/
-  Cargo.toml
-  crates/
-    osv-proxy/
-      src/main.rs
-    osv-core/
-      src/
-        artifact.rs
-        config.rs
-        decision.rs
-        ecosystem.rs
-        policy.rs
-        version.rs
-    osv-adapters/
-      src/
-        npm.rs
-        pypi.rs
-        mod.rs
-    osv-malicious/
-      src/
-        osv_client.rs
-        naive.rs
-        local.rs
-        mongo.rs
-        sync.rs
-        store.rs
-    osv-metadata-cache/
-      src/
-        cache.rs
-        noop.rs
-        cachebox.rs
-    osv-artifacts/
-      src/
-        redirect.rs
-        proxy.rs
-        s3_cache.rs
-    osv-audit/
-      src/lib.rs
+server/router
+  npm metadata + tarball routes
+  PyPI Simple + file routes
+  Cargo sparse index + crate routes
+  Go list/info/mod/zip routes
+  NuGet service/registration/flat-container/package routes
+        |
+        v
+ecosystem adapters -> canonical Artifact
+        |
+        v
+policy
+  exact allowlist and OSV bypass
+  OSV malicious/vulnerability evaluation
+  manual blocklist
+  minimum age and missing-time behavior
+        |
+        +-- live OSV client
+        |     paginated query/batch + bounded detail hydration
+        |
+        +-- local SQLite OSV store
+              generation-scoped advisories and affected occurrences
+              exact versions, ranges/events, selected severity/error
+              bootstrap catch-up + incremental/background sync
+        |
+        v
+artifact delivery
+  redirect | plain streaming proxy
 ```
 
-This is a target layout, not current repository state.
+All adapters normalize registry data into `Artifact { ecosystem, name,
+version, filename, upstream_url, published_at, hashes }`. Supported ecosystems
+are npm, PyPI, crates.io, Go, and NuGet. Package names and versions are
+normalized according to their registry before policy evaluation.
 
-## Major Components
+Metadata filtering evaluates batches of canonical artifacts. Retained download
+URLs point back through `osv-proxy`. Direct artifact routes rebuild the exact
+artifact and re-run policy before redirecting or fetching upstream bytes.
 
-```text
-osv-proxy
-  server
-    npm routes
-    pypi routes
-  adapters
-    npm adapter
-    pypi adapter
-  policy
-    age gate
-    malicious package check
-    manual blocklist
-    exact-version allowlist
-  malicious
-    naive OSV API client
-    local SQLite store
-    background OSV sync
-  metadata_cache
-    disabled/no-op
-    cachebox backend
-  artifacts
-    redirect mode
-    proxy mode
-    proxy_cache_s3 mode
-  config
-  audit
-  observability
-```
+## OSV Boundary
 
-## Canonical Artifact Model
+The policy engine consumes OSV findings and does not depend on whether they came
+from live HTTP or local SQLite. Live batch checks preserve input cardinality,
+deduplicate advisory IDs, paginate, and hydrate at most 16 details concurrently.
+Local request handling performs indexed reads only and makes no OSV network
+call.
 
-The policy engine evaluates canonical artifacts, not raw npm or PyPI metadata.
+The local store uses one active generation per ecosystem. Bootstrap imports an
+archive plus source-timestamp catch-up into staging and activates it atomically;
+failed imports never expose partial data. Existing malicious-only databases are
+version 0 and cannot satisfy vulnerability-enabled readiness. Raw JSON remains
+optional.
 
-```rust
-pub enum Ecosystem {
-    Npm,
-    Pypi,
-}
+## Future Boundaries
 
-pub struct Artifact {
-    pub ecosystem: Ecosystem,
-    pub name: String,
-    pub version: String,
-    pub filename: Option<String>,
-    pub upstream_url: Option<String>,
-    pub published_at: Option<DateTime<Utc>>,
-    pub hashes: ArtifactHashes,
-}
-
-pub struct ArtifactHashes {
-    pub sha256: Option<String>,
-    pub sha512: Option<String>,
-    pub integrity: Option<String>,
-}
-```
-
-Canonical package identity format:
-
-```text
-{ecosystem}:{name}@{version}
-```
-
-Examples:
-
-- `npm:lodash@4.17.21`
-- `npm:@babel/core@7.24.0`
-- `pypi:requests@2.32.3`
-
-## Ecosystem Normalization
-
-npm:
-
-- preserve scoped package names
-- examples: `lodash`, `@babel/core`
-
-PyPI:
-
-- normalize according to Python package-name rules
-- examples: `Requests` becomes `requests`, `my_package` becomes `my-package`
-
-## External System Boundaries
-
-Use traits for external services:
-
-- OSV client
-- OSV advisory store
-- metadata cache
-- artifact backend
-- audit sink
-
-The policy engine does not depend on whether OSV findings come from live calls
-or the local generation-scoped store.
-
-The implemented local OSV store is SQLite. It stores advisory metadata,
-normalized affected occurrences, selected CVSS data, exact affected versions,
-range events, generation readiness, and sync state. Full raw OSV advisory JSON
-retention is optional. Request handling
-performs indexed SQLite reads and evaluates exact versions and ranges in memory
-without OSV network calls.
-
-MongoDB-compatible storage may be added later if needed. If it is, mongolino
-should remain MongoDB-compatible infrastructure behind that future store
-interface, not a separate active backend or config shape.
+Metadata cache, S3 artifact cache, MongoDB-compatible advisory storage, and an
+audit sink are possible future components. They are not implemented current
+components. If introduced, they must preserve the metadata/artifact policy
+recheck and generation-readiness invariants.

@@ -1,107 +1,75 @@
 # Product Specification
 
-`osv-proxy` is a policy-enforcing package registry proxy for npm, PyPI,
+`osv-proxy` is a Rust package-registry security proxy for npm, PyPI,
 Cargo/crates.io, Go modules, and NuGet restore.
 
 ```text
-npm / pnpm / yarn / bun / pip / uv / poetry
-        |
-        v
-    osv-proxy
-        |
-        +-- policy engine
-        +-- OSV malicious and vulnerability checks
-        +-- minimum age gate
-        +-- exact-version allowlist
-        +-- optional metadata cache via cachebox
-        +-- optional artifact proxy/cache
-        |
-        v
-npm registry / PyPI / files.pythonhosted.org
+npm/pnpm/yarn/bun   pip/uv/poetry   Cargo   Go   dotnet/NuGet
+         \              |            |      |        /
+                          osv-proxy
+                              |
+          metadata filtering + artifact policy recheck
+                              |
+       npm / PyPI / crates.io / Go proxy / NuGet upstreams
 ```
 
-## Product Summary
+## Current Product
 
-`osv-proxy` protects dependency installation by:
+The implemented product provides:
 
-- filtering package metadata before clients see versions or files
-- enforcing a configurable minimum age gate
-- blocking known malicious packages and active vulnerabilities from OSV
-- supporting exact-version allowlist overrides
-- supporting manual package and version blocklists
-- optionally proxying or caching package artifacts
-- supporting cheap public-service redirect mode to avoid large artifact egress costs
+- registry-native metadata filtering for all five supported ecosystems;
+- a minimum package-age gate and missing-publish-time policy;
+- active OSV `MAL-*` and CVSS-threshold vulnerability blocking;
+- exact-version OSV and age-gate allowlist bypasses;
+- exact-version and whole-package manual blocklists;
+- a second policy check on direct artifact routes;
+- HTTP redirect and plain streaming proxy artifact behavior;
+- live OSV API evaluation with bounded, deduplicated detail hydration;
+- generation-scoped local SQLite OSV evaluation with no OSV request on the
+  install path;
+- strict YAML configuration and structured JSON decisions.
 
-## Name
-
-- Product name: `osv-proxy`
-- Main binary: `osv-proxy`
-
-## Implementation Language
-
-Use Rust.
-
-Recommended stack:
-
-- `axum` for HTTP server
-- `tokio` for async runtime
-- `reqwest` for HTTP client
-- `serde`, `serde_json`, and `serde_yaml` for serialization and config
-- `tracing` for structured logs
-- `tower` for middleware
-- `chrono` for time handling
-- `rusqlite` for local OSV advisory storage
-- `object_store` or `aws-sdk-s3` for S3-compatible artifact cache
-- `semver` for npm version helpers
-- `pep440_rs` for PyPI version helpers, if useful
-
-Keep external systems behind traits so the core policy engine stays easy to test.
-
-## Default Security Posture
-
-Defaults should be conservative:
+Default security posture:
 
 ```yaml
 policy:
   minimum_age: "72h"
-  missing_publish_time: "block"
+  missing_publish_time: block
   osv:
     block_malicious: true
-    on_error: "block"
+    block_vulnerabilities: true
+    minimum_cvss_score: 0
+    source: live
+    on_error: block
+artifacts:
+  behavior: redirect
 ```
 
-Developer mode can be more permissive, but must be explicit.
+The zero threshold intentionally blocks matching unscored advisories. Operators
+who need the prior behavior can set `block_vulnerabilities: false` while
+retaining malicious-package blocking. Any OSV bypass is exact-version only,
+explicit, and requires a reason.
 
-## Important Invariants
+## Invariants
 
-- Policy is checked during metadata generation.
-- Policy is checked again during artifact serving.
-- Cached metadata never bypasses current policy.
-- Cached artifacts never bypass current policy.
-- Allowlist bypasses are exact-version only.
-- Malicious bypass requires explicit config and a reason.
-- Live OSV mode may call OSV during request handling.
-- Local OSV mode must not call OSV during install-request handling.
-- Metadata cache is either disabled or cachebox-backed.
-- There is no memory metadata cache.
-- Redirect mode rewrites artifact URLs to `osv-proxy` URLs, not upstream URLs.
+- Metadata and direct artifact delivery evaluate the same current policy.
+- Redirected artifact URLs remain owned by `osv-proxy` until the second check.
+- A denied proxy-mode artifact is rejected before upstream package bytes are
+  fetched.
+- Live OSV failures and malformed recognized vectors follow `on_error`.
+- Local vulnerability checks require a complete active dataset generation.
+- Raw OSV advisory retention is opt-in.
 
-## Final Product Definition
+## Implementation
 
-`osv-proxy` is a Rust registry security proxy for npm and PyPI.
+The current implementation uses Axum/Tokio, Reqwest, Serde, Rusqlite,
+`polycvss`, and ecosystem-specific version parsers. External OSV and registry
+access remains behind injectable interfaces so policy and adapters can be
+tested hermetically.
 
-It provides:
+## Future Work
 
-- minimum age gate for newly published packages
-- built-in OSV malicious and CVSS-threshold vulnerability blocking
-- exact-version allowlist escape hatches
-- manual blocklist
-- metadata filtering
-- artifact redirect, proxy, and S3-cache modes
-- live OSV API mode
-- local SQLite all-advisory store mode
-- possible future MongoDB-compatible malicious storage
-- cachebox support for metadata caching
-- YAML configuration
-- structured audit logs
-- cheap public deployment mode with low artifact egress
+Metadata caching with cachebox, S3-compatible artifact caching,
+MongoDB-compatible advisory storage, authentication/publishing controls,
+license policy, and a structured audit-log sink are possible future features.
+They are not current product capabilities or accepted configuration modes.

@@ -1,7 +1,8 @@
 # osv-proxy
 
-`osv-proxy` is a package-registry security proxy for npm, PyPI, Cargo/crates.io, Go modules, and NuGet restore that combines
-the [OSV vulnerability database](https://osv.dev/) with local policy.
+`osv-proxy` is a package-registry security proxy for npm, PyPI,
+Cargo/crates.io, Go modules, and NuGet restore. It combines the
+[OSV vulnerability database](https://osv.dev/) with local policy.
 
 It sits between package managers and public registries, filters package metadata
 through deterministic policy backed by OSV data and local rules, and checks the
@@ -11,7 +12,8 @@ configured artifact behavior.
 ## What It Does
 
 - Blocks package versions that are too new for the configured minimum age.
-- Blocks package versions with active OSV malicious-package and vulnerability records.
+- Blocks package versions with active OSV malicious-package and vulnerability
+  records.
 - Supports exact-version allowlist exceptions.
 - Supports exact-version and whole-package blocklist entries.
 - Filters npm metadata and PyPI Simple project metadata so blocked versions are
@@ -29,8 +31,8 @@ Implemented now:
 - NuGet V3 restore service discovery, registration filtering, flat-container
   version enumeration, and protected `.nupkg`/`.nuspec` delivery.
 - YAML config loading and validation.
-- `serve`, `check`, `eval`, `config validate`, `osv sync`, and the compatibility `malicious sync`
-  commands.
+- `serve`, `check`, `eval`, `config validate`, `osv sync`, and the compatibility
+  `malicious sync` commands.
 - Live OSV API checks during request handling.
 - Local SQLite OSV advisory checks with explicit and background OSV dump
   sync.
