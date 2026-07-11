@@ -4,16 +4,28 @@
 //! this adapter so the shared policy engine remains ecosystem-neutral.
 
 use crate::artifact::{Artifact, ArtifactHashes, Ecosystem};
+use crate::config::Config;
+use crate::malicious::MaliciousChecker;
+use crate::policy::{Decision, PolicyEngine};
+use crate::response::RegistryResponse;
 use async_trait::async_trait;
+use axum::http::{HeaderMap, header};
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use thiserror::Error;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_GEM_VARIANTS: usize = 10_000;
+const MAX_COMPACT_INFO_BYTES: usize = 16 * 1024 * 1024;
+const MAX_COMPACT_INFO_LINES: usize = 100_000;
+const COMPACT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 
 #[derive(Debug, Clone)]
 pub struct RubyGemsClient {
@@ -54,15 +66,398 @@ pub trait RubyGemsProvider: Send + Sync {
 #[async_trait]
 impl RubyGemsProvider for RubyGemsClient {
     async fn fetch_versions(&self, name: &str) -> Result<Vec<GemVersion>, RubyGemsError> {
-        Ok(self
+        let mut versions: Vec<GemVersion> = self
             .client
             .get(self.versions_url(name)?)
             .send()
             .await?
             .error_for_status()?
             .json()
-            .await?)
+            .await?;
+        if versions.len() > MAX_GEM_VARIANTS {
+            return Err(RubyGemsError::TooManyVariants(versions.len()));
+        }
+        for version in &mut versions {
+            if version.gem_uri.is_empty() {
+                version.gem_uri =
+                    format!("{}/downloads/{}", self.registry_url, version.filename(name));
+            }
+        }
+        Ok(versions)
     }
+}
+
+#[async_trait]
+pub trait CompactIndexProvider: Send + Sync {
+    async fn fetch_versions_index(
+        &self,
+        request_headers: Option<&HeaderMap>,
+    ) -> Result<RegistryResponse, RubyGemsError>;
+    async fn fetch_info(&self, name: &str) -> Result<Vec<u8>, RubyGemsError>;
+}
+
+#[async_trait]
+impl CompactIndexProvider for RubyGemsClient {
+    async fn fetch_versions_index(
+        &self,
+        request_headers: Option<&HeaderMap>,
+    ) -> Result<RegistryResponse, RubyGemsError> {
+        let mut request = self.client.get(format!("{}/versions", self.registry_url));
+        if let Some(headers) = request_headers {
+            for name in [
+                header::RANGE,
+                header::IF_NONE_MATCH,
+                header::IF_MODIFIED_SINCE,
+                header::IF_RANGE,
+            ] {
+                if let Some(value) = headers.get(&name) {
+                    request = request.header(name, value);
+                }
+            }
+        }
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        if status >= 400 {
+            return Err(RubyGemsError::UpstreamStatus(status));
+        }
+        let headers = response
+            .headers()
+            .iter()
+            .filter(|(name, _)| {
+                matches!(
+                    name.as_str(),
+                    "content-type"
+                        | "content-length"
+                        | "etag"
+                        | "last-modified"
+                        | "accept-ranges"
+                        | "content-range"
+                        | "cache-control"
+                        | "digest"
+                        | "repr-digest"
+                )
+            })
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_string(), value.to_string()))
+            })
+            .collect();
+        Ok(RegistryResponse {
+            status,
+            headers,
+            body: response.bytes().await?.to_vec(),
+        })
+    }
+
+    async fn fetch_info(&self, name: &str) -> Result<Vec<u8>, RubyGemsError> {
+        validate_name(name)?;
+        let response = self
+            .client
+            .get(format!("{}/info/{name}", self.registry_url))
+            .send()
+            .await?;
+        let status = response.status().as_u16();
+        if status >= 400 {
+            return Err(RubyGemsError::UpstreamStatus(status));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_COMPACT_INFO_BYTES as u64)
+        {
+            return Err(RubyGemsError::CompactInfoTooLarge);
+        }
+        let bytes = response.bytes().await?.to_vec();
+        if bytes.len() > MAX_COMPACT_INFO_BYTES {
+            return Err(RubyGemsError::CompactInfoTooLarge);
+        }
+        Ok(bytes)
+    }
+}
+
+pub async fn compact_info_response(
+    config: &Config,
+    metadata: &dyn RubyGemsProvider,
+    compact: &dyn CompactIndexProvider,
+    checker: &dyn MaliciousChecker,
+    name: &str,
+    now: DateTime<Utc>,
+    request_headers: &HeaderMap,
+) -> Result<RegistryResponse, RubyGemsError> {
+    validate_name(name)?;
+    let (raw, versions) =
+        tokio::try_join!(compact.fetch_info(name), metadata.fetch_versions(name))?;
+    let filtered = filter_compact_info(config, checker, name, &raw, versions, now).await?;
+    Ok(filtered_representation_response(filtered, request_headers))
+}
+
+async fn filter_compact_info(
+    config: &Config,
+    checker: &dyn MaliciousChecker,
+    name: &str,
+    raw: &[u8],
+    versions: Vec<GemVersion>,
+    now: DateTime<Utc>,
+) -> Result<Vec<u8>, RubyGemsError> {
+    let raw = std::str::from_utf8(raw)
+        .map_err(|_| RubyGemsError::InvalidMetadata("compact info must be UTF-8".into()))?;
+    if raw.lines().count() > MAX_COMPACT_INFO_LINES {
+        return Err(RubyGemsError::CompactInfoTooLarge);
+    }
+    let separator = raw
+        .lines()
+        .position(|line| line == "---")
+        .ok_or_else(|| RubyGemsError::InvalidMetadata("compact info has no separator".into()))?;
+    let mut metadata_by_key = BTreeMap::new();
+    for version in versions {
+        if version.yanked {
+            continue;
+        }
+        let key = version.compact_key();
+        if metadata_by_key.insert(key.clone(), version).is_some() {
+            return Err(RubyGemsError::InvalidMetadata(format!(
+                "duplicate RubyGems variant {key}"
+            )));
+        }
+    }
+    let lines = raw.lines().collect::<Vec<_>>();
+    let mut seen = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for line in lines
+        .iter()
+        .skip(separator + 1)
+        .filter(|line| !line.is_empty())
+    {
+        let key = line.split_once(' ').map(|(key, _)| key).ok_or_else(|| {
+            RubyGemsError::InvalidMetadata("compact info line has no version separator".into())
+        })?;
+        if !seen.insert(key.to_string()) {
+            return Err(RubyGemsError::InvalidMetadata(format!(
+                "duplicate compact info variant {key}"
+            )));
+        }
+        let metadata = metadata_by_key.remove(key).ok_or_else(|| {
+            RubyGemsError::InvalidMetadata(format!(
+                "compact info variant {key} has no exact upstream metadata"
+            ))
+        })?;
+        validate_compact_attributes(line, &metadata)?;
+        candidates.push(((*line).to_string(), metadata.artifact(name)?));
+    }
+    if !metadata_by_key.is_empty() {
+        return Err(RubyGemsError::InvalidMetadata(
+            "upstream version metadata contains variants absent from compact info".into(),
+        ));
+    }
+    let artifacts = candidates
+        .iter()
+        .map(|(_, artifact)| artifact.clone())
+        .collect::<Vec<_>>();
+    let decisions = evaluate_artifacts(config, checker, &artifacts, now).await;
+    let mut output = lines[..=separator].join("\n");
+    output.push('\n');
+    for ((line, _), decision) in candidates.into_iter().zip(decisions) {
+        if decision.allowed {
+            output.push_str(&line);
+            output.push('\n');
+        }
+    }
+    Ok(output.into_bytes())
+}
+
+fn validate_compact_attributes(line: &str, metadata: &GemVersion) -> Result<(), RubyGemsError> {
+    let attributes = line
+        .rsplit_once('|')
+        .map(|(_, value)| value)
+        .ok_or_else(|| {
+            RubyGemsError::InvalidMetadata("compact info line has no attributes".into())
+        })?;
+    let mut checksum = None;
+    let mut created_at = None;
+    for attribute in attributes.split(',') {
+        if let Some(value) = attribute.strip_prefix("checksum:") {
+            if checksum.replace(value).is_some() {
+                return Err(RubyGemsError::InvalidMetadata(
+                    "compact info has duplicate checksum".into(),
+                ));
+            }
+        }
+        if let Some(value) = attribute.strip_prefix("created_at:") {
+            if created_at.replace(value).is_some() {
+                return Err(RubyGemsError::InvalidMetadata(
+                    "compact info has duplicate created_at".into(),
+                ));
+            }
+        }
+    }
+    let checksum = checksum
+        .ok_or_else(|| RubyGemsError::InvalidMetadata("compact info has no checksum".into()))?;
+    if !checksum.eq_ignore_ascii_case(&metadata.sha) {
+        return Err(RubyGemsError::InvalidMetadata(
+            "compact info checksum disagrees with version metadata".into(),
+        ));
+    }
+    let created_at = created_at
+        .ok_or_else(|| RubyGemsError::InvalidMetadata("compact info has no created_at".into()))?
+        .parse::<DateTime<Utc>>()
+        .map_err(|error| RubyGemsError::InvalidMetadata(error.to_string()))?;
+    if created_at.timestamp() != metadata.created_at.timestamp() {
+        return Err(RubyGemsError::InvalidMetadata(
+            "compact info created_at disagrees with version metadata".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn evaluate_artifacts(
+    config: &Config,
+    checker: &dyn MaliciousChecker,
+    artifacts: &[Artifact],
+    now: DateTime<Utc>,
+) -> Vec<Decision> {
+    let policy = PolicyEngine::new(config);
+    let indexed = artifacts
+        .iter()
+        .enumerate()
+        .filter(|(_, artifact)| policy.should_check_osv(artifact))
+        .map(|(index, artifact)| (index, artifact.clone()))
+        .collect::<Vec<_>>();
+    let checked = indexed
+        .iter()
+        .map(|(_, artifact)| artifact.clone())
+        .collect::<Vec<_>>();
+    let results = if checked.is_empty() {
+        Ok(Vec::new())
+    } else {
+        match checker.check_many(&checked).await {
+            Ok(results) if results.len() == checked.len() => Ok(results),
+            Ok(results) => Err(format!(
+                "OSV batch returned {} results for {} RubyGems artifacts",
+                results.len(),
+                checked.len()
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    let mut results_by_index = vec![None; artifacts.len()];
+    for (batch_index, (artifact_index, artifact)) in indexed.iter().enumerate() {
+        results_by_index[*artifact_index] = Some(match &results {
+            Ok(results) => results
+                .get(batch_index)
+                .cloned()
+                .ok_or_else(|| format!("OSV batch result missing for {}", artifact.identity())),
+            Err(error) => Err(error.clone()),
+        });
+    }
+    artifacts
+        .iter()
+        .zip(results_by_index)
+        .map(|(artifact, result)| policy.evaluate_with_malicious_result(artifact, now, result))
+        .collect()
+}
+
+fn filtered_representation_response(body: Vec<u8>, headers: &HeaderMap) -> RegistryResponse {
+    let digest = Sha256::digest(&body);
+    let digest_hex = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let etag = format!("\"{digest_hex}\"");
+    let repr_digest = format!(
+        "sha-256=\"{}\"",
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    );
+    let base_headers = || {
+        vec![
+            ("content-type".into(), COMPACT_CONTENT_TYPE.into()),
+            ("etag".into(), etag.clone()),
+            ("repr-digest".into(), repr_digest.clone()),
+            ("digest".into(), repr_digest.clone()),
+            ("accept-ranges".into(), "bytes".into()),
+            ("cache-control".into(), "no-cache".into()),
+        ]
+    };
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| etag_list_matches(value, &etag))
+    {
+        return RegistryResponse {
+            status: 304,
+            headers: base_headers(),
+            body: Vec::new(),
+        };
+    }
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let if_range_matches = headers
+        .get(header::IF_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| value.trim() == etag);
+    if let Some(range) = range.filter(|_| if_range_matches) {
+        match parse_range(range, body.len()) {
+            Some((start, end)) => {
+                let partial = body[start..=end].to_vec();
+                let mut response_headers = base_headers();
+                response_headers.push((
+                    "content-range".into(),
+                    format!("bytes {start}-{end}/{}", body.len()),
+                ));
+                response_headers.push(("content-length".into(), partial.len().to_string()));
+                return RegistryResponse {
+                    status: 206,
+                    headers: response_headers,
+                    body: partial,
+                };
+            }
+            None => {
+                let mut response_headers = base_headers();
+                response_headers.push(("content-range".into(), format!("bytes */{}", body.len())));
+                return RegistryResponse {
+                    status: 416,
+                    headers: response_headers,
+                    body: Vec::new(),
+                };
+            }
+        }
+    }
+    let mut response_headers = base_headers();
+    response_headers.push(("content-length".into(), body.len().to_string()));
+    RegistryResponse {
+        status: 200,
+        headers: response_headers,
+        body,
+    }
+}
+
+fn etag_list_matches(value: &str, etag: &str) -> bool {
+    value.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate == etag || candidate.strip_prefix("W/") == Some(etag)
+    })
+}
+
+fn parse_range(value: &str, length: usize) -> Option<(usize, usize)> {
+    let range = value.strip_prefix("bytes=")?;
+    if range.contains(',') || length == 0 {
+        return None;
+    }
+    let (start, end) = range.split_once('-')?;
+    if start.is_empty() {
+        let suffix = end.parse::<usize>().ok()?.min(length);
+        return (suffix > 0).then_some((length - suffix, length - 1));
+    }
+    let start = start.parse::<usize>().ok()?;
+    if start >= length {
+        return None;
+    }
+    let end = if end.is_empty() {
+        length - 1
+    } else {
+        end.parse::<usize>().ok()?.min(length - 1)
+    };
+    (start <= end).then_some((start, end))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -73,10 +468,19 @@ pub struct GemVersion {
     pub sha: String,
     #[serde(default)]
     pub yanked: bool,
+    #[serde(default)]
     pub gem_uri: String,
 }
 
 impl GemVersion {
+    pub fn compact_key(&self) -> String {
+        if self.platform == "ruby" {
+            self.number.clone()
+        } else {
+            format!("{}-{}", self.number, self.platform)
+        }
+    }
+
     pub fn filename(&self, name: &str) -> String {
         if self.platform == "ruby" {
             format!("{name}-{}.gem", self.number)
@@ -332,14 +736,28 @@ pub enum RubyGemsError {
     InvalidMetadata(String),
     #[error("RubyGems version not found: {name}@{version}")]
     VersionNotFound { name: String, version: String },
+    #[error("RubyGems upstream returned HTTP status {0}")]
+    UpstreamStatus(u16),
+    #[error("RubyGems package has too many variants: {0}")]
+    TooManyVariants(usize),
+    #[error("RubyGems compact info exceeds supported bounds")]
+    CompactInfoTooLarge,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AllowlistEntry, BlocklistEntry, MissingPublishTime, OsvErrorBehavior};
+    use crate::malicious::{OsvError, OsvFinding};
+    use axum::http::HeaderValue;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     fn gem(number: &str, platform: &str, yanked: bool) -> GemVersion {
+        gem_at(number, platform, yanked, "2026-01-01T00:00:00Z")
+    }
+
+    fn gem_at(number: &str, platform: &str, yanked: bool, created_at: &str) -> GemVersion {
         let suffix = if platform == "ruby" {
             format!("demo-{number}.gem")
         } else {
@@ -348,7 +766,7 @@ mod tests {
         GemVersion {
             number: number.into(),
             platform: platform.into(),
-            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            created_at: created_at.parse().unwrap(),
             sha: "a".repeat(64),
             yanked,
             gem_uri: format!("https://rubygems.example/gems/{suffix}"),
@@ -361,6 +779,58 @@ mod tests {
     impl RubyGemsProvider for StaticProvider {
         async fn fetch_versions(&self, name: &str) -> Result<Vec<GemVersion>, RubyGemsError> {
             Ok(self.0.get(name).cloned().unwrap_or_default())
+        }
+    }
+
+    struct CleanChecker {
+        batches: AtomicUsize,
+    }
+
+    struct PositionalChecker;
+
+    #[async_trait]
+    impl MaliciousChecker for PositionalChecker {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<OsvFinding>, OsvError> {
+            panic!("compact filtering must use check_many")
+        }
+
+        async fn check_many(
+            &self,
+            artifacts: &[Artifact],
+        ) -> Result<Vec<Vec<OsvFinding>>, OsvError> {
+            assert_eq!(
+                artifacts
+                    .iter()
+                    .map(|artifact| artifact.version.as_str())
+                    .collect::<Vec<_>>(),
+                ["1.0.0", "3.0.0"]
+            );
+            Ok(vec![
+                Vec::new(),
+                vec![OsvFinding {
+                    osv_id: "MAL-ruby-positional".into(),
+                    summary: None,
+                    source: "fixture".into(),
+                    modified: None,
+                    effective_severity: None,
+                    evaluation_error: None,
+                }],
+            ])
+        }
+    }
+
+    #[async_trait]
+    impl MaliciousChecker for CleanChecker {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<OsvFinding>, OsvError> {
+            panic!("compact filtering must use check_many")
+        }
+
+        async fn check_many(
+            &self,
+            artifacts: &[Artifact],
+        ) -> Result<Vec<Vec<OsvFinding>>, OsvError> {
+            self.batches.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(vec![Vec::new(); artifacts.len()])
         }
     }
 
@@ -457,5 +927,205 @@ mod tests {
             vec![gem("1.-1", "ruby", false), gem("1.0.0", "ruby", false)],
         )]));
         assert!(lookup_artifacts(&provider, "demo", "1.0.0").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn compact_info_filters_policy_in_one_batch_and_preserves_lines() {
+        let raw = concat!(
+            "---\n",
+            "1.0.0 dep:>= 1|checksum:",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ",created_at:2026-01-01T00:00:00Z\n",
+            "2.0.0 |checksum:",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ",created_at:2026-01-02T00:00:00Z\n",
+            "3.0.0-arm64-darwin |checksum:",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ",created_at:2026-07-10T12:00:00Z\n"
+        );
+        let versions = vec![
+            gem_at("1.0.0", "ruby", false, "2026-01-01T00:00:00.123Z"),
+            gem_at("2.0.0", "ruby", false, "2026-01-02T00:00:00.456Z"),
+            gem_at("3.0.0", "arm64-darwin", false, "2026-07-10T12:00:00.789Z"),
+        ];
+        let mut config = Config::default();
+        config.policy.osv.on_error = OsvErrorBehavior::Block;
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::RubyGems,
+            name: "demo".into(),
+            versions: vec!["2.0.0".into()],
+            reason: "test".into(),
+        });
+        let checker = CleanChecker {
+            batches: AtomicUsize::new(0),
+        };
+        let filtered = filter_compact_info(
+            &config,
+            &checker,
+            "demo",
+            raw.as_bytes(),
+            versions,
+            "2026-07-11T16:00:00Z".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        let text = String::from_utf8(filtered).unwrap();
+        assert!(text.contains("1.0.0 dep:>= 1|checksum:"));
+        assert!(!text.contains("2.0.0 |"));
+        assert!(!text.contains("3.0.0-arm64-darwin |"));
+        assert_eq!(checker.batches.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn filtered_response_supports_validators_and_byte_ranges() {
+        let body = b"---\n1.0.0 |checksum:abc\n".to_vec();
+        let full = filtered_representation_response(body.clone(), &HeaderMap::new());
+        assert_eq!(full.status, 200);
+        assert_eq!(
+            header_value(&full, "content-length"),
+            Some(body.len().to_string())
+        );
+        let etag = header_value(&full, "etag").unwrap();
+        assert!(
+            header_value(&full, "repr-digest")
+                .unwrap()
+                .starts_with("sha-256=\"")
+        );
+        assert_eq!(
+            header_value(&full, "cache-control").as_deref(),
+            Some("no-cache")
+        );
+
+        let mut conditional = HeaderMap::new();
+        conditional.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&format!("W/{etag}")).unwrap(),
+        );
+        assert_eq!(
+            filtered_representation_response(body.clone(), &conditional).status,
+            304
+        );
+
+        let mut ranged = HeaderMap::new();
+        ranged.insert(header::RANGE, HeaderValue::from_static("bytes=4-8"));
+        ranged.insert(header::IF_RANGE, HeaderValue::from_str(&etag).unwrap());
+        let partial = filtered_representation_response(body.clone(), &ranged);
+        assert_eq!(partial.status, 206);
+        assert_eq!(partial.body, body[4..=8]);
+        assert_eq!(
+            header_value(&partial, "content-range"),
+            Some(format!("bytes 4-8/{}", body.len()))
+        );
+
+        ranged.insert(header::IF_RANGE, HeaderValue::from_static("\"stale\""));
+        assert_eq!(
+            filtered_representation_response(body.clone(), &ranged).status,
+            200
+        );
+        ranged.remove(header::IF_RANGE);
+        ranged.insert(header::RANGE, HeaderValue::from_static("bytes=999-"));
+        assert_eq!(filtered_representation_response(body, &ranged).status, 416);
+    }
+
+    #[tokio::test]
+    async fn compact_info_fails_closed_on_metadata_disagreement() {
+        let raw = concat!(
+            "---\n1.0.0 |checksum:",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ",created_at:2026-01-01T00:00:00Z\n"
+        );
+        let checker = CleanChecker {
+            batches: AtomicUsize::new(0),
+        };
+        let error = filter_compact_info(
+            &Config::default(),
+            &checker,
+            "demo",
+            raw.as_bytes(),
+            vec![gem("1.0.0", "ruby", false)],
+            Utc::now(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("checksum disagrees"));
+    }
+
+    #[tokio::test]
+    async fn age_transition_invalidates_filtered_etag() {
+        let raw = concat!(
+            "---\n1.0.0 |checksum:",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ",created_at:2026-07-10T00:00:00Z\n"
+        );
+        let versions = vec![gem_at("1.0.0", "ruby", false, "2026-07-10T00:00:00.123Z")];
+        let checker = CleanChecker {
+            batches: AtomicUsize::new(0),
+        };
+        let young = filter_compact_info(
+            &Config::default(),
+            &checker,
+            "demo",
+            raw.as_bytes(),
+            versions.clone(),
+            "2026-07-11T00:00:00Z".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        let young_response = filtered_representation_response(young, &HeaderMap::new());
+        let old_etag = header_value(&young_response, "etag").unwrap();
+
+        let aged = filter_compact_info(
+            &Config::default(),
+            &checker,
+            "demo",
+            raw.as_bytes(),
+            versions,
+            "2026-07-14T00:00:01Z".parse().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&old_etag).unwrap(),
+        );
+        let aged_response = filtered_representation_response(aged, &headers);
+        assert_eq!(aged_response.status, 200);
+        assert_ne!(header_value(&aged_response, "etag").unwrap(), old_etag);
+        assert!(
+            String::from_utf8(aged_response.body)
+                .unwrap()
+                .contains("1.0.0 |")
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_results_map_linearly_across_osv_bypass_entries() {
+        let artifacts = ["1.0.0", "2.0.0", "3.0.0"]
+            .map(|version| Artifact::package(Ecosystem::RubyGems, "demo", version, None));
+        let mut config = Config::default();
+        config.policy.minimum_age = Duration::ZERO;
+        config.policy.missing_publish_time = MissingPublishTime::Allow;
+        config.allowlist.push(AllowlistEntry {
+            ecosystem: Ecosystem::RubyGems,
+            name: "demo".into(),
+            version: "2.0.0".into(),
+            bypass_age_gate: false,
+            bypass_osv: true,
+            reason: "exercise positional mapping".into(),
+        });
+        let decisions =
+            evaluate_artifacts(&config, &PositionalChecker, &artifacts, Utc::now()).await;
+        assert!(decisions[0].allowed);
+        assert!(decisions[1].allowed);
+        assert!(!decisions[2].allowed);
+    }
+
+    fn header_value(response: &RegistryResponse, name: &str) -> Option<String> {
+        response
+            .headers
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
     }
 }

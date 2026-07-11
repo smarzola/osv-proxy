@@ -145,7 +145,7 @@ The goal is complete only when:
 ## Milestones
 
 - [x] Milestone 1: RubyGems identity, configuration, OSV, and CLI foundations
-- [ ] Milestone 2: Policy-filtered Compact Index with cache/range semantics
+- [x] Milestone 2: Policy-filtered Compact Index with cache/range semantics
 - [ ] Milestone 3: Protected `.gem` delivery and deterministic error mapping
 - [ ] Milestone 4: Real Bundler workflows, documentation, and full regression
 
@@ -254,7 +254,22 @@ cargo fmt --check
 git diff --check
 ```
 
-Status: Not started.
+Status (2026-07-11): Complete. Added owned `/rubygems/versions` and
+`/rubygems/info/<gem>` routes. Global versions preserve upstream conditional and
+range responses; per-gem info correlates bounded Compact Index records with the
+exact version/platform metadata set, validates checksums and publication times,
+batch-evaluates policy, and fails closed on malformed, duplicate, missing, or
+ambiguous correlation. Filtered bodies own strong SHA-256 ETags, Digest and
+Repr-Digest, mandatory-revalidation cache policy, and correct full,
+`If-None-Match`, `Range`, `If-Range`, `206`, `304`, and `416` behavior. A live
+read-only `rack` check found 178 API keys and 178 compact records with no set
+differences. Adversarial review found stale-freshness reuse from `max-age=60`
+and quadratic result mapping at the 10,000-variant bound. Repairs changed
+filtered metadata to `Cache-Control: no-cache` and linear indexed result
+mapping; focused tests cover both, and re-review reported no blocking findings.
+Verification: `cargo test rubygems::tests` (10 passed), `cargo test
+server::tests` (28 passed), `cargo fmt --check` (passed), and `git diff --check`
+(passed).
 
 ## Milestone 3: Protected Gem Delivery
 
