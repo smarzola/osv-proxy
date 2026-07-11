@@ -522,6 +522,24 @@ policy:
     }
 
     #[test]
+    fn config_load_rejects_yaml_non_finite_cvss_scores() {
+        let directory = tempfile::tempdir().unwrap();
+        for (index, value) in [".nan", ".inf", "-.inf"].into_iter().enumerate() {
+            let path = directory.path().join(format!("non-finite-{index}.yaml"));
+            fs::write(
+                &path,
+                format!("policy:\n  osv:\n    minimum_cvss_score: {value}\n"),
+            )
+            .unwrap();
+            let error = Config::load(&path).unwrap_err();
+            assert!(
+                error.to_string().contains("minimum_cvss_score"),
+                "unexpected error for {value}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn cargo_upstream_defaults_and_strict_keys_validate() {
         let config = load("upstreams:\n  cargo:\n    sparse_index_url: https://index.example\n    download_url: https://downloads.example\n").unwrap();
         assert_eq!(
