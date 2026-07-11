@@ -5,6 +5,8 @@ source for GitHub release notes.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-11
+
 ### Added
 
 - Block active OSV vulnerability advisories by default, with CVSS v2, v3, and
