@@ -3,7 +3,8 @@ use crate::cargo::{self, CargoRegistryClient};
 use crate::config::{Config, LocalOsvConfig, OsvSource};
 use crate::go::{self, GoProxyClient};
 use crate::malicious::{
-    HttpOsvDumpClient, MaliciousChecker, OsvDumpClient, configured_malicious_checker, sync_osv,
+    ALL_OSV_ECOSYSTEMS, HttpOsvDumpClient, MaliciousChecker, OsvDumpClient,
+    configured_malicious_checker, sync_osv_ecosystems,
 };
 use crate::maven::{self, MavenRepositoryClient, MetadataChecksum};
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
@@ -19,10 +20,21 @@ use axum::http::{HeaderMap, Method, Response, Uri, header};
 use axum::routing::any;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 const REQUEST_BODY_LIMIT_BYTES: usize = 8192;
+const BACKGROUND_RETRY_POLICY: BackgroundRetryPolicy = BackgroundRetryPolicy {
+    initial: Duration::from_secs(5),
+    maximum: Duration::from_secs(5 * 60),
+};
+
+#[derive(Clone, Copy)]
+struct BackgroundRetryPolicy {
+    initial: Duration,
+    maximum: Duration,
+}
 
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.server.bind).await?;
@@ -113,19 +125,74 @@ fn spawn_background_osv_sync(
     local_config: LocalOsvConfig,
     client: Arc<dyn OsvDumpClient>,
 ) -> BackgroundSyncTask {
+    spawn_background_osv_sync_with_policy(local_config, client, BACKGROUND_RETRY_POLICY)
+}
+
+fn spawn_background_osv_sync_with_policy(
+    local_config: LocalOsvConfig,
+    client: Arc<dyn OsvDumpClient>,
+    retry_policy: BackgroundRetryPolicy,
+) -> BackgroundSyncTask {
     let handle = tokio::spawn(async move {
+        let mut requested = ALL_OSV_ECOSYSTEMS.to_vec();
+        let mut consecutive_failures = 0_u32;
         loop {
-            match sync_osv(&local_config, client.as_ref()).await {
-                Ok(report) => println!(
-                    "local OSV background sync completed for {} ecosystems",
-                    report.ecosystems.len()
-                ),
-                Err(err) => eprintln!("local OSV background sync failed: {err}"),
-            }
-            tokio::time::sleep(local_config.sync_interval).await;
+            let delay = match sync_osv_ecosystems(&local_config, client.as_ref(), &requested).await
+            {
+                Ok(report) if report.is_success() => {
+                    println!(
+                        "local OSV background sync completed for {} ecosystems",
+                        report.ecosystems.len()
+                    );
+                    requested = ALL_OSV_ECOSYSTEMS.to_vec();
+                    consecutive_failures = 0;
+                    local_config.sync_interval
+                }
+                Ok(report) => {
+                    requested = report.failed_ecosystems();
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    eprintln!(
+                        "local OSV background sync completed with {} failures out of {} attempts",
+                        report.failures.len(),
+                        report.attempted()
+                    );
+                    background_retry_delay(
+                        local_config.sync_interval,
+                        consecutive_failures,
+                        retry_policy,
+                    )
+                }
+                Err(err) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    eprintln!("local OSV background sync failed: {err}");
+                    background_retry_delay(
+                        local_config.sync_interval,
+                        consecutive_failures,
+                        retry_policy,
+                    )
+                }
+            };
+            tokio::time::sleep(delay).await;
         }
     });
     BackgroundSyncTask { handle }
+}
+
+fn background_retry_delay(
+    sync_interval: Duration,
+    consecutive_failures: u32,
+    retry_policy: BackgroundRetryPolicy,
+) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(16);
+    let multiplier = 1_u32 << exponent;
+    let exponential = retry_policy
+        .initial
+        .checked_mul(multiplier)
+        .unwrap_or(retry_policy.maximum);
+    let below_normal_interval = sync_interval / 2;
+    exponential
+        .min(retry_policy.maximum)
+        .min(below_normal_interval.max(Duration::from_millis(1)))
 }
 
 async fn registry_handler(
@@ -2124,6 +2191,98 @@ mod tests {
             )
             .unwrap();
         assert!(error_summary.contains("missing fixture response"));
+    }
+
+    #[test]
+    fn background_retry_delay_is_bounded_and_below_normal_interval() {
+        let interval = Duration::from_secs(60 * 60);
+        assert_eq!(
+            background_retry_delay(interval, 1, BACKGROUND_RETRY_POLICY),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            background_retry_delay(interval, 2, BACKGROUND_RETRY_POLICY),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            background_retry_delay(interval, 3, BACKGROUND_RETRY_POLICY),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            background_retry_delay(interval, 20, BACKGROUND_RETRY_POLICY),
+            BACKGROUND_RETRY_POLICY.maximum
+        );
+        assert!(background_retry_delay(interval, 20, BACKGROUND_RETRY_POLICY) < interval);
+        assert_eq!(
+            background_retry_delay(Duration::from_secs(8), 20, BACKGROUND_RETRY_POLICY),
+            Duration::from_secs(4)
+        );
+    }
+
+    #[tokio::test]
+    async fn background_retry_targets_only_failed_ecosystems() {
+        struct RetryClient {
+            archives: Mutex<BTreeMap<String, usize>>,
+        }
+
+        #[async_trait]
+        impl OsvDumpClient for RetryClient {
+            async fn fetch_bytes(&self, _url: &str) -> Result<Vec<u8>, MaliciousError> {
+                Ok(Vec::new())
+            }
+
+            async fn fetch_archive(&self, url: &str) -> Result<std::fs::File, MaliciousError> {
+                let attempt = {
+                    let mut archives = self.archives.lock().unwrap();
+                    let attempt = archives.entry(url.to_string()).or_default();
+                    *attempt += 1;
+                    *attempt
+                };
+                if url.ends_with("/npm/all.zip") && attempt == 1 {
+                    return Err(MaliciousError::Sync("transient npm failure".to_string()));
+                }
+                crate::malicious::fixture_archive_file(&zip_bytes([]))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let local_config = LocalOsvConfig {
+            sqlite_path: dir.path().join("malicious.sqlite"),
+            background_sync: true,
+            sync_interval: Duration::from_secs(1),
+            ..LocalOsvConfig::default()
+        };
+        let client = Arc::new(RetryClient {
+            archives: Mutex::new(BTreeMap::new()),
+        });
+        let task = spawn_background_osv_sync_with_policy(
+            local_config,
+            Arc::clone(&client) as Arc<dyn OsvDumpClient>,
+            BackgroundRetryPolicy {
+                initial: Duration::from_millis(10),
+                maximum: Duration::from_millis(20),
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let attempts = client.archives.lock().unwrap().values().sum::<usize>();
+                if attempts > ALL_OSV_ECOSYSTEMS.len() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let archives = client.archives.lock().unwrap();
+        assert_eq!(archives[&all_zip_url("npm")], 2);
+        for ecosystem in ["PyPI", "Go", "crates.io", "NuGet", "RubyGems", "Maven"] {
+            assert_eq!(archives[&all_zip_url(ecosystem)], 1, "{ecosystem}");
+        }
+        drop(archives);
+        drop(task);
     }
 
     #[tokio::test]

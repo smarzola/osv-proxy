@@ -75,7 +75,10 @@ version 0 and cannot satisfy vulnerability-enabled readiness. Raw JSON remains
 optional. Request-time SQLite reads, version/range evaluation, and Maven XML
 deserialization run in separate bounded blocking pools. Local batch checks load
 all ranges and ordered events once per ecosystem/package, then evaluate every
-requested version in memory.
+requested version in memory. Sync runs are serialized per SQLite path, attempt
+each requested ecosystem independently, and retain successful generations when
+another ecosystem fails. Background mode retries only failed ecosystems with
+bounded exponential backoff before returning to the normal interval.
 
 ## Upstream Body Bounds
 

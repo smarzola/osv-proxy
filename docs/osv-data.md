@@ -23,6 +23,13 @@ uses only consumed OSV source timestamps. An upgraded malicious-only database
 is marked version 0 and cannot return a clean vulnerability result until this
 full bootstrap succeeds.
 
+Each sync run attempts all seven ecosystems and reports successes and failures
+separately, so an early failure does not prevent later generation updates.
+Only one explicit or background run may operate on a SQLite store at a time,
+including across processes; a sidecar advisory lock is held for the full run.
+Background sync retries only failed ecosystems with bounded exponential backoff;
+a fully successful cycle waits for the configured normal interval.
+
 The compact schema stores advisory metadata, affected occurrences, exact
 versions, ranges/events, and each occurrence's selected severity type, original
 vector, base score, or evaluation error. Raw source JSON is retained only when

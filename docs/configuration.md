@@ -192,8 +192,9 @@ policy:
   advisory JSON in SQLite. Defaults to false so the local DB keeps only compact
   normalized lookup data plus advisory metadata needed for policy decisions.
 - `local.background_sync`: when true, `serve` starts a background sync task.
-  The first sync runs immediately on startup, then repeats after
-  `sync_interval`.
+  The first full sync runs immediately on startup. Successful cycles repeat
+  after `sync_interval`; failed ecosystems retry independently with exponential
+  backoff starting at 5 seconds and capped at 5 minutes.
 - `local.sync_interval`: background sync interval. It must be between `60s` and
   `7d`; defaults to `6h`.
 
@@ -204,7 +205,10 @@ osv-proxy osv sync --config /path/to/osv-proxy.yaml
 ```
 
 The sync command downloads npm, PyPI, Go, crates.io, NuGet, RubyGems, and Maven OSV GCS dumps,
-stores all advisories locally, and updates generation-scoped health state.
+attempts each ecosystem independently, stores successful advisory generations,
+and reports per-ecosystem successes and failures. Concurrent sync commands for
+the same SQLite store are rejected across processes through an advisory lock on
+the adjacent `<sqlite_path>.sync.lock` file.
 `malicious sync` is a compatibility alias. Full advisory storage is materially
 larger than the former malicious-only database. Missing, corrupt,
 unhealthy, or stale local data fails closed by default through `on_error:

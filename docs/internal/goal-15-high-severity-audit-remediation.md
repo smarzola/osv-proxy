@@ -133,7 +133,7 @@ The goal is complete only when:
 - [x] Milestone 2: Enforce artifact egress and redirect safety.
 - [x] Milestone 3: Reuse clients and make local policy evaluation async-safe and
   package-batched.
-- [ ] Milestone 4: Isolate ecosystem sync failures and implement background
+- [x] Milestone 4: Isolate ecosystem sync failures and implement background
   retry behavior.
 
 ### Checkpoint Protocol
@@ -296,7 +296,27 @@ cargo test --locked --lib background
 cargo run --locked -- config validate --config examples/basic/osv-proxy.yaml
 ```
 
-Status: Not started.
+Status: Completed 2026-07-11 after three adversarial review rounds. Explicit
+sync now attempts all seven ecosystems and returns separate success/failure
+entries while preserving each successful generation. A normalized per-store
+run guard rejects overlapping explicit/background work. Background mode retries
+only failed ecosystems with deterministic exponential delays starting at five
+seconds, capped at five minutes and always below the normal interval. Focused
+tests cover an npm failure followed by six successes, preserved prior data,
+same-store overlap rejection including symlink-normalized paths, exact retry
+targeting, and bounded scheduling. Verification before review: all sync and
+background tests passed; strict all-target/all-feature Clippy passed; the basic
+configuration validated; `git diff --check` passed. The first review found the
+run guard was process-local; it now also holds a nonblocking OS advisory lock on
+a normalized per-database sidecar for the full run. A child-process regression
+proves contention is rejected and release permits reacquisition.
+The second review found a dangling final-symlink alias could still derive a
+different sidecar; lock identity now resolves final symlink chains before the
+database exists, and the cross-process regression covers
+`alias.sqlite -> real.sqlite` contention and release. Final verification:
+`cargo fmt --check` passed; `cargo test --locked --lib` passed 282 tests; strict
+all-target/all-feature Clippy passed; the basic configuration validated; `git
+diff --check` passed.
 
 ## Final Verification
 

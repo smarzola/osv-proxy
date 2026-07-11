@@ -14,13 +14,13 @@ use semver::Version as cargo_semver;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
+use std::fs::{File, OpenOptions, TryLockError};
 #[cfg(test)]
 use std::io::{Cursor, Write};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -40,6 +40,17 @@ const MAX_OSV_ARCHIVE_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const SQLITE_CHECK_CONCURRENCY: usize = 8;
 
 static SQLITE_CHECK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static ACTIVE_SYNC_PATHS: OnceLock<StdMutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
+pub(crate) const ALL_OSV_ECOSYSTEMS: [Ecosystem; 7] = [
+    Ecosystem::Npm,
+    Ecosystem::Pypi,
+    Ecosystem::Go,
+    Ecosystem::CratesIo,
+    Ecosystem::Nuget,
+    Ecosystem::RubyGems,
+    Ecosystem::Maven,
+];
 
 #[async_trait]
 pub trait OsvChecker: Send + Sync {
@@ -697,6 +708,34 @@ where
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OsvSyncReport {
     pub ecosystems: Vec<OsvSyncEcosystemReport>,
+    pub failures: Vec<OsvSyncEcosystemFailure>,
+}
+
+impl OsvSyncReport {
+    pub fn is_success(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    pub fn attempted(&self) -> usize {
+        self.ecosystems.len() + self.failures.len()
+    }
+
+    pub(crate) fn failed_ecosystems(&self) -> Vec<Ecosystem> {
+        ALL_OSV_ECOSYSTEMS
+            .into_iter()
+            .filter(|ecosystem| {
+                self.failures
+                    .iter()
+                    .any(|failure| failure.ecosystem == ecosystem.osv_name())
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OsvSyncEcosystemFailure {
+    pub ecosystem: String,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -779,29 +818,157 @@ pub async fn sync_osv(
     config: &LocalOsvConfig,
     client: &dyn OsvDumpClient,
 ) -> Result<OsvSyncReport, OsvError> {
+    sync_osv_ecosystems(config, client, &ALL_OSV_ECOSYSTEMS).await
+}
+
+pub(crate) async fn sync_osv_ecosystems(
+    config: &LocalOsvConfig,
+    client: &dyn OsvDumpClient,
+    requested: &[Ecosystem],
+) -> Result<OsvSyncReport, OsvError> {
+    let _run = SyncRunGuard::acquire(&config.sqlite_path)?;
     SqliteMaliciousChecker::initialize(&config.sqlite_path)?;
     let mut connection = open_read_write_connection(&config.sqlite_path)?;
     let mut ecosystems = Vec::new();
-    for ecosystem in [
-        Ecosystem::Npm,
-        Ecosystem::Pypi,
-        Ecosystem::Go,
-        Ecosystem::CratesIo,
-        Ecosystem::Nuget,
-        Ecosystem::RubyGems,
-        Ecosystem::Maven,
-    ] {
-        ecosystems.push(
-            sync_ecosystem(
-                &mut connection,
-                client,
-                ecosystem,
-                config.retain_raw_advisories,
-            )
-            .await?,
-        );
+    let mut failures = Vec::new();
+    for &ecosystem in requested {
+        match sync_ecosystem(
+            &mut connection,
+            client,
+            ecosystem,
+            config.retain_raw_advisories,
+        )
+        .await
+        {
+            Ok(report) => ecosystems.push(report),
+            Err(error) => failures.push(OsvSyncEcosystemFailure {
+                ecosystem: ecosystem.osv_name().to_string(),
+                error: error.to_string(),
+            }),
+        }
     }
-    Ok(OsvSyncReport { ecosystems })
+    Ok(OsvSyncReport {
+        ecosystems,
+        failures,
+    })
+}
+
+#[derive(Debug)]
+struct SyncRunGuard {
+    path: PathBuf,
+    lock_file: File,
+}
+
+impl SyncRunGuard {
+    fn acquire(path: &Path) -> Result<Self, OsvError> {
+        let path = normalized_sync_path(path);
+        let mut active = ACTIVE_SYNC_PATHS
+            .get_or_init(|| StdMutex::new(BTreeSet::new()))
+            .lock()
+            .map_err(|_| OsvError::Sync("OSV sync-run lock was poisoned".to_string()))?;
+        if !active.insert(path.clone()) {
+            return Err(OsvError::Sync(format!(
+                "OSV sync is already in progress for {}",
+                path.display()
+            )));
+        }
+        drop(active);
+
+        let lock_path = sync_lock_path(&path);
+        let lock_file = match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                remove_active_sync_path(&path);
+                return Err(OsvError::Sync(format!(
+                    "failed to open OSV sync lock {}: {error}",
+                    lock_path.display()
+                )));
+            }
+        };
+        if let Err(error) = lock_file.try_lock() {
+            remove_active_sync_path(&path);
+            let message = match error {
+                TryLockError::WouldBlock => {
+                    format!("OSV sync is already in progress for {}", path.display())
+                }
+                TryLockError::Error(error) => format!(
+                    "failed to lock OSV sync file {}: {error}",
+                    lock_path.display()
+                ),
+            };
+            return Err(OsvError::Sync(message));
+        }
+        Ok(Self { path, lock_file })
+    }
+}
+
+impl Drop for SyncRunGuard {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+        remove_active_sync_path(&self.path);
+    }
+}
+
+fn remove_active_sync_path(path: &Path) {
+    if let Ok(mut active) = ACTIVE_SYNC_PATHS
+        .get_or_init(|| StdMutex::new(BTreeSet::new()))
+        .lock()
+    {
+        active.remove(path);
+    }
+}
+
+fn sync_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".sync.lock");
+    PathBuf::from(lock_path)
+}
+
+fn normalized_sync_path(path: &Path) -> PathBuf {
+    let mut candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    for _ in 0..16 {
+        if let Ok(path) = candidate.canonicalize() {
+            return path;
+        }
+        let Ok(metadata) = candidate.symlink_metadata() else {
+            return canonicalize_existing_parent(candidate);
+        };
+        if !metadata.file_type().is_symlink() {
+            return canonicalize_existing_parent(candidate);
+        }
+        let Ok(target) = std::fs::read_link(&candidate) else {
+            return canonicalize_existing_parent(candidate);
+        };
+        candidate = if target.is_absolute() {
+            target
+        } else {
+            candidate
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+        candidate = canonicalize_existing_parent(candidate);
+    }
+    canonicalize_existing_parent(candidate)
+}
+
+fn canonicalize_existing_parent(path: PathBuf) -> PathBuf {
+    path.parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+        .unwrap_or(path)
 }
 
 pub type MaliciousSyncReport = OsvSyncReport;
@@ -4301,9 +4468,17 @@ INSERT INTO advisories (
             (modified_id_csv_url(Ecosystem::Pypi), Vec::new()),
             (modified_id_csv_url(Ecosystem::CratesIo), Vec::new()),
         ]);
-        let err = sync_malicious(&config, &client).await.unwrap_err();
+        let report = sync_malicious(&config, &client).await.unwrap();
 
-        assert!(err.to_string().contains("missing fixture response"));
+        assert_eq!(report.attempted(), ALL_OSV_ECOSYSTEMS.len());
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].ecosystem, "npm");
+        assert!(
+            report.failures[0]
+                .error
+                .contains("missing fixture response")
+        );
+        assert_eq!(report.ecosystems.len(), 6);
         let checker = checker_for(&db);
         let hits = checker
             .check(&Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None))
@@ -4320,6 +4495,122 @@ INSERT INTO advisories (
             .unwrap();
         assert_eq!(status, "healthy");
         assert!(error_summary.unwrap().contains("missing fixture response"));
+    }
+
+    #[tokio::test]
+    async fn overlapping_sync_for_same_store_is_rejected() {
+        struct BlockingClient {
+            first_archive: AtomicUsize,
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+
+        #[async_trait]
+        impl OsvDumpClient for BlockingClient {
+            async fn fetch_bytes(&self, _url: &str) -> Result<Vec<u8>, OsvError> {
+                Ok(Vec::new())
+            }
+
+            async fn fetch_archive(&self, _url: &str) -> Result<File, OsvError> {
+                if self.first_archive.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                fixture_archive_file(&zip_bytes([]))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let config = local_config_for(&dir.path().join("malicious.sqlite"));
+        let client = Arc::new(BlockingClient {
+            first_archive: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let running = {
+            let config = config.clone();
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { sync_osv(&config, client.as_ref()).await })
+        };
+        client.started.notified().await;
+
+        let overlap = sync_osv(&config, client.as_ref()).await.unwrap_err();
+
+        assert!(overlap.to_string().contains("already in progress"));
+        client.release.notify_one();
+        assert!(running.await.unwrap().unwrap().is_success());
+    }
+
+    #[test]
+    fn sync_lock_is_cross_process_and_released() {
+        const CHILD_PATH: &str = "OSV_PROXY_SYNC_LOCK_TEST_PATH";
+        const CHILD_EXPECT_BLOCKED: &str = "OSV_PROXY_SYNC_LOCK_EXPECT_BLOCKED";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let result = SyncRunGuard::acquire(Path::new(&path));
+            if std::env::var_os(CHILD_EXPECT_BLOCKED).is_some() {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("already in progress")
+                );
+            } else {
+                drop(result.unwrap());
+            }
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("malicious.sqlite");
+        let guard = SyncRunGuard::acquire(&db).unwrap();
+        let run_child = |path: &Path, expect_blocked: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("malicious::tests::sync_lock_is_cross_process_and_released")
+                .arg("--nocapture")
+                .env(CHILD_PATH, path);
+            if expect_blocked {
+                command.env(CHILD_EXPECT_BLOCKED, "1");
+            }
+            command.output().unwrap()
+        };
+
+        let blocked = run_child(&db, true);
+        assert!(
+            blocked.status.success(),
+            "blocked child failed:\n{}\n{}",
+            String::from_utf8_lossy(&blocked.stdout),
+            String::from_utf8_lossy(&blocked.stderr)
+        );
+        drop(guard);
+        let acquired = run_child(&db, false);
+        assert!(
+            acquired.status.success(),
+            "released child failed:\n{}\n{}",
+            String::from_utf8_lossy(&acquired.stdout),
+            String::from_utf8_lossy(&acquired.stderr)
+        );
+
+        let alias = dir.path().join("alias.sqlite");
+        std::os::unix::fs::symlink("malicious.sqlite", &alias).unwrap();
+        assert!(!db.exists());
+        let alias_guard = SyncRunGuard::acquire(&alias).unwrap();
+        let alias_blocked = run_child(&db, true);
+        assert!(
+            alias_blocked.status.success(),
+            "dangling-alias child failed:\n{}\n{}",
+            String::from_utf8_lossy(&alias_blocked.stdout),
+            String::from_utf8_lossy(&alias_blocked.stderr)
+        );
+        drop(alias_guard);
+        let alias_released = run_child(&db, false);
+        assert!(
+            alias_released.status.success(),
+            "released dangling-alias child failed:\n{}\n{}",
+            String::from_utf8_lossy(&alias_released.stdout),
+            String::from_utf8_lossy(&alias_released.stderr)
+        );
     }
 
     #[test]
