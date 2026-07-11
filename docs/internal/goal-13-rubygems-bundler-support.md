@@ -146,7 +146,7 @@ The goal is complete only when:
 
 - [x] Milestone 1: RubyGems identity, configuration, OSV, and CLI foundations
 - [x] Milestone 2: Policy-filtered Compact Index with cache/range semantics
-- [ ] Milestone 3: Protected `.gem` delivery and deterministic error mapping
+- [x] Milestone 3: Protected `.gem` delivery and deterministic error mapping
 - [ ] Milestone 4: Real Bundler workflows, documentation, and full regression
 
 ### Checkpoint Protocol
@@ -305,7 +305,21 @@ cargo fmt --check
 git diff --check
 ```
 
-Status: Not started.
+Status (2026-07-11): Complete. Direct `.gem` routes now derive only validated
+gem-name prefixes from the requested filename, bound fan-out to 32 candidates,
+resolve metadata with eight-way concurrency, and deliver only when exactly one
+non-yanked name/version/platform tuple reconstructs the filename and validates
+its version, platform, canonical configured-registry download URL, and SHA-256
+metadata. Zero matches return `404`; ambiguity, malformed metadata, or non-404
+upstream failure returns structured `502`; policy denial returns structured
+`403` before artifact delivery. Allowed redirect and proxy modes reuse shared
+delivery, and proxy tests preserve exact bytes and content type. Adversarial
+review found no blocking issues. It noted that proxy mode does not independently
+hash streamed CDN bytes; this matches shared delivery behavior, and docs must
+not claim payload checksum verification. Verification: `cargo test
+rubygems::tests` (13 passed), `cargo test server::tests` (28 passed), `cargo
+test artifacts::tests` (4 passed), `cargo fmt --check` (passed), and `git diff
+--check` (passed).
 
 ## Milestone 4: Real Bundler Integration And Documentation
 

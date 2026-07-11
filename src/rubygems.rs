@@ -4,6 +4,9 @@
 //! this adapter so the shared policy engine remains ecosystem-neutral.
 
 use crate::artifact::{Artifact, ArtifactHashes, Ecosystem};
+use crate::artifacts::{
+    self, ArtifactDeliveryError, ArtifactDeliveryOptions, ArtifactDeliveryResponse,
+};
 use crate::config::Config;
 use crate::malicious::MaliciousChecker;
 use crate::policy::{Decision, PolicyEngine};
@@ -12,6 +15,7 @@ use async_trait::async_trait;
 use axum::http::{HeaderMap, header};
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use futures_util::{StreamExt, stream};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -25,6 +29,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_GEM_VARIANTS: usize = 10_000;
 const MAX_COMPACT_INFO_BYTES: usize = 16 * 1024 * 1024;
 const MAX_COMPACT_INFO_LINES: usize = 100_000;
+const MAX_ARTIFACT_FILENAME_BYTES: usize = 512;
+const MAX_ARTIFACT_NAME_CANDIDATES: usize = 32;
+const ARTIFACT_RESOLUTION_CONCURRENCY: usize = 8;
 const COMPACT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 
 #[derive(Debug, Clone)]
@@ -78,10 +85,7 @@ impl RubyGemsProvider for RubyGemsClient {
             return Err(RubyGemsError::TooManyVariants(versions.len()));
         }
         for version in &mut versions {
-            if version.gem_uri.is_empty() {
-                version.gem_uri =
-                    format!("{}/downloads/{}", self.registry_url, version.filename(name));
-            }
+            version.gem_uri = format!("{}/downloads/{}", self.registry_url, version.filename(name));
         }
         Ok(versions)
     }
@@ -549,6 +553,112 @@ pub async fn lookup_artifacts(
     Ok(artifacts)
 }
 
+pub async fn resolve_artifact(
+    provider: &dyn RubyGemsProvider,
+    filename: &str,
+) -> Result<Artifact, RubyGemsError> {
+    let stem = filename
+        .strip_suffix(".gem")
+        .filter(|stem| !stem.is_empty() && filename.len() <= MAX_ARTIFACT_FILENAME_BYTES)
+        .ok_or_else(|| RubyGemsError::ArtifactNotFound(filename.to_string()))?;
+    let candidates = stem
+        .char_indices()
+        .filter(|(_, character)| *character == '-')
+        .map(|(index, _)| &stem[..index])
+        .filter(|name| validate_name(name).is_ok())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if candidates.is_empty() {
+        return Err(RubyGemsError::ArtifactNotFound(filename.to_string()));
+    }
+    if candidates.len() > MAX_ARTIFACT_NAME_CANDIDATES {
+        return Err(RubyGemsError::TooManyArtifactCandidates(candidates.len()));
+    }
+    let results = stream::iter(candidates)
+        .map(|name| async move {
+            let result = provider.fetch_versions(&name).await;
+            (name, result)
+        })
+        .buffer_unordered(ARTIFACT_RESOLUTION_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    let mut matches = Vec::new();
+    for (name, result) in results {
+        let versions = match result {
+            Ok(versions) => versions,
+            Err(error) if error.is_not_found() => continue,
+            Err(error) => return Err(error),
+        };
+        for version in versions.into_iter().filter(|version| !version.yanked) {
+            if version.filename(&name) == filename {
+                matches.push(version.artifact(&name)?);
+            }
+        }
+    }
+    match matches.len() {
+        0 => Err(RubyGemsError::ArtifactNotFound(filename.to_string())),
+        1 => Ok(matches.pop().expect("one RubyGems artifact match")),
+        count => Err(RubyGemsError::AmbiguousArtifact {
+            filename: filename.to_string(),
+            count,
+        }),
+    }
+}
+
+pub async fn artifact_delivery_response(
+    config: &Config,
+    provider: &dyn RubyGemsProvider,
+    checker: &dyn MaliciousChecker,
+    filename: &str,
+    now: DateTime<Utc>,
+    delivery: ArtifactDeliveryOptions<'_>,
+) -> Result<ArtifactDeliveryResponse, RubyGemsError> {
+    let artifact = resolve_artifact(provider, filename).await?;
+    let decision = PolicyEngine::new(config)
+        .evaluate(&artifact, now, checker)
+        .await;
+    if !decision.allowed {
+        return Ok(ArtifactDeliveryResponse::Buffered(RegistryResponse::json(
+            403,
+            &serde_json::to_value(decision)?,
+        )?));
+    }
+    let upstream = artifact
+        .upstream_url
+        .ok_or_else(|| RubyGemsError::InvalidMetadata("resolved gem has no upstream URL".into()))?;
+    delivery
+        .client
+        .deliver(config, upstream, delivery.request_headers)
+        .await
+        .map_err(RubyGemsError::ArtifactDelivery)
+}
+
+pub fn error_response(error: &RubyGemsError) -> RegistryResponse {
+    if let RubyGemsError::ArtifactDelivery(error) = error {
+        return artifacts::gateway_error_response(error);
+    }
+    let status = if error.is_not_found() {
+        404
+    } else {
+        match error {
+            RubyGemsError::InvalidName(_)
+            | RubyGemsError::InvalidVersion(_)
+            | RubyGemsError::VersionNotFound { .. }
+            | RubyGemsError::ArtifactNotFound(_) => 404,
+            _ => 502,
+        }
+    };
+    RegistryResponse::json(
+        status,
+        &serde_json::json!({
+            "allowed": false,
+            "reason": "rubygems_upstream_error",
+            "message": error.to_string()
+        }),
+    )
+    .expect("static RubyGems error response")
+}
+
 pub fn validate_name(name: &str) -> Result<(), RubyGemsError> {
     if name.is_empty()
         || name.len() > 128
@@ -742,6 +852,23 @@ pub enum RubyGemsError {
     TooManyVariants(usize),
     #[error("RubyGems compact info exceeds supported bounds")]
     CompactInfoTooLarge,
+    #[error("RubyGems artifact not found: {0}")]
+    ArtifactNotFound(String),
+    #[error("RubyGems artifact filename {filename} matched {count} package variants")]
+    AmbiguousArtifact { filename: String, count: usize },
+    #[error("RubyGems artifact filename produced too many name candidates: {0}")]
+    TooManyArtifactCandidates(usize),
+    #[error("RubyGems artifact delivery failed: {0}")]
+    ArtifactDelivery(#[from] ArtifactDeliveryError),
+    #[error("RubyGems response serialization failed: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+impl RubyGemsError {
+    fn is_not_found(&self) -> bool {
+        matches!(self, Self::UpstreamStatus(404 | 410))
+            || matches!(self, Self::Upstream(error) if matches!(error.status().map(|status| status.as_u16()), Some(404 | 410)))
+    }
 }
 
 #[cfg(test)]
@@ -758,10 +885,20 @@ mod tests {
     }
 
     fn gem_at(number: &str, platform: &str, yanked: bool, created_at: &str) -> GemVersion {
+        gem_for_at("demo", number, platform, yanked, created_at)
+    }
+
+    fn gem_for_at(
+        name: &str,
+        number: &str,
+        platform: &str,
+        yanked: bool,
+        created_at: &str,
+    ) -> GemVersion {
         let suffix = if platform == "ruby" {
-            format!("demo-{number}.gem")
+            format!("{name}-{number}.gem")
         } else {
-            format!("demo-{number}-{platform}.gem")
+            format!("{name}-{number}-{platform}.gem")
         };
         GemVersion {
             number: number.into(),
@@ -927,6 +1064,167 @@ mod tests {
             vec![gem("1.-1", "ruby", false), gem("1.0.0", "ruby", false)],
         )]));
         assert!(lookup_artifacts(&provider, "demo", "1.0.0").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn artifact_resolution_handles_hyphenated_names_platforms_and_ambiguity() {
+        let provider = StaticProvider(HashMap::from([
+            (
+                "name-with-dash".into(),
+                vec![gem_for_at(
+                    "name-with-dash",
+                    "1.2.3",
+                    "arm64-darwin",
+                    false,
+                    "2026-01-01T00:00:00Z",
+                )],
+            ),
+            (
+                "demo".into(),
+                vec![gem_for_at(
+                    "demo",
+                    "1-0-x",
+                    "ruby",
+                    false,
+                    "2026-01-01T00:00:00Z",
+                )],
+            ),
+            (
+                "demo-1".into(),
+                vec![gem_for_at(
+                    "demo-1",
+                    "0-x",
+                    "ruby",
+                    false,
+                    "2026-01-01T00:00:00Z",
+                )],
+            ),
+        ]));
+        let artifact = resolve_artifact(&provider, "name-with-dash-1.2.3-arm64-darwin.gem")
+            .await
+            .unwrap();
+        assert_eq!(artifact.name, "name-with-dash");
+        assert_eq!(artifact.version, "1.2.3");
+        assert!(matches!(
+            resolve_artifact(&provider, "demo-1-0-x.gem").await,
+            Err(RubyGemsError::AmbiguousArtifact { count: 2, .. })
+        ));
+        assert!(matches!(
+            resolve_artifact(&provider, "wrong.gem").await,
+            Err(RubyGemsError::ArtifactNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn artifact_delivery_rechecks_policy_before_redirect() {
+        let provider = StaticProvider(HashMap::from([(
+            "demo".into(),
+            vec![gem("1.0.0", "ruby", false)],
+        )]));
+        let mut config = Config::default();
+        config.policy.minimum_age = Duration::ZERO;
+        config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
+        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let allowed = artifact_delivery_response(
+            &config,
+            &provider,
+            &CleanChecker {
+                batches: AtomicUsize::new(0),
+            },
+            "demo-1.0.0.gem",
+            Utc::now(),
+            ArtifactDeliveryOptions::new(&delivery),
+        )
+        .await
+        .unwrap()
+        .into_registry_response()
+        .await;
+        assert_eq!(allowed.status, 302);
+        assert_eq!(
+            header_value(&allowed, "location").as_deref(),
+            Some("https://rubygems.example/gems/demo-1.0.0.gem")
+        );
+
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::RubyGems,
+            name: "demo".into(),
+            versions: vec!["1.0.0".into()],
+            reason: "test direct denial".into(),
+        });
+        let denied = artifact_delivery_response(
+            &config,
+            &provider,
+            &CleanChecker {
+                batches: AtomicUsize::new(0),
+            },
+            "demo-1.0.0.gem",
+            Utc::now(),
+            ArtifactDeliveryOptions::new(&delivery),
+        )
+        .await
+        .unwrap()
+        .into_registry_response()
+        .await;
+        assert_eq!(denied.status, 403);
+        assert!(
+            String::from_utf8(denied.body)
+                .unwrap()
+                .contains("manually_blocked")
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_delivery_preserves_gem_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/gems/demo-1.0.0.gem",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0; 4096];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: 9\r\nconnection: close\r\n\r\ngem-bytes",
+                )
+                .await
+                .unwrap();
+        });
+        let mut metadata = gem("1.0.0", "ruby", false);
+        metadata.gem_uri = url;
+        let provider = StaticProvider(HashMap::from([("demo".into(), vec![metadata])]));
+        let mut config = Config::default();
+        config.artifacts.behavior = crate::config::ArtifactBehavior::Proxy;
+        config.policy.minimum_age = Duration::ZERO;
+        config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
+        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let response = artifact_delivery_response(
+            &config,
+            &provider,
+            &CleanChecker {
+                batches: AtomicUsize::new(0),
+            },
+            "demo-1.0.0.gem",
+            Utc::now(),
+            ArtifactDeliveryOptions::new(&delivery),
+        )
+        .await
+        .unwrap()
+        .into_registry_response()
+        .await;
+        server.await.unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"gem-bytes");
+        assert_eq!(
+            header_value(&response, "content-type").as_deref(),
+            Some("application/octet-stream")
+        );
     }
 
     #[tokio::test]

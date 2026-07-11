@@ -136,7 +136,7 @@ pub async fn route_request_with_accept(
             RubyGemsRoute::Versions => rubygems_upstream
                 .fetch_versions_index(None)
                 .await
-                .unwrap_or_else(|error| rubygems_error_response(&error)),
+                .unwrap_or_else(|error| rubygems::error_response(&error)),
             RubyGemsRoute::Info { name } => rubygems::compact_info_response(
                 config,
                 &rubygems_upstream,
@@ -147,8 +147,23 @@ pub async fn route_request_with_accept(
                 &headers,
             )
             .await
-            .unwrap_or_else(|error| rubygems_error_response(&error)),
-            RubyGemsRoute::Artifact { .. } => simple_response(404, "not found"),
+            .unwrap_or_else(|error| rubygems::error_response(&error)),
+            RubyGemsRoute::Artifact { filename } => {
+                let delivery = ArtifactDeliveryClient::new();
+                match rubygems::artifact_delivery_response(
+                    config,
+                    &rubygems_upstream,
+                    checker.as_ref(),
+                    &filename,
+                    Utc::now(),
+                    ArtifactDeliveryOptions::new(&delivery),
+                )
+                .await
+                {
+                    Ok(response) => response.into_registry_response().await,
+                    Err(error) => rubygems::error_response(&error),
+                }
+            }
         };
     }
     if let Some((module, route)) = go::parse_route(path) {
@@ -366,25 +381,6 @@ fn nuget_error_response(error: crate::nuget::NugetError) -> RegistryResponse {
     RegistryResponse::json(status, &serde_json::json!({"allowed": false, "reason": "nuget_upstream_error", "message": error.to_string()})).expect("static NuGet error response")
 }
 
-fn rubygems_error_response(error: &rubygems::RubyGemsError) -> RegistryResponse {
-    let status = match error {
-        rubygems::RubyGemsError::InvalidName(_)
-        | rubygems::RubyGemsError::InvalidVersion(_)
-        | rubygems::RubyGemsError::VersionNotFound { .. }
-        | rubygems::RubyGemsError::UpstreamStatus(404 | 410) => 404,
-        _ => 502,
-    };
-    RegistryResponse::json(
-        status,
-        &serde_json::json!({
-            "allowed": false,
-            "reason": "rubygems_upstream_error",
-            "message": error.to_string()
-        }),
-    )
-    .expect("static RubyGems error response")
-}
-
 async fn route_http_request_with_accept_and_headers(
     config: &Config,
     checker: &dyn MaliciousChecker,
@@ -411,7 +407,7 @@ async fn route_http_request_with_accept_and_headers(
             RubyGemsRoute::Versions => rubygems_upstream
                 .fetch_versions_index(Some(headers))
                 .await
-                .unwrap_or_else(|error| rubygems_error_response(&error))
+                .unwrap_or_else(|error| rubygems::error_response(&error))
                 .into_http_response(),
             RubyGemsRoute::Info { name } => rubygems::compact_info_response(
                 config,
@@ -423,11 +419,19 @@ async fn route_http_request_with_accept_and_headers(
                 headers,
             )
             .await
-            .unwrap_or_else(|error| rubygems_error_response(&error))
+            .unwrap_or_else(|error| rubygems::error_response(&error))
             .into_http_response(),
-            RubyGemsRoute::Artifact { .. } => {
-                simple_response(404, "not found").into_http_response()
-            }
+            RubyGemsRoute::Artifact { filename } => rubygems::artifact_delivery_response(
+                config,
+                &rubygems_upstream,
+                checker,
+                &filename,
+                now,
+                ArtifactDeliveryOptions::with_request_headers(&delivery, headers),
+            )
+            .await
+            .map(|response| response.into_http_response())
+            .unwrap_or_else(|error| rubygems::error_response(&error).into_http_response()),
         };
     }
 
