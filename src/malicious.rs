@@ -2044,7 +2044,7 @@ mod tests {
         let (url, _) = live_mock().await;
         let client = OsvHttpClient::new(url);
         let bad = Artifact::package(Ecosystem::Npm, "demo", "mal-bad", None);
-        let clean = Artifact::package(Ecosystem::Npm, "demo", "mismatch", None);
+        let clean = Artifact::package(Ecosystem::Npm, "demo", "clean", None);
         let results = client.check_many(&[bad.clone(), clean]).await.unwrap();
         assert!(
             results[0]
@@ -2057,7 +2057,7 @@ mod tests {
                 .any(|finding| finding.evaluation_error.is_some())
         );
         assert_eq!(results[1].len(), 1);
-        assert!(results[1][0].evaluation_error.is_some());
+        assert!(results[1][0].evaluation_error.is_none());
 
         let mut config = Config::default();
         config.policy.osv.on_error = crate::config::OsvErrorBehavior::Allow;
@@ -2067,6 +2067,22 @@ mod tests {
             Some(Ok(results[0].clone())),
         );
         assert_eq!(decision.reason, crate::policy::DecisionReason::Malicious);
+    }
+
+    #[tokio::test]
+    async fn mismatched_detail_identity_is_assigned_to_requesting_artifact() {
+        let (url, _) = live_mock().await;
+        let client = OsvHttpClient::new(url);
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "mismatch", None);
+        let findings = client.check_many(&[artifact]).await.unwrap();
+        assert_eq!(findings[0].len(), 1);
+        assert!(
+            findings[0][0]
+                .evaluation_error
+                .as_deref()
+                .unwrap()
+                .contains("ID mismatch")
+        );
     }
 
     #[tokio::test]
