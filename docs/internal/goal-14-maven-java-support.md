@@ -173,7 +173,7 @@ The goal is complete only when:
 
 - [x] Milestone 1: Maven identity, configuration, version semantics, OSV, and CLI
 - [x] Milestone 2: Policy-filtered Maven metadata and response semantics
-- [ ] Milestone 3: Protected coordinate-scoped delivery and routing
+- [x] Milestone 3: Protected coordinate-scoped delivery and routing
 - [ ] Milestone 4: Real Maven/Gradle workflows, CI, docs, and full regression
 
 ### Checkpoint Protocol
@@ -308,7 +308,16 @@ cargo test server::tests
 cargo test e2e
 ```
 
-Status: Not started.
+Status: Completed 2026-07-11. Added strict Maven release-path reconstruction,
+protected POM/JAR/module/classifier/signature/checksum delivery, HEAD-only POM
+policy preflight, exact redirect existence checks, streaming proxy GET/HEAD,
+and deterministic `403`/`404`/`502` responses. Verification passed:
+`cargo test maven::tests` (22), `cargo test server::tests` (31),
+`cargo test artifacts::tests` (4), `cargo test e2e` (6), and
+`git diff --check`. Adversarial review required one repair round to prevent
+blocked direct POM requests from fetching POM bodies and to prevent non-POM
+files from inheriting POM hashes. Re-review reported no findings and no
+blocking findings remain.
 
 ## Milestone 4: Maven/Gradle Integration and Documentation
 

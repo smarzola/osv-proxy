@@ -390,7 +390,12 @@ async fn route_http_request_with_accept_and_headers(
     accept: Option<&str>,
     headers: &HeaderMap,
 ) -> Response<Body> {
-    if method != "GET" {
+    let maven_request = path
+        .split('?')
+        .next()
+        .unwrap_or(path)
+        .starts_with("/maven/");
+    if method != "GET" && !(method == "HEAD" && maven_request) {
         return simple_response(405, "method not allowed").into_http_response();
     }
 
@@ -405,7 +410,7 @@ async fn route_http_request_with_accept_and_headers(
     let now = Utc::now();
 
     if let Some((relative_path, checksum)) = parse_maven_metadata_route(path) {
-        return maven::apply_if_none_match(
+        let mut response = maven::apply_if_none_match(
             maven::metadata_route_response(
                 config,
                 &maven_upstream,
@@ -419,8 +424,33 @@ async fn route_http_request_with_accept_and_headers(
             headers
                 .get(header::IF_NONE_MATCH)
                 .and_then(|value| value.to_str().ok()),
+        );
+        if method == "HEAD" {
+            response.body.clear();
+        }
+        return response.into_http_response();
+    }
+    if let Some(relative_path) = maven_relative_path(path) {
+        let route = match maven::parse_release_path(&relative_path) {
+            Ok(route) => route,
+            Err(error) => return maven::error_response(&error).into_http_response(),
+        };
+        let delivery_options = if method == "HEAD" {
+            ArtifactDeliveryOptions::with_request_headers_for_head(&delivery, headers)
+        } else {
+            ArtifactDeliveryOptions::with_request_headers(&delivery, headers)
+        };
+        return maven::artifact_delivery_response(
+            config,
+            &maven_upstream,
+            checker,
+            &route,
+            now,
+            delivery_options,
         )
-        .into_http_response();
+        .await
+        .map(|response| response.into_http_response())
+        .unwrap_or_else(|error| maven::error_response(&error).into_http_response());
     }
 
     if let Some(route) = parse_rubygems_route(path) {
@@ -713,6 +743,14 @@ fn parse_maven_metadata_route(path: &str) -> Option<(String, Option<MetadataChec
     Some((base.to_string(), checksum))
 }
 
+fn maven_relative_path(path: &str) -> Option<String> {
+    path.split('?')
+        .next()
+        .unwrap_or(path)
+        .strip_prefix("/maven/")
+        .map(str::to_string)
+}
+
 fn parse_rubygems_route(path: &str) -> Option<RubyGemsRoute> {
     let path = path.split('?').next().unwrap_or(path);
     if path == "/rubygems/versions" {
@@ -933,6 +971,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::HashMap;
     use std::io::{Cursor, Write};
+    use std::sync::Mutex;
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1286,6 +1325,172 @@ mod tests {
             parse_maven_metadata_route("/maven/com/acme/demo/maven-metadata.xml.sha3"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn e2e_maven_route_redirects_allowed_and_blocks_direct_bytes() {
+        let (upstream, requests, server) = serve_maven_upstream().await;
+        let mut config = Config::default();
+        config.upstreams.maven.repository_url = upstream;
+        config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
+        let path = "/maven/com/acme/demo/1.0/demo-1.0.jar";
+
+        let allowed = route_http_request_with_accept_and_headers(
+            &config,
+            &CleanChecker,
+            "GET",
+            path,
+            None,
+            &HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(allowed.status(), StatusCode::FOUND);
+        assert!(
+            allowed
+                .headers()
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|location| location.ends_with("/com/acme/demo/1.0/demo-1.0.jar"))
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let observed = requests.lock().unwrap().clone();
+        assert!(
+            observed
+                .iter()
+                .any(|request| request.starts_with("head /com/acme/demo/1.0/demo-1.0.pom "))
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|request| request.starts_with("head /com/acme/demo/1.0/demo-1.0.jar "))
+        );
+
+        let before_block = observed.len();
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Maven,
+            name: "com.acme:demo".to_string(),
+            versions: vec!["1.0".to_string()],
+            reason: "blocked fixture".to_string(),
+        });
+        let blocked = route_http_request_with_accept_and_headers(
+            &config,
+            &CleanChecker,
+            "GET",
+            path,
+            None,
+            &HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(blocked.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let decision: crate::policy::Decision = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decision.package, "maven:com.acme:demo@1.0");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after_block = requests.lock().unwrap().clone();
+        assert_eq!(after_block.len(), before_block + 1);
+        assert!(
+            after_block
+                .last()
+                .unwrap()
+                .starts_with("head /com/acme/demo/1.0/demo-1.0.pom ")
+        );
+
+        let before_blocked_pom = after_block.len();
+        let blocked_pom = route_http_request_with_accept_and_headers(
+            &config,
+            &CleanChecker,
+            "GET",
+            "/maven/com/acme/demo/1.0/demo-1.0.pom",
+            None,
+            &HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(blocked_pom.status(), StatusCode::FORBIDDEN);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let after_blocked_pom = requests.lock().unwrap().clone();
+        assert_eq!(after_blocked_pom.len(), before_blocked_pom + 1);
+        assert!(
+            after_blocked_pom
+                .last()
+                .unwrap()
+                .starts_with("head /com/acme/demo/1.0/demo-1.0.pom ")
+        );
+        assert_eq!(
+            after_blocked_pom
+                .iter()
+                .filter(|request| request.starts_with("get /com/acme/demo/1.0/demo-1.0.pom "))
+                .count(),
+            0
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn e2e_maven_proxy_route_preserves_artifact_bytes() {
+        let (upstream, requests, server) = serve_maven_upstream().await;
+        let mut config = Config::default();
+        config.upstreams.maven.repository_url = upstream;
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
+        let response = route_http_request_with_accept_and_headers(
+            &config,
+            &CleanChecker,
+            "GET",
+            "/maven/com/acme/demo/1.0/demo-1.0.jar",
+            None,
+            &HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"bytes");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let observed = requests.lock().unwrap().clone();
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|request| request.starts_with("get /com/acme/demo/1.0/demo-1.0.jar "))
+                .count(),
+            1
+        );
+
+        let head = route_http_request_with_accept_and_headers(
+            &config,
+            &CleanChecker,
+            "HEAD",
+            "/maven/com/acme/demo/1.0/demo-1.0.jar",
+            None,
+            &HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(
+            head.headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
+        let head_body = axum::body::to_bytes(head.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(head_body.is_empty());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let observed = requests.lock().unwrap().clone();
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|request| request.starts_with("head /com/acme/demo/1.0/demo-1.0.jar "))
+                .count(),
+            1
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -2223,6 +2428,46 @@ INSERT INTO advisories (
             String::from_utf8_lossy(&buffer[..bytes]).to_ascii_lowercase()
         });
         (format!("http://{address}"), handle)
+    }
+
+    async fn serve_maven_upstream() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let captured = Arc::clone(&captured);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 8192];
+                    let bytes = stream.read(&mut buffer).await.unwrap();
+                    let request = String::from_utf8_lossy(&buffer[..bytes]).to_ascii_lowercase();
+                    captured.lock().unwrap().push(request.clone());
+                    let (content_type, body) = if request
+                        .starts_with("get /com/acme/demo/1.0/demo-1.0.pom ")
+                    {
+                        (
+                            "application/xml",
+                            "<project><groupId>com.acme</groupId><artifactId>demo</artifactId><version>1.0</version></project>",
+                        )
+                    } else {
+                        ("application/java-archive", "bytes")
+                    };
+                    let include_body = !request.starts_with("head ");
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nlast-modified: Sun, 01 Jun 2025 00:00:00 GMT\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        if include_body { body } else { "" }
+                    );
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (format!("http://{address}"), requests, handle)
     }
 
     async fn wait_for_sync_status(db: &std::path::Path, ecosystem: &str, expected_status: &str) {

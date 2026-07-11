@@ -1,7 +1,8 @@
 //! Maven Repository Layout metadata, identity, and version semantics.
 
 use crate::artifact::{Artifact, ArtifactHashes, Ecosystem};
-use crate::config::Config;
+use crate::artifacts::{ArtifactDeliveryError, ArtifactDeliveryOptions, ArtifactDeliveryResponse};
+use crate::config::{ArtifactBehavior, Config};
 use crate::malicious::MaliciousChecker;
 use crate::policy::{Decision, PolicyEngine};
 use crate::response::RegistryResponse;
@@ -52,6 +53,13 @@ pub struct MavenPomMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MavenPomHead {
+    pub last_modified: Option<String>,
+    pub sha256: Option<String>,
+    pub upstream_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MavenRawMetadata {
     pub body: String,
 }
@@ -67,6 +75,19 @@ pub trait MavenMetadataProvider: Send + Sync {
 
     async fn fetch_metadata(&self, _relative_path: &str) -> Result<MavenRawMetadata, MavenError> {
         Err(MavenError::UnsupportedMetadataRoute)
+    }
+
+    async fn fetch_pom_head(
+        &self,
+        _group_id: &str,
+        _artifact_id: &str,
+        _version: &str,
+    ) -> Result<MavenPomHead, MavenError> {
+        Err(MavenError::UnsupportedPomHead)
+    }
+
+    async fn validate_artifact(&self, _relative_path: &str) -> Result<(), MavenError> {
+        Ok(())
     }
 }
 
@@ -135,6 +156,63 @@ impl MavenMetadataProvider for MavenRepositoryClient {
             .map_err(|error| MavenError::InvalidMetadataEncoding(error.to_string()))?;
         Ok(MavenRawMetadata { body })
     }
+
+    async fn fetch_pom_head(
+        &self,
+        group_id: &str,
+        artifact_id: &str,
+        version: &str,
+    ) -> Result<MavenPomHead, MavenError> {
+        validate_coordinate(group_id, artifact_id, version)?;
+        let url = pom_url(&self.repository_url, group_id, artifact_id, version);
+        let response = self.client.head(&url).send().await?;
+        if matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::GONE) {
+            return Err(MavenError::VersionNotFound(format!(
+                "{group_id}:{artifact_id}@{version}"
+            )));
+        }
+        let response = response.error_for_status()?;
+        Ok(MavenPomHead {
+            last_modified: response
+                .headers()
+                .get(header::LAST_MODIFIED)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            sha256: response
+                .headers()
+                .get("x-checksum-sha256")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+            upstream_url: url,
+        })
+    }
+
+    async fn validate_artifact(&self, relative_path: &str) -> Result<(), MavenError> {
+        validate_relative_path(relative_path)?;
+        let response = self
+            .client
+            .head(format!("{}/{}", self.repository_url, relative_path))
+            .send()
+            .await?;
+        if matches!(response.status(), StatusCode::NOT_FOUND | StatusCode::GONE) {
+            return Err(MavenError::ArtifactNotFound(relative_path.to_string()));
+        }
+        response.error_for_status()?;
+        Ok(())
+    }
+}
+
+fn validate_relative_path(relative_path: &str) -> Result<(), MavenError> {
+    if relative_path.is_empty()
+        || relative_path.starts_with('/')
+        || relative_path.contains('%')
+        || relative_path
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return Err(MavenError::InvalidArtifactPath(relative_path.to_string()));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -630,9 +708,20 @@ fn weak_entity_tag(value: &str) -> &str {
 
 pub fn error_response(error: &MavenError) -> RegistryResponse {
     let status = match error {
-        MavenError::MetadataNotFound(_) | MavenError::VersionNotFound(_) => 404,
+        MavenError::MetadataNotFound(_)
+        | MavenError::VersionNotFound(_)
+        | MavenError::ArtifactNotFound(_)
+        | MavenError::Delivery(ArtifactDeliveryError::UpstreamStatus(404 | 410)) => 404,
+        MavenError::Denied(_) => 403,
         _ => 502,
     };
+    if let MavenError::Denied(decision) = error {
+        return RegistryResponse::json(
+            403,
+            &serde_json::to_value(decision).expect("Maven decision should serialize"),
+        )
+        .expect("Maven denial should serialize");
+    }
     RegistryResponse::json(
         status,
         &serde_json::json!({
@@ -642,6 +731,121 @@ pub fn error_response(error: &MavenError) -> RegistryResponse {
         }),
     )
     .expect("static Maven error response should serialize")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MavenReleaseRoute {
+    pub relative_path: String,
+    pub group_id: String,
+    pub artifact_id: String,
+    pub version: String,
+    pub filename: String,
+}
+
+pub fn parse_release_path(relative_path: &str) -> Result<MavenReleaseRoute, MavenError> {
+    validate_relative_path(relative_path)?;
+    let segments = relative_path.split('/').collect::<Vec<_>>();
+    if segments.len() < 4 {
+        return Err(MavenError::InvalidArtifactPath(relative_path.to_string()));
+    }
+    let artifact_id = segments[segments.len() - 3];
+    let version = segments[segments.len() - 2];
+    let filename = segments[segments.len() - 1];
+    let group_segments = &segments[..segments.len() - 3];
+    if group_segments.iter().any(|segment| {
+        !segment
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }) {
+        return Err(MavenError::InvalidArtifactPath(relative_path.to_string()));
+    }
+    let group_id = group_segments.join(".");
+    validate_coordinate(&group_id, artifact_id, version)?;
+    if version.to_ascii_uppercase().ends_with("-SNAPSHOT") {
+        return Err(MavenError::SnapshotsUnsupported(version.to_string()));
+    }
+    let prefix = format!("{artifact_id}-{version}");
+    let suffix = filename
+        .strip_prefix(&prefix)
+        .ok_or_else(|| MavenError::InvalidArtifactPath(relative_path.to_string()))?;
+    let suffix_valid = if let Some(extension) = suffix.strip_prefix('.') {
+        !extension.is_empty()
+    } else if let Some(classified) = suffix.strip_prefix('-') {
+        classified
+            .split_once('.')
+            .is_some_and(|(classifier, extension)| !classifier.is_empty() && !extension.is_empty())
+    } else {
+        false
+    };
+    if !suffix_valid
+        || !suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'))
+    {
+        return Err(MavenError::InvalidArtifactPath(relative_path.to_string()));
+    }
+    Ok(MavenReleaseRoute {
+        relative_path: relative_path.to_string(),
+        group_id,
+        artifact_id: artifact_id.to_string(),
+        version: version.to_string(),
+        filename: filename.to_string(),
+    })
+}
+
+pub async fn artifact_delivery_response(
+    config: &Config,
+    provider: &dyn MavenMetadataProvider,
+    checker: &dyn MaliciousChecker,
+    route: &MavenReleaseRoute,
+    now: DateTime<Utc>,
+    delivery: ArtifactDeliveryOptions<'_>,
+) -> Result<ArtifactDeliveryResponse, MavenError> {
+    let package = format!("{}:{}", route.group_id, route.artifact_id);
+    let pom = provider
+        .fetch_pom_head(&route.group_id, &route.artifact_id, &route.version)
+        .await?;
+    let published_at = pom
+        .last_modified
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc2822(value).ok())
+        .map(|value| value.with_timezone(&Utc));
+    let canonical_pom = format!("{}-{}.pom", route.artifact_id, route.version);
+    let mut artifact = Artifact::package(Ecosystem::Maven, &package, &route.version, published_at);
+    artifact.filename = Some(route.filename.clone());
+    artifact.upstream_url = Some(format!(
+        "{}/{}",
+        config.upstreams.maven.repository_url.trim_end_matches('/'),
+        route.relative_path
+    ));
+    if route.filename == canonical_pom {
+        artifact.hashes.sha256 = pom.sha256;
+    }
+    let decision = PolicyEngine::new(config)
+        .evaluate(&artifact, now, checker)
+        .await;
+    if !decision.allowed {
+        return Err(MavenError::Denied(Box::new(decision)));
+    }
+    if config.artifacts.behavior == ArtifactBehavior::Redirect && route.filename != canonical_pom {
+        provider.validate_artifact(&route.relative_path).await?;
+    }
+    let upstream_url = artifact
+        .upstream_url
+        .expect("Maven artifact has upstream URL");
+    if delivery.head {
+        delivery
+            .client
+            .deliver_head(config, upstream_url, delivery.request_headers)
+            .await
+            .map_err(MavenError::Delivery)
+    } else {
+        delivery
+            .client
+            .deliver(config, upstream_url, delivery.request_headers)
+            .await
+            .map_err(MavenError::Delivery)
+    }
 }
 
 async fn evaluate_artifacts(
@@ -714,6 +918,7 @@ pub fn validate_coordinate(
                 byte.is_ascii_alphanumeric()
                     || byte == b'-'
                     || byte == b'_'
+                    || byte == b'+'
                     || (allow_dots && byte == b'.')
             })
     };
@@ -937,16 +1142,26 @@ pub enum MavenError {
     InvalidMetadata(String),
     #[error("invalid Maven metadata path: {0}")]
     InvalidMetadataPath(String),
+    #[error("invalid Maven artifact path: {0}")]
+    InvalidArtifactPath(String),
     #[error("Maven metadata not found: {0}")]
     MetadataNotFound(String),
+    #[error("Maven artifact not found: {0}")]
+    ArtifactNotFound(String),
     #[error("Maven metadata coordinate mismatch: expected {expected}, got {actual}")]
     MetadataCoordinateMismatch { expected: String, actual: String },
     #[error("Maven snapshots are unsupported: {0}")]
     SnapshotsUnsupported(String),
     #[error("Maven metadata route is unsupported by this provider")]
     UnsupportedMetadataRoute,
+    #[error("Maven POM HEAD is unsupported by this provider")]
+    UnsupportedPomHead,
     #[error("failed to enrich Maven version {version}: {message}")]
     VersionEnrichment { version: String, message: String },
+    #[error("Maven package denied by policy")]
+    Denied(Box<Decision>),
+    #[error("Maven artifact delivery failed: {0}")]
+    Delivery(#[from] ArtifactDeliveryError),
     #[error("Maven POM coordinate mismatch: expected {expected}, got {actual}")]
     CoordinateMismatch { expected: String, actual: String },
     #[error("Maven upstream request failed: {0}")]
@@ -959,7 +1174,11 @@ mod tests {
     use crate::config::{BlocklistEntry, MissingPublishTime};
     use crate::malicious::{MaliciousHit, OsvError};
     use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
 
     struct StaticProvider(MavenPomMetadata);
 
@@ -1027,6 +1246,65 @@ mod tests {
         ) -> Result<Vec<Vec<MaliciousHit>>, OsvError> {
             self.0.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(vec![Vec::new(); artifacts.len()])
+        }
+    }
+
+    struct CleanChecker;
+
+    #[async_trait]
+    impl MaliciousChecker for CleanChecker {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, OsvError> {
+            Ok(Vec::new())
+        }
+    }
+
+    struct CapturingChecker(Mutex<Option<Artifact>>);
+
+    #[async_trait]
+    impl MaliciousChecker for CapturingChecker {
+        async fn check(&self, artifact: &Artifact) -> Result<Vec<MaliciousHit>, OsvError> {
+            *self.0.lock().unwrap() = Some(artifact.clone());
+            Ok(Vec::new())
+        }
+    }
+
+    struct DeliveryProvider {
+        pom: MavenPomMetadata,
+        artifact_exists: bool,
+        validations: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MavenMetadataProvider for DeliveryProvider {
+        async fn fetch_pom(
+            &self,
+            _group_id: &str,
+            _artifact_id: &str,
+            _version: &str,
+        ) -> Result<MavenPomMetadata, MavenError> {
+            Ok(self.pom.clone())
+        }
+
+        async fn fetch_pom_head(
+            &self,
+            _group_id: &str,
+            _artifact_id: &str,
+            _version: &str,
+        ) -> Result<MavenPomHead, MavenError> {
+            Ok(MavenPomHead {
+                last_modified: self.pom.last_modified.clone(),
+                sha256: self.pom.sha256.clone(),
+                upstream_url: self.pom.upstream_url.clone(),
+            })
+        }
+
+        async fn validate_artifact(&self, relative_path: &str) -> Result<(), MavenError> {
+            self.validations.fetch_add(1, AtomicOrdering::SeqCst);
+            if self.artifact_exists {
+                Ok(())
+            } else {
+                Err(MavenError::ArtifactNotFound(relative_path.to_string()))
+            }
         }
     }
 
@@ -1503,5 +1781,219 @@ mod tests {
             .await,
             Err(MavenError::InvalidMetadata(_))
         ));
+    }
+
+    #[test]
+    fn parses_strict_release_paths_for_all_coordinate_scoped_files() {
+        for path in [
+            "com/acme/demo/1.2.3/demo-1.2.3.pom",
+            "com/acme/demo/1.2.3/demo-1.2.3.jar",
+            "com/acme/demo/1.2.3/demo-1.2.3.module",
+            "com/acme/demo/1.2.3/demo-1.2.3-sources.jar",
+            "com/acme/demo/1.2.3/demo-1.2.3-linux-x86_64.tar.gz",
+            "com/acme/demo/1.2.3/demo-1.2.3.jar.sha256",
+            "com/acme/demo/1.2.3/demo-1.2.3.pom.asc",
+        ] {
+            let route = parse_release_path(path).unwrap();
+            assert_eq!(route.group_id, "com.acme");
+            assert_eq!(route.artifact_id, "demo");
+            assert_eq!(route.version, "1.2.3");
+            assert_eq!(route.relative_path, path);
+        }
+        for invalid in [
+            "com/acme/demo/1.2.3/other-1.2.3.jar",
+            "com/acme/demo/1.2.3/demo-1.2.3",
+            "com/acme/demo/1.2.3/demo-1.2.3-sources",
+            "com/acme/demo/1.2.3/../secret.jar",
+            "com/acme%2Fdemo/1.2.3/demo-1.2.3.jar",
+            "com/acme/demo/1.2-SNAPSHOT/demo-1.2-SNAPSHOT.jar",
+        ] {
+            assert!(parse_release_path(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_redirect_validates_exact_file_before_returning_location() {
+        let mut config = Config::default();
+        config.upstreams.maven.repository_url = "https://repo.example/maven2".to_string();
+        let provider = DeliveryProvider {
+            pom: pom_metadata("1.0"),
+            artifact_exists: true,
+            validations: AtomicUsize::new(0),
+        };
+        let route = parse_release_path("com/acme/demo/1.0/demo-1.0.jar").unwrap();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let response = artifact_delivery_response(
+            &config,
+            &provider,
+            &CleanChecker,
+            &route,
+            Utc::now(),
+            ArtifactDeliveryOptions::new(&delivery),
+        )
+        .await
+        .unwrap()
+        .into_registry_response()
+        .await;
+        assert_eq!(response.status, 302);
+        assert_eq!(
+            response.headers,
+            vec![(
+                "location".to_string(),
+                "https://repo.example/maven2/com/acme/demo/1.0/demo-1.0.jar".to_string()
+            )]
+        );
+        assert_eq!(provider.validations.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn non_pom_delivery_never_inherits_pom_hash() {
+        let mut config = Config::default();
+        config.upstreams.maven.repository_url = "https://repo.example/maven2".to_string();
+        let provider = DeliveryProvider {
+            pom: MavenPomMetadata {
+                sha256: Some("pom-digest".to_string()),
+                ..pom_metadata("1.0")
+            },
+            artifact_exists: true,
+            validations: AtomicUsize::new(0),
+        };
+        let checker = CapturingChecker(Mutex::new(None));
+        let route = parse_release_path("com/acme/demo/1.0/demo-1.0.jar").unwrap();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        artifact_delivery_response(
+            &config,
+            &provider,
+            &checker,
+            &route,
+            Utc::now(),
+            ArtifactDeliveryOptions::new(&delivery),
+        )
+        .await
+        .unwrap();
+        let artifact = checker.0.lock().unwrap().clone().unwrap();
+        assert_eq!(artifact.filename.as_deref(), Some("demo-1.0.jar"));
+        assert_eq!(artifact.hashes, ArtifactHashes::default());
+    }
+
+    #[tokio::test]
+    async fn missing_redirect_artifact_maps_to_404() {
+        let config = Config::default();
+        let provider = DeliveryProvider {
+            pom: pom_metadata("1.0"),
+            artifact_exists: false,
+            validations: AtomicUsize::new(0),
+        };
+        let route = parse_release_path("com/acme/demo/1.0/demo-1.0.jar").unwrap();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let error = match artifact_delivery_response(
+            &config,
+            &provider,
+            &CleanChecker,
+            &route,
+            Utc::now(),
+            ArtifactDeliveryOptions::new(&delivery),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("missing artifact should not be delivered"),
+        };
+        assert_eq!(error_response(&error).status, 404);
+    }
+
+    #[tokio::test]
+    async fn blocked_proxy_artifact_never_contacts_byte_endpoint() {
+        let (repository_url, request) = serve_artifact_once(
+            "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nbytes",
+        )
+        .await;
+        let mut config = Config::default();
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.upstreams.maven.repository_url = repository_url;
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Maven,
+            name: "com.acme:demo".to_string(),
+            versions: vec!["1.0".to_string()],
+            reason: "blocked fixture".to_string(),
+        });
+        let provider = DeliveryProvider {
+            pom: pom_metadata("1.0"),
+            artifact_exists: true,
+            validations: AtomicUsize::new(0),
+        };
+        let route = parse_release_path("com/acme/demo/1.0/demo-1.0.jar").unwrap();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let error = match artifact_delivery_response(
+            &config,
+            &provider,
+            &CleanChecker,
+            &route,
+            Utc::now(),
+            ArtifactDeliveryOptions::new(&delivery),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("blocked artifact should not be delivered"),
+        };
+        let response = error_response(&error);
+        assert_eq!(response.status, 403);
+        let decision: Decision = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(decision.package, "maven:com.acme:demo@1.0");
+        assert!(timeout(Duration::from_millis(100), request).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn allowed_proxy_preserves_exact_artifact_bytes() {
+        let (repository_url, request) = serve_artifact_once(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/java-archive\r\ncontent-length: 5\r\nconnection: close\r\n\r\nbytes",
+        )
+        .await;
+        let mut config = Config::default();
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.upstreams.maven.repository_url = repository_url;
+        let provider = DeliveryProvider {
+            pom: pom_metadata("1.0"),
+            artifact_exists: true,
+            validations: AtomicUsize::new(0),
+        };
+        let route = parse_release_path("com/acme/demo/1.0/demo-1.0.jar").unwrap();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let response = artifact_delivery_response(
+            &config,
+            &provider,
+            &CleanChecker,
+            &route,
+            Utc::now(),
+            ArtifactDeliveryOptions::new(&delivery),
+        )
+        .await
+        .unwrap()
+        .into_registry_response()
+        .await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"bytes");
+        assert!(
+            request
+                .await
+                .unwrap()
+                .starts_with("get /com/acme/demo/1.0/demo-1.0.jar ")
+        );
+    }
+
+    async fn serve_artifact_once(
+        response: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 4096];
+            let bytes = stream.read(&mut buffer).await.unwrap();
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buffer[..bytes]).to_ascii_lowercase()
+        });
+        (format!("http://{address}"), handle)
     }
 }
