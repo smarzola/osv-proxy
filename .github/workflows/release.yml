@@ -89,7 +89,14 @@ jobs:
           set -euo pipefail
           rustup toolchain install stable --profile minimal
           rustup default stable
-          rustup component add rustfmt
+          rustup component add clippy rustfmt
+
+      - name: Audit Rust dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo install cargo-audit --locked --version 0.22.2
+          cargo audit --file Cargo.lock
 
       - name: Install Java
         uses: actions/setup-java@v4
@@ -158,6 +165,12 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --check
+
+      - name: Run Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests
         shell: bash

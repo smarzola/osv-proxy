@@ -3,6 +3,7 @@
 use crate::artifact::{Artifact, Ecosystem};
 use crate::artifacts::ArtifactDeliveryOptions;
 use crate::config::Config;
+use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
@@ -23,6 +24,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const LIST_INFO_CONCURRENCY: usize = 16;
 const LIST_INFO_LIMIT: usize = 256;
+const MAX_GO_LIST_BYTES: usize = 4 * 1024 * 1024;
+const MAX_GO_INFO_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct GoInfo {
@@ -39,6 +42,8 @@ pub enum GoError {
     InvalidRoute(String),
     #[error("Go upstream request failed: {0}")]
     Upstream(#[from] reqwest::Error),
+    #[error("Go upstream body failed validation: {0}")]
+    Body(#[from] HttpBodyError),
     #[error("Go upstream returned HTTP status {0}")]
     UpstreamStatus(u16),
     #[error("invalid Go upstream response: {0}")]
@@ -92,7 +97,7 @@ impl GoProxyProvider for GoProxyClient {
         if !response.status().is_success() {
             return Err(GoError::UpstreamStatus(response.status().as_u16()));
         }
-        let body = response.text().await?;
+        let body = http_body::collect_text(response, MAX_GO_LIST_BYTES, "Go version list").await?;
         Ok(body
             .lines()
             .map(str::trim)
@@ -109,20 +114,18 @@ impl GoProxyProvider for GoProxyClient {
         if !response.status().is_success() {
             return Err(GoError::UpstreamStatus(response.status().as_u16()));
         }
-        response
-            .json()
+        http_body::collect_json(response, MAX_GO_INFO_BYTES, "Go module info")
             .await
-            .map_err(|err| GoError::InvalidResponse(err.to_string()))
+            .map_err(GoError::from)
     }
     async fn latest(&self, module: &str) -> Result<GoInfo, GoError> {
         let response = self.client.get(self.url(module, "@latest")?).send().await?;
         if !response.status().is_success() {
             return Err(GoError::UpstreamStatus(response.status().as_u16()));
         }
-        response
-            .json()
+        http_body::collect_json(response, MAX_GO_INFO_BYTES, "Go latest module info")
             .await
-            .map_err(|err| GoError::InvalidResponse(err.to_string()))
+            .map_err(GoError::from)
     }
     fn resource_url(
         &self,

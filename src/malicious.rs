@@ -1,6 +1,7 @@
 use crate::artifact::{Artifact, Ecosystem};
 use crate::config::{Config, LocalOsvConfig, LocalOsvStaleBehavior, OsvSource};
 use crate::go;
+use crate::http_body::{self, HttpBodyError};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -13,7 +14,10 @@ use semver::Version as cargo_semver;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Cursor, Read};
+use std::fs::File;
+#[cfg(test)]
+use std::io::{Cursor, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -26,6 +30,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const OSV_DUMP_BASE_URL: &str = "https://storage.googleapis.com/osv-vulnerabilities";
 const OSV_DETAIL_CONCURRENCY: usize = 16;
+const MAX_OSV_API_BYTES: usize = 64 * 1024 * 1024;
+const MAX_OSV_DOCUMENT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_OSV_ARCHIVE_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const MAX_OSV_ARCHIVE_ENTRIES: usize = 1_000_000;
+const MAX_OSV_ARCHIVE_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_OSV_ARCHIVE_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[async_trait]
 pub trait OsvChecker: Send + Sync {
@@ -153,6 +163,8 @@ pub fn effective_osv_severity(
 pub enum OsvError {
     #[error("OSV request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("OSV upstream body failed validation: {0}")]
+    Body(#[from] HttpBodyError),
     #[error("OSV batch response returned {actual} results for {expected} queries")]
     InvalidBatchResponse { expected: usize, actual: usize },
     #[error("local malicious store failed: {0}")]
@@ -199,30 +211,28 @@ impl OsvHttpClient {
     }
 
     async fn post_query(&self, request: &OsvQueryRequest) -> Result<OsvQueryResponse, OsvError> {
-        Ok(self
+        let response = self
             .client
             .post(format!("{}/v1/query", self.api_url))
             .json(request)
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .error_for_status()?;
+        Ok(http_body::collect_json(response, MAX_OSV_API_BYTES, "OSV query response").await?)
     }
 
     async fn post_batch(
         &self,
         queries: Vec<OsvQueryRequest>,
     ) -> Result<OsvBatchQueryResponse, OsvError> {
-        Ok(self
+        let response = self
             .client
             .post(format!("{}/v1/querybatch", self.api_url))
             .json(&OsvBatchQueryRequest { queries })
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .error_for_status()?;
+        Ok(http_body::collect_json(response, MAX_OSV_API_BYTES, "OSV batch response").await?)
     }
 
     async fn hydrate_details(
@@ -244,16 +254,20 @@ impl OsvHttpClient {
                         url.path_segments_mut()
                             .map_err(|_| "OSV API URL cannot be a base URL".to_string())?
                             .extend(["v1", "vulns", id.as_str()]);
-                        let detail = client
+                        let response = client
                             .get(url)
                             .send()
                             .await
                             .map_err(|error| error.to_string())?
                             .error_for_status()
-                            .map_err(|error| error.to_string())?
-                            .json::<OsvVulnerability>()
-                            .await
                             .map_err(|error| error.to_string())?;
+                        let detail = http_body::collect_json::<OsvVulnerability>(
+                            response,
+                            MAX_OSV_API_BYTES,
+                            "OSV vulnerability detail",
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
                         if detail.id != id {
                             return Err(OsvError::DetailIdentity {
                                 requested: id.clone(),
@@ -657,6 +671,23 @@ pub enum OsvSyncMode {
 #[async_trait]
 pub trait OsvDumpClient: Send + Sync {
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, OsvError>;
+    async fn fetch_archive(&self, url: &str) -> Result<File, OsvError>;
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_archive_file(bytes: &[u8]) -> Result<File, OsvError> {
+    if bytes.len() > MAX_OSV_ARCHIVE_BYTES {
+        return Err(OsvError::Sync(format!(
+            "OSV archive exceeds the {MAX_OSV_ARCHIVE_BYTES}-byte limit"
+        )));
+    }
+    let mut file = tempfile::tempfile()
+        .map_err(|error| OsvError::Sync(format!("failed to create OSV archive file: {error}")))?;
+    file.write_all(bytes)
+        .map_err(|error| OsvError::Sync(format!("failed to write OSV archive file: {error}")))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| OsvError::Sync(format!("failed to rewind OSV archive file: {error}")))?;
+    Ok(file)
 }
 
 #[derive(Debug, Clone)]
@@ -686,11 +717,15 @@ impl Default for HttpOsvDumpClient {
 impl OsvDumpClient for HttpOsvDumpClient {
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, OsvError> {
         let response = self.client.get(url).send().await?.error_for_status()?;
-        response
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(OsvError::Request)
+        Ok(http_body::collect_bytes(response, MAX_OSV_DOCUMENT_BYTES, "OSV dump document").await?)
+    }
+
+    async fn fetch_archive(&self, url: &str) -> Result<File, OsvError> {
+        let response = self.client.get(url).send().await?.error_for_status()?;
+        Ok(
+            http_body::collect_temp_file(response, MAX_OSV_ARCHIVE_BYTES, "OSV all.zip archive")
+                .await?,
+        )
     }
 }
 
@@ -781,10 +816,10 @@ async fn sync_bootstrap(
     attempted_at: DateTime<Utc>,
     retain_raw_advisories: bool,
 ) -> Result<MaliciousSyncEcosystemReport, OsvError> {
-    let bytes = client.fetch_bytes(&all_zip_url(ecosystem)).await?;
+    let mut archive = client.fetch_archive(&all_zip_url(ecosystem)).await?;
     let modified_csv = client.fetch_bytes(&modified_id_csv_url(ecosystem)).await?;
     let modified_rows = parse_modified_id_csv(&modified_csv, None)?;
-    let archive_modified = archive_modified_by_id(&bytes)?;
+    let archive_modified = archive_modified_by_id(&mut archive)?;
     let mut catch_up = Vec::new();
     for row in &modified_rows {
         if archive_modified
@@ -805,7 +840,7 @@ async fn sync_bootstrap(
     let stats = import_zip_bootstrap_and_record_success(
         connection,
         ecosystem,
-        &bytes,
+        &mut archive,
         &catch_up,
         attempted_at,
         high_watermark,
@@ -819,10 +854,17 @@ async fn sync_bootstrap(
     })
 }
 
-fn archive_modified_by_id(bytes: &[u8]) -> Result<BTreeMap<String, DateTime<Utc>>, OsvError> {
-    let mut archive = ZipArchive::new(Cursor::new(bytes))
+fn archive_modified_by_id<R: Read + Seek>(
+    reader: &mut R,
+) -> Result<BTreeMap<String, DateTime<Utc>>, OsvError> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| OsvError::Sync(format!("failed to rewind OSV all.zip: {error}")))?;
+    let mut archive = ZipArchive::new(reader)
         .map_err(|error| OsvError::Sync(format!("invalid OSV all.zip: {error}")))?;
+    validate_archive_bounds(&archive)?;
     let mut modified = BTreeMap::new();
+    let mut expanded = 0_u64;
     for index in 0..archive.len() {
         let mut file = archive
             .by_index(index)
@@ -830,9 +872,7 @@ fn archive_modified_by_id(bytes: &[u8]) -> Result<BTreeMap<String, DateTime<Utc>
         if !file.name().ends_with(".json") {
             continue;
         }
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw)
-            .map_err(|error| OsvError::Sync(format!("failed to read OSV zip entry: {error}")))?;
+        let raw = read_archive_entry(&mut file, &mut expanded)?;
         let advisory: OsvDumpAdvisory = serde_json::from_slice(&raw)
             .map_err(|err| OsvError::Sync(format!("invalid OSV advisory JSON: {err}")))?;
         let timestamp = advisory
@@ -846,10 +886,10 @@ fn archive_modified_by_id(bytes: &[u8]) -> Result<BTreeMap<String, DateTime<Utc>
     Ok(modified)
 }
 
-fn import_zip_bootstrap_and_record_success(
+fn import_zip_bootstrap_and_record_success<R: Read + Seek>(
     connection: &mut Connection,
     ecosystem: Ecosystem,
-    bytes: &[u8],
+    reader: &mut R,
     catch_up: &[OsvDumpAdvisory],
     imported_at: DateTime<Utc>,
     high_watermark: Option<String>,
@@ -869,9 +909,14 @@ fn import_zip_bootstrap_and_record_success(
         )
         .map_err(sqlite_error)?;
     let generation_id = transaction.last_insert_rowid();
-    let mut archive = ZipArchive::new(Cursor::new(bytes))
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| OsvError::Sync(format!("failed to rewind OSV all.zip: {error}")))?;
+    let mut archive = ZipArchive::new(reader)
         .map_err(|error| OsvError::Sync(format!("invalid OSV all.zip: {error}")))?;
+    validate_archive_bounds(&archive)?;
     let mut totals = ImportStats::default();
+    let mut expanded = 0_u64;
     for index in 0..archive.len() {
         let mut file = archive
             .by_index(index)
@@ -879,9 +924,7 @@ fn import_zip_bootstrap_and_record_success(
         if !file.name().ends_with(".json") {
             continue;
         }
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw)
-            .map_err(|error| OsvError::Sync(format!("failed to read OSV zip entry: {error}")))?;
+        let raw = read_archive_entry(&mut file, &mut expanded)?;
         let advisory = parse_osv_advisory_bytes(&raw, retain_raw_advisories)?;
         let stats = import_advisories(
             &transaction,
@@ -925,6 +968,46 @@ fn import_zip_bootstrap_and_record_success(
     )?;
     transaction.commit().map_err(sqlite_error)?;
     Ok(totals)
+}
+
+fn validate_archive_bounds<R: Read + Seek>(archive: &ZipArchive<R>) -> Result<(), OsvError> {
+    if archive.len() > MAX_OSV_ARCHIVE_ENTRIES {
+        return Err(OsvError::Sync(format!(
+            "OSV archive contains more than {MAX_OSV_ARCHIVE_ENTRIES} entries"
+        )));
+    }
+    Ok(())
+}
+
+fn read_archive_entry<R: Read>(
+    file: &mut zip::read::ZipFile<'_, R>,
+    expanded: &mut u64,
+) -> Result<Vec<u8>, OsvError> {
+    let name = file.name().to_string();
+    if file.size() > MAX_OSV_ARCHIVE_ENTRY_BYTES {
+        return Err(OsvError::Sync(format!(
+            "OSV zip entry {} exceeds the {MAX_OSV_ARCHIVE_ENTRY_BYTES}-byte expanded limit",
+            name
+        )));
+    }
+    let mut raw = Vec::with_capacity(file.size() as usize);
+    file.take(MAX_OSV_ARCHIVE_ENTRY_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|error| OsvError::Sync(format!("failed to read OSV zip entry: {error}")))?;
+    if raw.len() as u64 > MAX_OSV_ARCHIVE_ENTRY_BYTES {
+        return Err(OsvError::Sync(format!(
+            "OSV zip entry {name} exceeds the {MAX_OSV_ARCHIVE_ENTRY_BYTES}-byte expanded limit"
+        )));
+    }
+    *expanded = expanded.checked_add(raw.len() as u64).ok_or_else(|| {
+        OsvError::Sync("OSV archive expanded-size accounting overflowed".to_string())
+    })?;
+    if *expanded > MAX_OSV_ARCHIVE_EXPANDED_BYTES {
+        return Err(OsvError::Sync(format!(
+            "OSV archive exceeds the {MAX_OSV_ARCHIVE_EXPANDED_BYTES}-byte cumulative expanded limit"
+        )));
+    }
+    Ok(raw)
 }
 
 async fn sync_incremental(
@@ -3810,12 +3893,13 @@ INSERT INTO advisories (
             ("broken.json", b"{".as_slice()),
         ]);
         let now = Utc::now();
+        let mut malformed = Cursor::new(malformed);
 
         assert!(
             import_zip_bootstrap_and_record_success(
                 &mut connection,
                 Ecosystem::Npm,
-                &malformed,
+                &mut malformed,
                 &[],
                 now,
                 Some("2026-07-02T00:00:00.000000000Z".to_string()),
@@ -3846,10 +3930,12 @@ INSERT INTO advisories (
             r#""ranges":[]"#,
             None,
         );
+        let mut replacement_archive =
+            Cursor::new(zip_bytes([("new.json", replacement.as_slice())]));
         import_zip_bootstrap_and_record_success(
             &mut connection,
             Ecosystem::Npm,
-            &zip_bytes([("new.json", replacement.as_slice())]),
+            &mut replacement_archive,
             &[],
             now,
             Some("2026-07-02T00:00:00.000000000Z".to_string()),
@@ -4123,6 +4209,14 @@ INSERT INTO advisories (
         );
     }
 
+    #[test]
+    fn archive_rejects_oversized_expanded_entry_before_parsing() {
+        let oversized = vec![b'a'; MAX_OSV_ARCHIVE_ENTRY_BYTES as usize + 1];
+        let mut archive = Cursor::new(zip_bytes([("oversized.json", oversized.as_slice())]));
+        let error = archive_modified_by_id(&mut archive).unwrap_err();
+        assert!(error.to_string().contains("expanded limit"));
+    }
+
     struct FixtureDumpClient {
         responses: BTreeMap<String, Vec<u8>>,
     }
@@ -4174,6 +4268,10 @@ INSERT INTO advisories (
             Err(OsvError::Sync(format!(
                 "missing fixture response for {url}"
             )))
+        }
+
+        async fn fetch_archive(&self, url: &str) -> Result<File, OsvError> {
+            fixture_archive_file(&self.fetch_bytes(url).await?)
         }
     }
 

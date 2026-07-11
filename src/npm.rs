@@ -4,6 +4,7 @@ use crate::artifacts::{
     ArtifactDeliveryResponse,
 };
 use crate::config::Config;
+use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
@@ -16,6 +17,7 @@ use thiserror::Error;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_NPM_METADATA_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct NpmRegistryClient {
@@ -49,14 +51,11 @@ impl NpmMetadataProvider for NpmRegistryClient {
             self.registry_url,
             encode_package_for_registry(package)
         );
-        Ok(self
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json::<Value>()
-            .await?)
+        let response = self.client.get(url).send().await?.error_for_status()?;
+        Ok(
+            http_body::collect_json(response, MAX_NPM_METADATA_BYTES, "npm package metadata")
+                .await?,
+        )
     }
 }
 
@@ -159,7 +158,7 @@ pub fn error_response(error: &NpmError) -> NpmResponse {
         | NpmError::MissingTarballUrl(_, _)
         | NpmError::InvalidTarballName(_)
         | NpmError::TarballBasenameMismatch { .. } => 404,
-        NpmError::Upstream(_) | NpmError::ArtifactDelivery(_) => 502,
+        NpmError::Upstream(_) | NpmError::Body(_) | NpmError::ArtifactDelivery(_) => 502,
         NpmError::Json(_) | NpmError::InvalidMetadata(_) => 500,
     };
     let body = json!({
@@ -437,6 +436,8 @@ fn encode_package_for_registry(package: &str) -> String {
 pub enum NpmError {
     #[error("npm upstream request failed: {0}")]
     Upstream(#[from] reqwest::Error),
+    #[error("npm upstream body failed validation: {0}")]
+    Body(#[from] HttpBodyError),
     #[error("npm JSON handling failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid npm metadata: {0}")]

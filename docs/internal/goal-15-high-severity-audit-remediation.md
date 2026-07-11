@@ -129,7 +129,7 @@ The goal is complete only when:
 
 ## Milestones
 
-- [ ] Milestone 1: Harden dependencies and bound upstream bodies.
+- [x] Milestone 1: Harden dependencies and bound upstream bodies.
 - [ ] Milestone 2: Enforce artifact egress and redirect safety.
 - [ ] Milestone 3: Reuse clients and make local policy evaluation async-safe and
   package-batched.
@@ -170,7 +170,17 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo audit --file Cargo.lock
 ```
 
-Status: Not started.
+Status: Completed 2026-07-11 after two adversarial review rounds. The first
+round found an unsafe buffering default on the public archive trait and missing
+tempfile-specific oversize tests; both were repaired and the re-review was
+clean. `quick-xml` was upgraded to 0.41.0; `src/http_body.rs` became the shared streamed
+bound for registry/OSV metadata and temporary-file archive downloads; expanded
+ZIP limits and CI/release Clippy/RustSec gates were added. Verification:
+`cargo fmt --check` passed; `cargo test --locked --lib` passed 258 tests;
+focused body, archive, and adversarial XML tests passed;
+`cargo clippy --all-targets --all-features -- -D warnings` passed; RustSec
+scanned 222 locked dependencies with no vulnerability findings; `git diff
+--check` passed.
 
 ## Milestone 2: Enforce Artifact Egress And Redirect Safety
 

@@ -1110,6 +1110,10 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| MaliciousError::Sync(format!("missing fixture response for {url}")))
         }
+
+        async fn fetch_archive(&self, url: &str) -> Result<std::fs::File, MaliciousError> {
+            crate::malicious::fixture_archive_file(&self.fetch_bytes(url).await?)
+        }
     }
 
     const OSV_DUMP_BASE_URL: &str = "https://storage.googleapis.com/osv-vulnerabilities";

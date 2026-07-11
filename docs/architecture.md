@@ -60,6 +60,30 @@ failed imports never expose partial data. Existing malicious-only databases are
 version 0 and cannot satisfy vulnerability-enabled readiness. Raw JSON remains
 optional.
 
+## Upstream Body Bounds
+
+All registry metadata and OSV HTTP responses are checked against
+`Content-Length` when present and against cumulative bytes received while
+streaming. Current ceilings are:
+
+| Response | Limit |
+| --- | ---: |
+| npm package metadata | 32 MiB |
+| PyPI Simple root / project | 128 MiB / 32 MiB |
+| Cargo sparse entry | 16 MiB |
+| Go version list / info | 4 MiB / 1 MiB |
+| NuGet V3 JSON | 32 MiB |
+| RubyGems version metadata / versions index / compact info | 16 MiB / 64 MiB / 16 MiB |
+| Maven POM / metadata | 1 MiB / 2 MiB |
+| Live OSV API response | 64 MiB |
+| OSV dump document | 256 MiB |
+
+OSV `all.zip` downloads stream to an unnamed temporary file rather than an
+in-memory buffer. The compressed archive is capped at 4 GiB, one expanded JSON
+entry at 16 MiB, the archive at one million entries, and cumulative expanded
+JSON at 8 GiB. A bound violation fails the affected sync before generation
+activation.
+
 ## Future Boundaries
 
 Metadata cache, S3 artifact cache, MongoDB-compatible advisory storage, and an

@@ -1,5 +1,6 @@
 use crate::artifact::{Artifact, Ecosystem, normalize_nuget_name, normalize_nuget_version};
 use crate::config::Config;
+use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
@@ -14,6 +15,7 @@ use thiserror::Error;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REGISTRATION_PAGES: usize = 64;
+const MAX_NUGET_JSON_BYTES: usize = 32 * 1024 * 1024;
 const REGISTRATION_PAGE_CONCURRENCY: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -47,14 +49,8 @@ impl NugetProvider for NugetClient {
         self.fetch_json(&self.service_index_url).await
     }
     async fn fetch_json(&self, url: &str) -> Result<Value, NugetError> {
-        Ok(self
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?)
+        let response = self.client.get(url).send().await?.error_for_status()?;
+        Ok(http_body::collect_json(response, MAX_NUGET_JSON_BYTES, "NuGet V3 metadata").await?)
     }
 }
 
@@ -157,6 +153,8 @@ fn parse_published(value: &str) -> Option<DateTime<Utc>> {
 pub enum NugetError {
     #[error("NuGet upstream request failed: {0}")]
     Upstream(#[from] reqwest::Error),
+    #[error("NuGet upstream body failed validation: {0}")]
+    Body(#[from] HttpBodyError),
     #[error("NuGet response serialization failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid NuGet metadata: {0}")]

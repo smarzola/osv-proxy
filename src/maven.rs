@@ -3,6 +3,7 @@
 use crate::artifact::{Artifact, ArtifactHashes, Ecosystem};
 use crate::artifacts::{ArtifactDeliveryError, ArtifactDeliveryOptions, ArtifactDeliveryResponse};
 use crate::config::{ArtifactBehavior, Config};
+use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::{Decision, PolicyEngine};
 use crate::response::RegistryResponse;
@@ -310,10 +311,7 @@ fn ensure_content_length(
     limit: usize,
     kind: &'static str,
 ) -> Result<(), MavenError> {
-    if content_length.is_some_and(|length| length > limit as u64) {
-        return Err(MavenError::BodyTooLarge { kind, limit });
-    }
-    Ok(())
+    http_body::ensure_content_length(content_length, limit, kind).map_err(map_body_error)
 }
 
 async fn collect_bounded_body<S, T, E>(
@@ -326,15 +324,20 @@ where
     T: AsRef<[u8]>,
     E: Display,
 {
-    let mut body = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| MavenError::BodyRead(error.to_string()))?;
-        if body.len().saturating_add(chunk.as_ref().len()) > limit {
-            return Err(MavenError::BodyTooLarge { kind, limit });
+    http_body::collect_stream(&mut stream, limit, kind)
+        .await
+        .map_err(map_body_error)
+}
+
+fn map_body_error(error: HttpBodyError) -> MavenError {
+    match error {
+        HttpBodyError::DeclaredTooLarge { kind, limit }
+        | HttpBodyError::StreamedTooLarge { kind, limit } => {
+            MavenError::BodyTooLarge { kind, limit }
         }
-        body.extend_from_slice(chunk.as_ref());
+        HttpBodyError::Read { message, .. } => MavenError::BodyRead(message),
+        other => MavenError::BodyRead(other.to_string()),
     }
-    Ok(body)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1481,6 +1484,21 @@ mod tests {
                 limit: MAX_POM_BYTES
             })
         ));
+    }
+
+    #[test]
+    fn adversarial_namespace_and_duplicate_attribute_xml_fail_closed() {
+        let namespaces = (0..300)
+            .map(|index| format!(r#"xmlns:n{index}="urn:test:{index}""#))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let namespace_heavy = format!(
+            "<metadata {namespaces}><groupId>com.acme</groupId><artifactId>demo</artifactId></metadata>"
+        );
+        assert!(from_str::<MavenMetadataDocument>(&namespace_heavy).is_err());
+
+        let duplicate = r#"<metadata id="one" id="two"><groupId>com.acme</groupId><artifactId>demo</artifactId></metadata>"#;
+        assert!(from_str::<MavenMetadataDocument>(duplicate).is_err());
     }
 
     #[tokio::test]
