@@ -197,17 +197,20 @@ async fn registry_check(
 ) -> anyhow::Result<CheckOutput> {
     let cargo_upstream = CargoRegistryClient::new(config);
     let maven_upstream = MavenRepositoryClient::new(&config.upstreams.maven.repository_url);
-    registry_check_with_upstreams(
-        config,
-        package,
-        now,
-        checker,
-        npm_upstream,
-        pypi_upstream,
-        &cargo_upstream,
-        &maven_upstream,
-    )
-    .await
+    let upstreams = RegistryCheckUpstreams {
+        npm: npm_upstream,
+        pypi: pypi_upstream,
+        cargo: &cargo_upstream,
+        maven: &maven_upstream,
+    };
+    registry_check_with_upstreams(config, package, now, checker, &upstreams).await
+}
+
+struct RegistryCheckUpstreams<'a> {
+    npm: &'a dyn NpmMetadataProvider,
+    pypi: &'a dyn PypiSimpleProvider,
+    cargo: &'a dyn CargoIndexProvider,
+    maven: &'a dyn MavenMetadataProvider,
 }
 
 async fn registry_check_with_upstreams(
@@ -215,18 +218,15 @@ async fn registry_check_with_upstreams(
     package: &str,
     now: DateTime<Utc>,
     checker: &dyn MaliciousChecker,
-    npm_upstream: &dyn NpmMetadataProvider,
-    pypi_upstream: &dyn PypiSimpleProvider,
-    cargo_upstream: &dyn CargoIndexProvider,
-    maven_upstream: &dyn MavenMetadataProvider,
+    upstreams: &RegistryCheckUpstreams<'_>,
 ) -> anyhow::Result<CheckOutput> {
     let identity = parse_package_identity(package)?;
     let artifacts = match identity.ecosystem {
         Ecosystem::Npm => vec![
-            crate::npm::lookup_artifact(npm_upstream, &identity.name, &identity.version).await?,
+            crate::npm::lookup_artifact(upstreams.npm, &identity.name, &identity.version).await?,
         ],
         Ecosystem::Pypi => {
-            crate::pypi::lookup_artifacts(config, pypi_upstream, &identity.name, &identity.version)
+            crate::pypi::lookup_artifacts(config, upstreams.pypi, &identity.name, &identity.version)
                 .await?
         }
         Ecosystem::Go => {
@@ -239,7 +239,7 @@ async fn registry_check_with_upstreams(
         Ecosystem::CratesIo => vec![
             crate::cargo::lookup_artifact(
                 config,
-                cargo_upstream,
+                upstreams.cargo,
                 &identity.name,
                 &identity.version,
             )
@@ -258,7 +258,7 @@ async fn registry_check_with_upstreams(
             crate::rubygems::lookup_artifacts(&upstream, &identity.name, &identity.version).await?
         }
         Ecosystem::Maven => vec![
-            crate::maven::lookup_artifact(maven_upstream, &identity.name, &identity.version)
+            crate::maven::lookup_artifact(upstreams.maven, &identity.name, &identity.version)
                 .await?,
         ],
     };
@@ -643,6 +643,12 @@ mod tests {
                     .to_string(),
             },
         };
+        let upstreams = RegistryCheckUpstreams {
+            npm: &empty_npm(),
+            pypi: &empty_pypi(),
+            cargo: &cargo,
+            maven: &maven,
+        };
         let output = registry_check_with_upstreams(
             &config,
             "maven:com.acme:demo@1.2.3",
@@ -650,10 +656,7 @@ mod tests {
             &CleanChecker {
                 calls: AtomicU32::new(0),
             },
-            &empty_npm(),
-            &empty_pypi(),
-            &cargo,
-            &maven,
+            &upstreams,
         )
         .await
         .unwrap();
@@ -681,15 +684,18 @@ mod tests {
         let checker = CleanChecker {
             calls: AtomicU32::new(0),
         };
+        let upstreams = RegistryCheckUpstreams {
+            npm: &empty_npm(),
+            pypi: &empty_pypi(),
+            cargo: &cargo,
+            maven: &maven,
+        };
         let blocked = registry_check_with_upstreams(
             &config,
             "maven:com.acme:demo@1.2.3",
             fixed_now(),
             &checker,
-            &empty_npm(),
-            &empty_pypi(),
-            &cargo,
-            &maven,
+            &upstreams,
         )
         .await
         .unwrap();
@@ -701,15 +707,18 @@ mod tests {
 
         config.policy.missing_publish_time = MissingPublishTime::Allow;
         let cargo = CargoRegistryClient::new(&config);
+        let upstreams = RegistryCheckUpstreams {
+            npm: &empty_npm(),
+            pypi: &empty_pypi(),
+            cargo: &cargo,
+            maven: &maven,
+        };
         let allowed = registry_check_with_upstreams(
             &config,
             "maven:com.acme:demo@1.2.3",
             fixed_now(),
             &checker,
-            &empty_npm(),
-            &empty_pypi(),
-            &cargo,
-            &maven,
+            &upstreams,
         )
         .await
         .unwrap();

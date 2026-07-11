@@ -1324,18 +1324,18 @@ mod tests {
             Ok(artifacts
                 .iter()
                 .map(|artifact| {
-                    (artifact.version == "4.0")
-                        .then(|| {
-                            vec![MaliciousHit {
-                                osv_id: "MAL-2026-000001".to_string(),
-                                summary: None,
-                                source: "osv".to_string(),
-                                modified: None,
-                                effective_severity: None,
-                                evaluation_error: None,
-                            }]
-                        })
-                        .unwrap_or_default()
+                    if artifact.version == "4.0" {
+                        vec![MaliciousHit {
+                            osv_id: "MAL-2026-000001".to_string(),
+                            summary: None,
+                            source: "osv".to_string(),
+                            modified: None,
+                            effective_severity: None,
+                            evaluation_error: None,
+                        }]
+                    } else {
+                        Vec::new()
+                    }
                 })
                 .collect())
         }

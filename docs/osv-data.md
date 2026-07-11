@@ -1,7 +1,7 @@
 # OSV Advisory Data
 
 `osv-proxy` evaluates active OSV records for npm, PyPI, Go, crates.io, NuGet,
-and RubyGems. `MAL-*` records are classified as known malicious packages. Other IDs
+RubyGems, and Maven. `MAL-*` records are classified as known malicious packages. Other IDs
 are vulnerabilities and are evaluated against `policy.osv.minimum_cvss_score`.
 
 Live mode queries OSV during metadata filtering and repeats the check before an
@@ -30,9 +30,10 @@ vector, base score, or evaluation error. Raw source JSON is retained only when
 Exact and range findings are unioned and withdrawn advisories are excluded.
 
 Full advisory storage is materially larger than the former `MAL-*`-only store.
-The 2026-07-11 five-ecosystem measurement was 168,296,448 bytes without raw
+The 2026-07-11 pre-Maven measurement was 168,296,448 bytes without raw
 JSON, versus a 92,114,944-byte npm-plus-PyPI malicious-only baseline. Plan disk
-capacity for dataset growth and SQLite WAL activity during sync.
+capacity for the additional Maven dataset, ongoing dataset growth, and SQLite
+WAL activity during sync.
 
 Missing, corrupt, unhealthy, incomplete, or stale data follows `on_error` and
 `local.on_stale`; both block by default. A failed staging import rolls back and

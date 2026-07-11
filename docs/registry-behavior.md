@@ -9,8 +9,9 @@ downloads recheck policy before redirecting or proxying exact upstream bytes.
 
 Under the default OSV policy, metadata omits versions matching either `MAL-*`
 or other active advisories at the inclusive CVSS threshold. Direct npm
-tarballs, PyPI files, Cargo crates, Go `.mod`/`.zip` files, and NuGet
-`.nupkg`/`.nuspec` requests, plus RubyGems `.gem` requests, rebuild the canonical artifact and re-run the same
+tarballs, PyPI files, Cargo crates, Go `.mod`/`.zip` files, NuGet
+`.nupkg`/`.nuspec` requests, RubyGems `.gem` requests, and Maven artifacts
+rebuild the canonical artifact and re-run the same
 policy before fetching package bytes. Denials use `reason: malicious` for
 `MAL-*` and `reason: vulnerable` for other advisories. An exact allowlist with
 `bypass_osv: true` is the only OSV bypass.
@@ -212,6 +213,26 @@ Ambiguous or inconsistent metadata fails closed. The proxy validates registry
 metadata and its advertised SHA-256; it does not independently rehash streamed
 CDN bytes. Legacy Marshal indexes, standalone `gem install`, dependency/search
 APIs, publishing, yanking, authentication, and gem hosting are unsupported.
+
+## Maven repository routes
+
+`/maven/` exposes a read-only Maven Central-compatible release repository for
+Maven and Gradle. It filters artifact-level `maven-metadata.xml`, removing
+denied versions before dynamic version selection. Bounded, validated
+plugin-prefix metadata is passed through unchanged because it does not identify
+a version. Filtered metadata has a strong proxy-owned ETag and matching checksum
+sidecars; conditional requests apply weak ETag comparison.
+
+Direct POM, JAR, Gradle `.module`, classifier, signature, and checksum requests
+resolve the canonical `groupId:artifactId:version` identity and re-run policy
+before redirecting or streaming bytes. POM metadata supplies publication time
+and SHA-256 where available; non-POM files do not inherit the POM hash. `GET`
+and `HEAD` denials are structured `403` responses, and redirect mode validates
+the artifact with upstream `HEAD` before returning its location.
+
+Only releases are supported. Snapshots, private authentication, publishing,
+search, and repository aggregation are outside the route surface. Client-side
+caches remain outside proxy control.
 
 ## Artifact Modes
 

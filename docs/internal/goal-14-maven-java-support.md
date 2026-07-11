@@ -174,7 +174,7 @@ The goal is complete only when:
 - [x] Milestone 1: Maven identity, configuration, version semantics, OSV, and CLI
 - [x] Milestone 2: Policy-filtered Maven metadata and response semantics
 - [x] Milestone 3: Protected coordinate-scoped delivery and routing
-- [ ] Milestone 4: Real Maven/Gradle workflows, CI, docs, and full regression
+- [x] Milestone 4: Real Maven/Gradle workflows, CI, docs, and full regression
 
 ### Checkpoint Protocol
 
@@ -353,7 +353,21 @@ cargo run -- config validate --config examples/basic/osv-proxy.yaml
 git diff --check main...HEAD
 ```
 
-Status: Not started.
+Status: Completed 2026-07-11. Added hermetic Maven 3.9.11 and Gradle 8.14.3
+workflows under Temurin 21.0.7+6, covering redirect and proxy delivery,
+transitive graphs, dynamic filtering, Gradle Module Metadata, fresh denials,
+and clean-cache pinned/locked denial transitions. CI pins and verifies the
+client toolchain, and the public docs now cover the Maven surface, sole-proxy
+configuration, cache limits, and non-goals.
+
+Verification: `cargo test --locked --test package_manager_e2e` passed 14 tests;
+`cargo test --locked` passed 251 unit tests, 14 real-client E2Es, and doc tests;
+`cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`,
+`cargo run --locked -- config validate --config examples/basic/osv-proxy.yaml`,
+and `git diff --check` passed. The pinned Maven archive SHA-512 was checked
+against the downloaded official archive. Adversarial review found an invalid
+bare-checksum CI invocation and inaccurate metadata-validator wording; both
+were repaired, and re-review reported CLEAN with no blocking findings.
 
 ## Final Verification
 

@@ -35,6 +35,7 @@ cargo run -- config validate --config examples/basic/osv-proxy.yaml
 
 The npm registry, PyPI Simple API, Go module proxy, NuGet service index,
 RubyGems registry, and OSV API default to their public URLs.
+Maven defaults to Maven Central at `https://repo.maven.apache.org/maven2`.
 Configure them only when routing through a mirror, fixture, or private gateway.
 
 ## Server
@@ -63,6 +64,8 @@ upstreams:
     service_index_url: "https://api.nuget.org/v3/index.json"
   rubygems:
     registry_url: "https://rubygems.org"
+  maven:
+    repository_url: "https://repo.maven.apache.org/maven2"
 ```
 
 - `npm.registry_url`: upstream npm registry metadata endpoint.
@@ -72,6 +75,9 @@ upstreams:
 - `nuget.service_index_url`: upstream NuGet V3 restore service index.
 - `rubygems.registry_url`: upstream RubyGems registry root used for Compact
   Index metadata, version metadata, and canonical gem downloads.
+- `maven.repository_url`: upstream Maven repository root used for release
+  metadata, POMs, JARs, Gradle module metadata, classifiers, signatures, and
+  checksums.
 
 All upstream values have public registry defaults, so most
 local configs can omit this section.
@@ -182,7 +188,7 @@ Populate or refresh the SQLite database explicitly with:
 osv-proxy osv sync --config /path/to/osv-proxy.yaml
 ```
 
-The sync command downloads npm, PyPI, Go, crates.io, NuGet, and RubyGems OSV GCS dumps,
+The sync command downloads npm, PyPI, Go, crates.io, NuGet, RubyGems, and Maven OSV GCS dumps,
 stores all advisories locally, and updates generation-scoped health state.
 `malicious sync` is a compatibility alias. Full advisory storage is materially
 larger than the former malicious-only database. Missing, corrupt,

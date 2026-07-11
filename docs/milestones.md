@@ -9,12 +9,19 @@ generation-scoped all-advisory SQLite store. `osv sync` is canonical;
 `malicious sync` is retained as an alias. See [policy](policy.md) and
 [OSV advisory data](osv-data.md).
 
+Maven is supported by the same policy and local advisory store.
+
 Cargo/crates.io sparse replacement filters index records, rechecks policy at
 artifact delivery, and supports redirect or proxy artifact behavior.
 
 RubyGems support filters the Bundler Compact Index, rechecks direct `.gem`
 downloads, and supports redirect or proxy artifact behavior. Legacy Marshal
 indexes and publishing are outside the supported surface.
+
+Maven Central support filters release metadata for Maven and Gradle and
+rechecks POMs, JARs, Gradle module metadata, classifiers, signatures, and
+checksums. Snapshots, authentication, publishing, search, and repository
+aggregation are outside the supported surface.
 
 ## First End-to-End Target
 

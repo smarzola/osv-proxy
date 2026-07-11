@@ -1,23 +1,24 @@
 # Product Specification
 
 `osv-proxy` is a Rust package-registry security proxy for npm, PyPI,
-Cargo/crates.io, Go modules, and NuGet restore.
+Cargo/crates.io, Go modules, NuGet restore, RubyGems/Bundler, and Maven Central
+for Maven and Gradle.
 
 ```text
-npm/pnpm/yarn/bun   pip/uv/poetry   Cargo   Go   dotnet/NuGet
-         \              |            |      |        /
+npm/pnpm/yarn/bun   pip/uv/poetry   Cargo   Go   dotnet/NuGet   Bundler   Maven/Gradle
+         \              |            |      |        |           |          /
                           osv-proxy
                               |
           metadata filtering + artifact policy recheck
                               |
-       npm / PyPI / crates.io / Go proxy / NuGet upstreams
+ npm / PyPI / crates.io / Go proxy / NuGet / RubyGems / Maven Central
 ```
 
 ## Current Product
 
 The implemented product provides:
 
-- registry-native metadata filtering for all five supported ecosystems;
+- registry-native metadata filtering for all seven supported ecosystems;
 - a minimum package-age gate and missing-publish-time policy;
 - active OSV `MAL-*` and CVSS-threshold vulnerability blocking;
 - exact-version OSV and age-gate allowlist bypasses;
