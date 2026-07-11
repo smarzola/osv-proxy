@@ -2028,6 +2028,18 @@ INSERT INTO advisories (
         SqliteMaliciousChecker::initialize(&config.policy.osv.local.sqlite_path).unwrap();
         let connection = Connection::open(&config.policy.osv.local.sqlite_path).unwrap();
         let ecosystem_name = ecosystem.osv_name();
+        let now = Utc::now().to_rfc3339();
+        connection
+            .execute(
+                r#"
+INSERT INTO dataset_generations (
+    ecosystem, dataset_version, status, staged_at, activated_at, high_watermark
+) VALUES (?1, 1, 'active', ?2, ?2, NULL)
+"#,
+                params![ecosystem_name, now],
+            )
+            .unwrap();
+        let generation_id = connection.last_insert_rowid();
         connection
             .execute(
                 r#"
@@ -2038,16 +2050,18 @@ INSERT OR REPLACE INTO sync_state (
     last_success_at,
     last_attempted_at,
     status,
-    error_summary
-) VALUES (?1, 'test', NULL, ?2, ?2, 'healthy', NULL)
+    error_summary,
+    active_generation_id
+) VALUES (?1, 'test', NULL, ?2, ?2, 'healthy', NULL, ?3)
 "#,
-                params![ecosystem_name, Utc::now().to_rfc3339()],
+                params![ecosystem_name, now, generation_id],
             )
             .unwrap();
         connection
             .execute(
                 r#"
-INSERT INTO advisories (
+INSERT INTO osv_advisories (
+    generation_id,
     osv_id,
     summary,
     modified,
@@ -2056,21 +2070,21 @@ INSERT INTO advisories (
     raw_json,
     source,
     imported_at
-) VALUES (?1, 'local malicious fixture', ?2, NULL, NULL, '{}', 'test', ?2)
+) VALUES (?1, ?2, 'local malicious fixture', ?3, NULL, NULL, '{}', 'test', ?3)
 "#,
-                params![osv_id, Utc::now().to_rfc3339()],
+                params![generation_id, osv_id, now],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO affected_packages (osv_id, ecosystem, name) VALUES (?1, ?2, ?3)",
-                params![osv_id, ecosystem_name, ecosystem.normalize_name(name)],
+                "INSERT INTO osv_affected_packages (generation_id, osv_id, ecosystem, name, affected_order) VALUES (?1, ?2, ?3, ?4, 0)",
+                params![generation_id, osv_id, ecosystem_name, ecosystem.normalize_name(name)],
             )
             .unwrap();
         let package_id = connection.last_insert_rowid();
         connection
             .execute(
-                "INSERT INTO affected_versions (affected_package_id, version) VALUES (?1, ?2)",
+                "INSERT INTO osv_affected_versions (affected_package_id, version) VALUES (?1, ?2)",
                 params![package_id, version],
             )
             .unwrap();

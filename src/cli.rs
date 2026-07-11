@@ -55,6 +55,10 @@ pub enum Command {
         #[command(subcommand)]
         command: MaliciousCommand,
     },
+    Osv {
+        #[command(subcommand)]
+        command: OsvCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -68,6 +72,15 @@ pub enum ConfigCommand {
 #[derive(Debug, Subcommand)]
 pub enum MaliciousCommand {
     #[command(about = "Synchronize local malicious package data from OSV GCS dumps")]
+    Sync {
+        #[arg(long)]
+        config: PathBuf,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum OsvCommand {
+    #[command(about = "Synchronize local OSV advisory data from OSV GCS dumps")]
     Sync {
         #[arg(long)]
         config: PathBuf,
@@ -137,6 +150,16 @@ pub async fn execute(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Malicious {
             command: MaliciousCommand::Sync { config },
+        } => {
+            let config = Config::load(&config)
+                .with_context(|| format!("config validation failed for {}", config.display()))?;
+            let client = HttpOsvDumpClient::new();
+            let report = sync_malicious(&config.policy.osv.local, &client).await?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::Osv {
+            command: OsvCommand::Sync { config },
         } => {
             let config = Config::load(&config)
                 .with_context(|| format!("config validation failed for {}", config.display()))?;
@@ -376,6 +399,18 @@ mod tests {
             } => assert_eq!(config, PathBuf::from("osv-proxy.yaml")),
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_canonical_osv_sync() {
+        let cli = Cli::try_parse_from(["osv-proxy", "osv", "sync", "--config", "osv-proxy.yaml"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Osv {
+                command: OsvCommand::Sync { .. }
+            }
+        ));
     }
 
     struct StaticNpm {

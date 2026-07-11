@@ -48,7 +48,10 @@ pub fn configured_osv_checker(config: &Config) -> Arc<dyn OsvChecker> {
             &config.policy.osv.api_url,
             config.policy.osv.block_vulnerabilities,
         )),
-        OsvSource::Local => Arc::new(SqliteMaliciousChecker::new(&config.policy.osv.local)),
+        OsvSource::Local => Arc::new(SqliteMaliciousChecker::with_vulnerability_policy(
+            &config.policy.osv.local,
+            config.policy.osv.block_vulnerabilities,
+        )),
     }
 }
 
@@ -526,14 +529,20 @@ pub struct SqliteMaliciousChecker {
     path: PathBuf,
     max_staleness: Duration,
     on_stale: LocalOsvStaleBehavior,
+    require_full_dataset: bool,
 }
 
 impl SqliteMaliciousChecker {
     pub fn new(config: &LocalOsvConfig) -> Self {
+        Self::with_vulnerability_policy(config, false)
+    }
+
+    pub fn with_vulnerability_policy(config: &LocalOsvConfig, require_full_dataset: bool) -> Self {
         Self {
             path: config.sqlite_path.clone(),
             max_staleness: config.max_staleness,
             on_stale: config.on_stale,
+            require_full_dataset,
         }
     }
 
@@ -726,9 +735,10 @@ async fn sync_ecosystem(
     retain_raw_advisories: bool,
 ) -> Result<MaliciousSyncEcosystemReport, OsvError> {
     let attempted_at = Utc::now();
-    let result = if sync_state(connection, ecosystem.osv_name())?
-        .and_then(|state| state.last_success_at)
-        .is_some()
+    let state = sync_state(connection, ecosystem.osv_name())?;
+    let result = if state
+        .as_ref()
+        .is_some_and(|state| state.last_success_at.is_some() && state.dataset_version == Some(1))
     {
         sync_incremental(
             connection,
@@ -766,14 +776,12 @@ async fn sync_bootstrap(
     retain_raw_advisories: bool,
 ) -> Result<MaliciousSyncEcosystemReport, OsvError> {
     let bytes = client.fetch_bytes(&all_zip_url(ecosystem)).await?;
-    let advisories = advisories_from_zip(&bytes, retain_raw_advisories)?;
-    let stats = import_advisories_and_record_success(
+    let stats = import_zip_bootstrap_and_record_success(
         connection,
         ecosystem,
-        &advisories,
+        &bytes,
         attempted_at,
-        ecosystem.osv_name(),
-        Some(serialize_high_watermark(attempted_at)),
+        retain_raw_advisories,
     )?;
     Ok(MaliciousSyncEcosystemReport {
         ecosystem: ecosystem.osv_name().to_string(),
@@ -782,6 +790,77 @@ async fn sync_bootstrap(
         withdrawn: stats.withdrawn,
         skipped_non_malicious: stats.skipped_non_malicious,
     })
+}
+
+fn import_zip_bootstrap_and_record_success(
+    connection: &mut Connection,
+    ecosystem: Ecosystem,
+    bytes: &[u8],
+    imported_at: DateTime<Utc>,
+    retain_raw_advisories: bool,
+) -> Result<ImportStats, OsvError> {
+    let transaction = connection.transaction().map_err(sqlite_error)?;
+    let high_watermark = Some(serialize_high_watermark(imported_at));
+    transaction
+        .execute(
+            "INSERT INTO dataset_generations
+             (ecosystem,dataset_version,status,staged_at,high_watermark)
+             VALUES (?1,1,'staging',?2,?3)",
+            params![
+                ecosystem.osv_name(),
+                imported_at.to_rfc3339(),
+                high_watermark
+            ],
+        )
+        .map_err(sqlite_error)?;
+    let generation_id = transaction.last_insert_rowid();
+    let mut archive = ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| OsvError::Sync(format!("invalid OSV all.zip: {error}")))?;
+    let mut totals = ImportStats::default();
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|error| OsvError::Sync(format!("invalid OSV zip entry: {error}")))?;
+        if !file.name().ends_with(".json") {
+            continue;
+        }
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)
+            .map_err(|error| OsvError::Sync(format!("failed to read OSV zip entry: {error}")))?;
+        let advisory = parse_osv_advisory_bytes(&raw, retain_raw_advisories)?;
+        let stats = import_advisories(
+            &transaction,
+            generation_id,
+            ecosystem,
+            std::slice::from_ref(&advisory),
+            imported_at,
+        )?;
+        totals.imported += stats.imported;
+        totals.withdrawn += stats.withdrawn;
+        totals.skipped_non_malicious += stats.skipped_non_malicious;
+    }
+    transaction
+        .execute(
+            "UPDATE dataset_generations SET status='superseded'
+             WHERE ecosystem=?1 AND status='active'",
+            [ecosystem.osv_name()],
+        )
+        .map_err(sqlite_error)?;
+    transaction
+        .execute(
+            "UPDATE dataset_generations SET status='active',activated_at=?2 WHERE id=?1",
+            params![generation_id, imported_at.to_rfc3339()],
+        )
+        .map_err(sqlite_error)?;
+    record_sync_success(
+        &transaction,
+        ecosystem.osv_name(),
+        imported_at,
+        high_watermark,
+        generation_id,
+    )?;
+    transaction.commit().map_err(sqlite_error)?;
+    Ok(totals)
 }
 
 async fn sync_incremental(
@@ -797,9 +876,6 @@ async fn sync_incremental(
     let rows = parse_modified_id_csv(&modified_csv, previous_high_watermark.as_deref())?;
     let mut advisories = Vec::new();
     for row in &rows {
-        if !row.osv_id.starts_with("MAL-") {
-            continue;
-        }
         let bytes = client
             .fetch_bytes(&advisory_json_url(ecosystem, &row.osv_id))
             .await?;
@@ -818,6 +894,7 @@ async fn sync_incremental(
         attempted_at,
         ecosystem.osv_name(),
         high_watermark,
+        false,
     )?;
     Ok(MaliciousSyncEcosystemReport {
         ecosystem: ecosystem.osv_name().to_string(),
@@ -847,29 +924,6 @@ fn advisory_json_url(ecosystem: Ecosystem, osv_id: &str) -> String {
         ecosystem.osv_name(),
         osv_id
     )
-}
-
-fn advisories_from_zip(
-    bytes: &[u8],
-    retain_raw_advisories: bool,
-) -> Result<Vec<OsvDumpAdvisory>, OsvError> {
-    let reader = Cursor::new(bytes);
-    let mut archive = ZipArchive::new(reader)
-        .map_err(|err| OsvError::Sync(format!("invalid OSV all.zip: {err}")))?;
-    let mut advisories = Vec::new();
-    for index in 0..archive.len() {
-        let mut file = archive
-            .by_index(index)
-            .map_err(|err| OsvError::Sync(format!("invalid OSV zip entry: {err}")))?;
-        if !file.name().ends_with(".json") {
-            continue;
-        }
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw)
-            .map_err(|err| OsvError::Sync(format!("failed to read OSV zip entry: {err}")))?;
-        advisories.push(parse_osv_advisory_bytes(&raw, retain_raw_advisories)?);
-    }
-    Ok(advisories)
 }
 
 fn parse_osv_advisory_bytes(
@@ -1013,27 +1067,78 @@ fn import_advisories_and_record_success(
     imported_at: DateTime<Utc>,
     state_ecosystem: &str,
     high_watermark: Option<String>,
+    bootstrap: bool,
 ) -> Result<ImportStats, OsvError> {
     let transaction = connection.transaction().map_err(sqlite_error)?;
-    let stats = import_advisories(&transaction, ecosystem, advisories, imported_at)?;
-    record_sync_success(&transaction, state_ecosystem, imported_at, high_watermark)?;
+    let generation_id = if bootstrap {
+        transaction
+            .execute(
+                "INSERT INTO dataset_generations
+                 (ecosystem,dataset_version,status,staged_at,high_watermark)
+                 VALUES (?1,1,'staging',?2,?3)",
+                params![state_ecosystem, imported_at.to_rfc3339(), high_watermark],
+            )
+            .map_err(sqlite_error)?;
+        transaction.last_insert_rowid()
+    } else {
+        transaction
+            .query_row(
+                "SELECT active_generation_id FROM sync_state WHERE ecosystem=?1",
+                [state_ecosystem],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(sqlite_error)?
+    };
+    let stats = import_advisories(
+        &transaction,
+        generation_id,
+        ecosystem,
+        advisories,
+        imported_at,
+    )?;
+    if bootstrap {
+        transaction
+            .execute(
+                "UPDATE dataset_generations SET status='superseded'
+                 WHERE ecosystem=?1 AND status='active'",
+                [state_ecosystem],
+            )
+            .map_err(sqlite_error)?;
+        transaction
+            .execute(
+                "UPDATE dataset_generations SET status='active',activated_at=?2
+                 WHERE id=?1",
+                params![generation_id, imported_at.to_rfc3339()],
+            )
+            .map_err(sqlite_error)?;
+    }
+    record_sync_success(
+        &transaction,
+        state_ecosystem,
+        imported_at,
+        high_watermark.clone(),
+        generation_id,
+    )?;
+    transaction
+        .execute(
+            "UPDATE dataset_generations SET high_watermark=?2 WHERE id=?1",
+            params![generation_id, high_watermark],
+        )
+        .map_err(sqlite_error)?;
     transaction.commit().map_err(sqlite_error)?;
     Ok(stats)
 }
 
 fn import_advisories(
     transaction: &rusqlite::Transaction<'_>,
+    generation_id: i64,
     ecosystem: Ecosystem,
     advisories: &[OsvDumpAdvisory],
     imported_at: DateTime<Utc>,
 ) -> Result<ImportStats, OsvError> {
     let mut stats = ImportStats::default();
     for advisory in advisories {
-        if !advisory.id.starts_with("MAL-") {
-            stats.skipped_non_malicious += 1;
-            continue;
-        }
-        replace_advisory(transaction, ecosystem, advisory, imported_at)?;
+        replace_advisory(transaction, generation_id, ecosystem, advisory, imported_at)?;
         if advisory.withdrawn.is_some() {
             stats.withdrawn += 1;
         } else {
@@ -1045,17 +1150,22 @@ fn import_advisories(
 
 fn replace_advisory(
     transaction: &rusqlite::Transaction<'_>,
+    generation_id: i64,
     ecosystem: Ecosystem,
     advisory: &OsvDumpAdvisory,
     imported_at: DateTime<Utc>,
 ) -> Result<(), OsvError> {
     transaction
-        .execute("DELETE FROM advisories WHERE osv_id = ?1", [&advisory.id])
+        .execute(
+            "DELETE FROM osv_advisories WHERE generation_id=?1 AND osv_id=?2",
+            params![generation_id, advisory.id],
+        )
         .map_err(sqlite_error)?;
     transaction
         .execute(
             r#"
-INSERT INTO advisories (
+INSERT INTO osv_advisories (
+    generation_id,
     osv_id,
     summary,
     modified,
@@ -1064,9 +1174,10 @@ INSERT INTO advisories (
     raw_json,
     source,
     imported_at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'osv-gcs', ?7)
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'osv-gcs', ?8)
 "#,
             params![
+                generation_id,
                 advisory.id,
                 advisory.summary,
                 advisory.modified,
@@ -1082,22 +1193,49 @@ INSERT INTO advisories (
         return Ok(());
     }
 
-    for affected in &advisory.affected {
+    for (affected_order, affected) in advisory.affected.iter().enumerate() {
         if affected.package.ecosystem != ecosystem.osv_name() {
             continue;
         }
         let normalized_name = ecosystem.normalize_name(&affected.package.name);
+        let (severity_type, severity_vector, severity_score, severity_error) =
+            if advisory.id.starts_with("MAL-") {
+                (None, None, None, None)
+            } else {
+                match effective_osv_severity(&advisory.severity, Some(&affected.severity)) {
+                    Ok(Some(severity)) => (
+                        Some(severity.severity_type),
+                        Some(severity.vector),
+                        Some(severity.base_score),
+                        None,
+                    ),
+                    Ok(None) => (None, None, None, None),
+                    Err(error) => (None, None, None, Some(error.to_string())),
+                }
+            };
         transaction
             .execute(
-                "INSERT INTO affected_packages (osv_id, ecosystem, name) VALUES (?1, ?2, ?3)",
-                params![advisory.id, ecosystem.osv_name(), normalized_name],
+                "INSERT INTO osv_affected_packages
+                 (generation_id,osv_id,ecosystem,name,affected_order,severity_type,severity_vector,severity_score,severity_error)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    generation_id,
+                    advisory.id,
+                    ecosystem.osv_name(),
+                    normalized_name,
+                    affected_order as i64,
+                    severity_type,
+                    severity_vector,
+                    severity_score,
+                    severity_error
+                ],
             )
             .map_err(sqlite_error)?;
         let package_id = transaction.last_insert_rowid();
         for version in &affected.versions {
             transaction
                 .execute(
-                    "INSERT INTO affected_versions (affected_package_id, version) VALUES (?1, ?2)",
+                    "INSERT OR IGNORE INTO osv_affected_versions (affected_package_id, version) VALUES (?1, ?2)",
                     params![package_id, version],
                 )
                 .map_err(sqlite_error)?;
@@ -1105,7 +1243,7 @@ INSERT INTO advisories (
         for range in &affected.ranges {
             transaction
                 .execute(
-                    "INSERT INTO affected_ranges (affected_package_id, range_type) VALUES (?1, ?2)",
+                    "INSERT INTO osv_affected_ranges (affected_package_id, range_type) VALUES (?1, ?2)",
                     params![package_id, range.range_type],
                 )
                 .map_err(sqlite_error)?;
@@ -1114,7 +1252,7 @@ INSERT INTO advisories (
                 let (event_type, version) = single_range_event(event)?;
                 transaction
                     .execute(
-                        "INSERT INTO affected_range_events (range_id, event_order, event_type, version) VALUES (?1, ?2, ?3, ?4)",
+                        "INSERT INTO osv_affected_range_events (range_id, event_order, event_type, version) VALUES (?1, ?2, ?3, ?4)",
                         params![range_id, index as i64, event_type, version],
                     )
                     .map_err(sqlite_error)?;
@@ -1139,17 +1277,22 @@ fn single_range_event(event: &BTreeMap<String, String>) -> Result<(&str, &str), 
 struct SyncStateRow {
     high_watermark: Option<String>,
     last_success_at: Option<String>,
+    dataset_version: Option<i64>,
 }
 
 fn sync_state(connection: &Connection, ecosystem: &str) -> Result<Option<SyncStateRow>, OsvError> {
     connection
         .query_row(
-            "SELECT high_watermark, last_success_at FROM sync_state WHERE ecosystem = ?1",
+            "SELECT s.high_watermark, s.last_success_at, g.dataset_version
+             FROM sync_state s
+             LEFT JOIN dataset_generations g ON g.id=s.active_generation_id
+             WHERE s.ecosystem = ?1",
             [ecosystem],
             |row| {
                 Ok(SyncStateRow {
                     high_watermark: row.get(0)?,
                     last_success_at: row.get(1)?,
+                    dataset_version: row.get(2)?,
                 })
             },
         )
@@ -1162,6 +1305,7 @@ fn record_sync_success(
     ecosystem: &str,
     attempted_at: DateTime<Utc>,
     high_watermark: Option<String>,
+    generation_id: i64,
 ) -> Result<(), OsvError> {
     transaction
         .execute(
@@ -1173,17 +1317,24 @@ INSERT INTO sync_state (
     last_success_at,
     last_attempted_at,
     status,
-    error_summary
-) VALUES (?1, 'osv-gcs', ?2, ?3, ?3, 'healthy', NULL)
+    error_summary,
+    active_generation_id
+) VALUES (?1, 'osv-gcs', ?2, ?3, ?3, 'healthy', NULL, ?4)
 ON CONFLICT(ecosystem) DO UPDATE SET
     source = excluded.source,
     high_watermark = excluded.high_watermark,
     last_success_at = excluded.last_success_at,
     last_attempted_at = excluded.last_attempted_at,
     status = excluded.status,
-    error_summary = excluded.error_summary
+    error_summary = excluded.error_summary,
+    active_generation_id = excluded.active_generation_id
 "#,
-            params![ecosystem, high_watermark, attempted_at.to_rfc3339()],
+            params![
+                ecosystem,
+                high_watermark,
+                attempted_at.to_rfc3339(),
+                generation_id
+            ],
         )
         .map_err(sqlite_error)?;
     Ok(())
@@ -1332,9 +1483,188 @@ CREATE TABLE IF NOT EXISTS sync_state (
     status TEXT NOT NULL,
     error_summary TEXT
 );
+
+CREATE TABLE IF NOT EXISTS dataset_generations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ecosystem TEXT NOT NULL,
+    dataset_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    staged_at TEXT NOT NULL,
+    activated_at TEXT,
+    high_watermark TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_generations_active
+ON dataset_generations(ecosystem) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS osv_advisories (
+    generation_id INTEGER NOT NULL REFERENCES dataset_generations(id) ON DELETE CASCADE,
+    osv_id TEXT NOT NULL,
+    summary TEXT,
+    modified TEXT,
+    published TEXT,
+    withdrawn TEXT,
+    raw_json TEXT NOT NULL,
+    source TEXT NOT NULL,
+    imported_at TEXT NOT NULL,
+    PRIMARY KEY (generation_id, osv_id)
+);
+
+CREATE TABLE IF NOT EXISTS osv_affected_packages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation_id INTEGER NOT NULL,
+    osv_id TEXT NOT NULL,
+    ecosystem TEXT NOT NULL,
+    name TEXT NOT NULL,
+    affected_order INTEGER NOT NULL,
+    severity_type TEXT,
+    severity_vector TEXT,
+    severity_score REAL,
+    severity_error TEXT,
+    legacy_id INTEGER,
+    FOREIGN KEY (generation_id, osv_id)
+      REFERENCES osv_advisories(generation_id, osv_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_osv_affected_lookup
+ON osv_affected_packages(generation_id, ecosystem, name);
+CREATE INDEX IF NOT EXISTS idx_osv_affected_name_lookup
+ON osv_affected_packages(ecosystem, name, generation_id);
+
+CREATE TABLE IF NOT EXISTS osv_affected_versions (
+    affected_package_id INTEGER NOT NULL REFERENCES osv_affected_packages(id) ON DELETE CASCADE,
+    version TEXT NOT NULL,
+    PRIMARY KEY (affected_package_id, version)
+);
+CREATE TABLE IF NOT EXISTS osv_affected_ranges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    affected_package_id INTEGER NOT NULL REFERENCES osv_affected_packages(id) ON DELETE CASCADE,
+    range_type TEXT NOT NULL,
+    legacy_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_osv_ranges_package
+ON osv_affected_ranges(affected_package_id);
+
+CREATE TABLE IF NOT EXISTS osv_affected_range_events (
+    range_id INTEGER NOT NULL REFERENCES osv_affected_ranges(id) ON DELETE CASCADE,
+    event_order INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    version TEXT NOT NULL,
+    PRIMARY KEY (range_id, event_order)
+);
 "#,
         )
-        .map_err(sqlite_error)
+        .map_err(sqlite_error)?;
+    connection
+        .execute_batch("DROP INDEX IF EXISTS idx_osv_versions_lookup")
+        .map_err(sqlite_error)?;
+    ensure_sync_active_generation_column(connection)?;
+    migrate_legacy_generations(connection)
+}
+
+fn ensure_sync_active_generation_column(connection: &Connection) -> Result<(), OsvError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(sync_state)")
+        .map_err(sqlite_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    if !columns
+        .iter()
+        .any(|column| column == "active_generation_id")
+    {
+        connection
+            .execute_batch("ALTER TABLE sync_state ADD COLUMN active_generation_id INTEGER")
+            .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy_generations(connection: &mut Connection) -> Result<(), OsvError> {
+    let existing: i64 = connection
+        .query_row("SELECT COUNT(*) FROM dataset_generations", [], |row| {
+            row.get(0)
+        })
+        .map_err(sqlite_error)?;
+    if existing != 0 {
+        return Ok(());
+    }
+    let ecosystems = {
+        let mut statement = connection
+            .prepare("SELECT ecosystem FROM sync_state ORDER BY ecosystem")
+            .map_err(sqlite_error)?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sqlite_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sqlite_error)?
+    };
+    let transaction = connection.transaction().map_err(sqlite_error)?;
+    for ecosystem in ecosystems {
+        let now = Utc::now().to_rfc3339();
+        transaction
+            .execute(
+                "INSERT INTO dataset_generations (ecosystem,dataset_version,status,staged_at,activated_at,high_watermark)
+                 SELECT ecosystem,0,'active',?2,last_success_at,high_watermark FROM sync_state WHERE ecosystem=?1",
+                params![ecosystem, now],
+            )
+            .map_err(sqlite_error)?;
+        let generation_id = transaction.last_insert_rowid();
+        transaction
+            .execute(
+                "INSERT INTO osv_advisories
+                 SELECT ?1,a.osv_id,a.summary,a.modified,a.published,a.withdrawn,a.raw_json,a.source,a.imported_at
+                 FROM advisories a WHERE EXISTS (
+                   SELECT 1 FROM affected_packages ap WHERE ap.osv_id=a.osv_id AND ap.ecosystem=?2
+                 )",
+                params![generation_id, ecosystem],
+            )
+            .map_err(sqlite_error)?;
+        transaction
+            .execute(
+                "INSERT INTO osv_affected_packages
+                 (generation_id,osv_id,ecosystem,name,affected_order,legacy_id)
+                 SELECT ?1,osv_id,ecosystem,name,0,id FROM affected_packages WHERE ecosystem=?2",
+                params![generation_id, ecosystem],
+            )
+            .map_err(sqlite_error)?;
+        transaction
+            .execute(
+                "INSERT INTO osv_affected_versions
+                 SELECT nap.id,av.version FROM affected_versions av
+                 JOIN osv_affected_packages nap ON nap.legacy_id=av.affected_package_id
+                 WHERE nap.generation_id=?1",
+                [generation_id],
+            )
+            .map_err(sqlite_error)?;
+        transaction
+            .execute(
+                "INSERT INTO osv_affected_ranges (affected_package_id,range_type,legacy_id)
+                 SELECT nap.id,ar.range_type,ar.id FROM affected_ranges ar
+                 JOIN osv_affected_packages nap ON nap.legacy_id=ar.affected_package_id
+                 WHERE nap.generation_id=?1",
+                [generation_id],
+            )
+            .map_err(sqlite_error)?;
+        transaction
+            .execute(
+                "INSERT INTO osv_affected_range_events
+                 SELECT nar.id,e.event_order,e.event_type,e.version
+                 FROM affected_range_events e
+                 JOIN osv_affected_ranges nar ON nar.legacy_id=e.range_id
+                 JOIN osv_affected_packages nap ON nap.id=nar.affected_package_id
+                 WHERE nap.generation_id=?1",
+                [generation_id],
+            )
+            .map_err(sqlite_error)?;
+        transaction
+            .execute(
+                "UPDATE sync_state SET active_generation_id=?2 WHERE ecosystem=?1",
+                params![ecosystem, generation_id],
+            )
+            .map_err(sqlite_error)?;
+    }
+    transaction.commit().map_err(sqlite_error)
 }
 
 fn ensure_store_healthy(
@@ -1344,9 +1674,18 @@ fn ensure_store_healthy(
 ) -> Result<(), OsvError> {
     let state = connection
         .query_row(
-            "SELECT last_success_at, status FROM sync_state WHERE ecosystem = ?1",
+            "SELECT s.last_success_at, s.status, g.dataset_version
+             FROM sync_state s
+             LEFT JOIN dataset_generations g ON g.id=s.active_generation_id
+             WHERE s.ecosystem = ?1",
             [ecosystem],
-            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(sqlite_error)?
@@ -1354,10 +1693,15 @@ fn ensure_store_healthy(
             OsvError::LocalStore(format!("missing sync_state row for ecosystem {ecosystem}"))
         })?;
 
-    let (last_success_at, status) = state;
+    let (last_success_at, status, dataset_version) = state;
     if status != "healthy" {
         return Err(OsvError::LocalStore(format!(
             "sync_state for ecosystem {ecosystem} is {status}"
+        )));
+    }
+    if checker.require_full_dataset && dataset_version != Some(1) {
+        return Err(OsvError::LocalStore(format!(
+            "local OSV dataset for ecosystem {ecosystem} is malicious-only or incomplete"
         )));
     }
     let last_success_at = last_success_at.ok_or_else(|| {
@@ -1386,10 +1730,12 @@ fn exact_hits(connection: &Connection, artifact: &Artifact) -> Result<Vec<OsvFin
     let mut statement = connection
         .prepare(
             r#"
-SELECT a.osv_id, a.summary, a.source, a.modified
-FROM affected_packages ap
-JOIN affected_versions av ON av.affected_package_id = ap.id
-JOIN advisories a ON a.osv_id = ap.osv_id
+SELECT a.osv_id, a.summary, a.source, a.modified,
+       ap.severity_type, ap.severity_vector, ap.severity_score, ap.severity_error
+FROM sync_state s
+JOIN osv_affected_packages ap ON ap.generation_id = s.active_generation_id
+JOIN osv_affected_versions av ON av.affected_package_id = ap.id
+JOIN osv_advisories a ON a.generation_id = ap.generation_id AND a.osv_id = ap.osv_id
 WHERE ap.ecosystem = ?1
   AND ap.name = ?2
   AND av.version = ?3
@@ -1422,14 +1768,21 @@ ORDER BY a.osv_id
                     summary: row.get(1)?,
                     source: row.get(2)?,
                     modified,
-                    effective_severity: None,
-                    evaluation_error: None,
+                    effective_severity: match row.get::<_, Option<f64>>(6)? {
+                        Some(base_score) => Some(OsvEffectiveSeverity {
+                            severity_type: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                            vector: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                            base_score,
+                        }),
+                        None => None,
+                    },
+                    evaluation_error: row.get(7)?,
                 })
             },
         )
         .map_err(sqlite_error)?;
 
-    rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
+    consolidate_local_findings(rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?)
 }
 
 #[derive(Debug, Clone)]
@@ -1453,8 +1806,34 @@ fn range_hits(connection: &Connection, artifact: &Artifact) -> Result<Vec<OsvFin
             hits.push(range.advisory);
         }
     }
-    hits.sort_by(|left, right| left.osv_id.cmp(&right.osv_id));
-    Ok(hits)
+    consolidate_local_findings(hits)
+}
+
+fn consolidate_local_findings(findings: Vec<OsvFinding>) -> Result<Vec<OsvFinding>, OsvError> {
+    let mut by_id = BTreeMap::<String, OsvFinding>::new();
+    for finding in findings {
+        let entry = by_id
+            .entry(finding.osv_id.clone())
+            .or_insert_with(|| finding.clone());
+        if entry.evaluation_error.is_none() {
+            entry.evaluation_error = finding.evaluation_error.clone();
+        }
+        if finding
+            .effective_severity
+            .as_ref()
+            .is_some_and(|candidate| {
+                entry.effective_severity.as_ref().is_none_or(|current| {
+                    candidate.base_score > current.base_score
+                        || (candidate.base_score == current.base_score
+                            && (&candidate.severity_type, &candidate.vector)
+                                < (&current.severity_type, &current.vector))
+                })
+            })
+        {
+            entry.effective_severity = finding.effective_severity;
+        }
+    }
+    Ok(by_id.into_values().collect())
 }
 
 fn stored_ranges(
@@ -1464,10 +1843,12 @@ fn stored_ranges(
     let mut statement = connection
         .prepare(
             r#"
-SELECT ar.id, a.osv_id, a.summary, a.source, a.modified, ar.range_type
-FROM affected_packages ap
-JOIN affected_ranges ar ON ar.affected_package_id = ap.id
-JOIN advisories a ON a.osv_id = ap.osv_id
+SELECT ar.id, a.osv_id, a.summary, a.source, a.modified, ar.range_type,
+       ap.severity_type, ap.severity_vector, ap.severity_score, ap.severity_error
+FROM sync_state s
+JOIN osv_affected_packages ap ON ap.generation_id = s.active_generation_id
+JOIN osv_affected_ranges ar ON ar.affected_package_id = ap.id
+JOIN osv_advisories a ON a.generation_id = ap.generation_id AND a.osv_id = ap.osv_id
 WHERE ap.ecosystem = ?1
   AND ap.name = ?2
   AND a.withdrawn IS NULL
@@ -1497,8 +1878,15 @@ ORDER BY a.osv_id, ar.id
                         summary: row.get(2)?,
                         source: row.get(3)?,
                         modified,
-                        effective_severity: None,
-                        evaluation_error: None,
+                        effective_severity: match row.get::<_, Option<f64>>(8)? {
+                            Some(base_score) => Some(OsvEffectiveSeverity {
+                                severity_type: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                                vector: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                                base_score,
+                            }),
+                            None => None,
+                        },
+                        evaluation_error: row.get(9)?,
                     },
                     row.get::<_, String>(5)?,
                 ))
@@ -1523,7 +1911,7 @@ fn range_events(connection: &Connection, range_id: i64) -> Result<Vec<RangeEvent
         .prepare(
             r#"
 SELECT event_type, version
-FROM affected_range_events
+FROM osv_affected_range_events
 WHERE range_id = ?1
 ORDER BY event_order
 "#,
@@ -2480,6 +2868,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_store_migrates_idempotently_and_requires_full_readiness() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "INSERT INTO advisories (osv_id,summary,modified,raw_json,source,imported_at)
+             VALUES ('MAL-legacy','legacy','2026-07-01T00:00:00Z','{}','test',?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO affected_packages (osv_id,ecosystem,name) VALUES ('MAL-legacy','npm','legacy')",
+            [],
+        ).unwrap();
+        let package_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO affected_versions VALUES (?1,'1.0.0')",
+                [package_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sync_state (ecosystem,source,last_success_at,last_attempted_at,status)
+             VALUES ('npm','test',?1,?1,'healthy')",
+                [Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        drop(connection);
+
+        SqliteMaliciousChecker::initialize(&db).unwrap();
+        SqliteMaliciousChecker::initialize(&db).unwrap();
+        let connection = Connection::open(&db).unwrap();
+        let generations: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM dataset_generations WHERE ecosystem='npm' AND dataset_version=0",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(generations, 1);
+        drop(connection);
+
+        let artifact = Artifact::package(Ecosystem::Npm, "legacy", "1.0.0", None);
+        assert_eq!(checker_for(&db).check(&artifact).await.unwrap().len(), 1);
+        let full = SqliteMaliciousChecker::with_vulnerability_policy(&local_config_for(&db), true);
+        assert!(
+            full.check(&artifact)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete")
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_checker_returns_exact_version_hits() {
         let dir = tempdir().unwrap();
         let db = initialized_db(dir.path());
@@ -2905,7 +3348,7 @@ INSERT INTO advisories (
     }
 
     #[tokio::test]
-    async fn sync_bootstrap_imports_only_malicious_exact_and_range_records() {
+    async fn sync_bootstrap_imports_all_exact_and_range_records() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("malicious.sqlite");
         let config = local_config_for(&db);
@@ -2914,6 +3357,7 @@ INSERT INTO advisories (
         let npm_non_mal = br#"{
             "id": "GHSA-xxxx-yyyy-zzzz",
             "modified": "2026-07-01T00:00:00Z",
+            "severity": [{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
             "affected": [{
                 "package": { "name": "clean", "ecosystem": "npm" },
                 "versions": ["9.9.9"]
@@ -2938,8 +3382,8 @@ INSERT INTO advisories (
         let report = sync_malicious(&config, &client).await.unwrap();
 
         assert_eq!(report.ecosystems[0].mode, MaliciousSyncMode::Bootstrap);
-        assert_eq!(report.ecosystems[0].imported, 1);
-        assert_eq!(report.ecosystems[0].skipped_non_malicious, 1);
+        assert_eq!(report.ecosystems[0].imported, 2);
+        assert_eq!(report.ecosystems[0].skipped_non_malicious, 0);
         let checker = checker_for(&db);
         let exact_hits = checker
             .check(&Artifact::package(
@@ -2965,16 +3409,76 @@ INSERT INTO advisories (
             .check(&Artifact::package(Ecosystem::Npm, "clean", "9.9.9", None))
             .await
             .unwrap();
-        assert!(clean_hits.is_empty());
+        assert_eq!(clean_hits[0].osv_id, "GHSA-xxxx-yyyy-zzzz");
+        assert_eq!(
+            clean_hits[0]
+                .effective_severity
+                .as_ref()
+                .unwrap()
+                .base_score,
+            9.8
+        );
         let connection = Connection::open(&db).unwrap();
         let raw_json: String = connection
             .query_row(
-                "SELECT raw_json FROM advisories WHERE osv_id = 'MAL-2022-1122'",
+                "SELECT raw_json FROM osv_advisories WHERE osv_id = 'MAL-2022-1122'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(raw_json, "{}");
+        let statuses = connection
+            .prepare("SELECT dataset_version,status FROM dataset_generations WHERE ecosystem='npm' ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>,_>>()
+            .unwrap();
+        assert_eq!(statuses.last(), Some(&(1, "active".to_string())));
+    }
+
+    #[tokio::test]
+    async fn same_osv_id_coexists_in_two_ecosystem_generations() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("same-id.sqlite");
+        let config = local_config_for(&db);
+        let npm = advisory_json(
+            "GHSA-shared",
+            "npm",
+            "demo",
+            &["1.0.0"],
+            r#""ranges":[]"#,
+            None,
+        );
+        let pypi = advisory_json(
+            "GHSA-shared",
+            "PyPI",
+            "demo",
+            &["1.0.0"],
+            r#""ranges":[]"#,
+            None,
+        );
+        let client = FixtureDumpClient::new([
+            (
+                all_zip_url(Ecosystem::Npm),
+                zip_bytes([("GHSA-shared.json", npm.as_slice())]),
+            ),
+            (
+                all_zip_url(Ecosystem::Pypi),
+                zip_bytes([("GHSA-shared.json", pypi.as_slice())]),
+            ),
+            (all_zip_url(Ecosystem::CratesIo), zip_bytes([])),
+        ]);
+        sync_malicious(&config, &client).await.unwrap();
+        let connection = Connection::open(&db).unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM osv_advisories WHERE osv_id='GHSA-shared'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]
@@ -2999,7 +3503,7 @@ INSERT INTO advisories (
         let connection = Connection::open(&db).unwrap();
         let raw_json: String = connection
             .query_row(
-                "SELECT raw_json FROM advisories WHERE osv_id = 'MAL-2022-1122'",
+                "SELECT raw_json FROM osv_advisories WHERE osv_id = 'MAL-2022-1122'",
                 [],
                 |row| row.get(0),
             )
@@ -3310,6 +3814,21 @@ INSERT INTO advisories (
     ) {
         connection
             .execute(
+                "INSERT OR IGNORE INTO dataset_generations
+                 (id,ecosystem,dataset_version,status,staged_at,activated_at)
+                 VALUES ((SELECT COALESCE(MAX(id),0)+1 FROM dataset_generations),?1,1,'active',?2,?2)",
+                params![ecosystem, last_success_at],
+            )
+            .unwrap();
+        let generation_id: i64 = connection
+            .query_row(
+                "SELECT id FROM dataset_generations WHERE ecosystem=?1 AND status='active'",
+                [ecosystem],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
                 r#"
 INSERT OR REPLACE INTO sync_state (
     ecosystem,
@@ -3318,10 +3837,11 @@ INSERT OR REPLACE INTO sync_state (
     last_success_at,
     last_attempted_at,
     status,
-    error_summary
-) VALUES (?1, 'test', NULL, ?2, ?2, ?3, NULL)
+    error_summary,
+    active_generation_id
+) VALUES (?1, 'test', NULL, ?2, ?2, ?3, NULL, ?4)
 "#,
-                params![ecosystem, last_success_at, status],
+                params![ecosystem, last_success_at, status, generation_id],
             )
             .unwrap();
     }
@@ -3334,17 +3854,18 @@ INSERT OR REPLACE INTO sync_state (
         version: &str,
         summary: Option<&str>,
     ) {
-        insert_advisory(connection, osv_id, summary);
+        let generation_id = active_generation_id(connection, ecosystem);
+        insert_advisory(connection, generation_id, osv_id, summary);
         connection
             .execute(
-                "INSERT INTO affected_packages (osv_id, ecosystem, name) VALUES (?1, ?2, ?3)",
-                params![osv_id, ecosystem, name],
+                "INSERT INTO osv_affected_packages (generation_id,osv_id,ecosystem,name,affected_order) VALUES (?1,?2,?3,?4,0)",
+                params![generation_id, osv_id, ecosystem, name],
             )
             .unwrap();
         let package_id = connection.last_insert_rowid();
         connection
             .execute(
-                "INSERT INTO affected_versions (affected_package_id, version) VALUES (?1, ?2)",
+                "INSERT INTO osv_affected_versions (affected_package_id, version) VALUES (?1, ?2)",
                 params![package_id, version],
             )
             .unwrap();
@@ -3358,17 +3879,18 @@ INSERT OR REPLACE INTO sync_state (
         range_type: &str,
         events: &[(&str, &str)],
     ) {
-        insert_advisory(connection, osv_id, Some("Range package"));
+        let generation_id = active_generation_id(connection, ecosystem);
+        insert_advisory(connection, generation_id, osv_id, Some("Range package"));
         connection
             .execute(
-                "INSERT INTO affected_packages (osv_id, ecosystem, name) VALUES (?1, ?2, ?3)",
-                params![osv_id, ecosystem, name],
+                "INSERT INTO osv_affected_packages (generation_id,osv_id,ecosystem,name,affected_order) VALUES (?1,?2,?3,?4,0)",
+                params![generation_id, osv_id, ecosystem, name],
             )
             .unwrap();
         let package_id = connection.last_insert_rowid();
         connection
             .execute(
-                "INSERT INTO affected_ranges (affected_package_id, range_type) VALUES (?1, ?2)",
+                "INSERT INTO osv_affected_ranges (affected_package_id, range_type) VALUES (?1, ?2)",
                 params![package_id, range_type],
             )
             .unwrap();
@@ -3376,18 +3898,34 @@ INSERT OR REPLACE INTO sync_state (
         for (index, (event_type, version)) in events.iter().enumerate() {
             connection
                 .execute(
-                    "INSERT INTO affected_range_events (range_id, event_order, event_type, version) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT INTO osv_affected_range_events (range_id, event_order, event_type, version) VALUES (?1, ?2, ?3, ?4)",
                     params![range_id, index as i64, event_type, version],
                 )
                 .unwrap();
         }
     }
 
-    fn insert_advisory(connection: &Connection, osv_id: &str, summary: Option<&str>) {
+    fn active_generation_id(connection: &Connection, ecosystem: &str) -> i64 {
+        connection
+            .query_row(
+                "SELECT id FROM dataset_generations WHERE ecosystem=?1 AND status='active'",
+                [ecosystem],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn insert_advisory(
+        connection: &Connection,
+        generation_id: i64,
+        osv_id: &str,
+        summary: Option<&str>,
+    ) {
         connection
             .execute(
                 r#"
-INSERT INTO advisories (
+INSERT INTO osv_advisories (
+    generation_id,
     osv_id,
     summary,
     modified,
@@ -3396,9 +3934,9 @@ INSERT INTO advisories (
     raw_json,
     source,
     imported_at
-) VALUES (?1, ?2, '2026-07-05T12:00:00Z', NULL, NULL, '{}', 'osv', ?3)
+) VALUES (?1, ?2, ?3, '2026-07-05T12:00:00Z', NULL, NULL, '{}', 'osv', ?4)
 "#,
-                params![osv_id, summary, Utc::now().to_rfc3339()],
+                params![generation_id, osv_id, summary, Utc::now().to_rfc3339()],
             )
             .unwrap();
     }
