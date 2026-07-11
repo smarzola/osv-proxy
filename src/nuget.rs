@@ -26,9 +26,13 @@ pub struct NugetClient {
 
 impl NugetClient {
     pub fn for_config(config: &Config) -> Self {
+        Self::with_delivery(config, ArtifactDeliveryClient::for_config(config))
+    }
+
+    pub(crate) fn with_delivery(config: &Config, client: ArtifactDeliveryClient) -> Self {
         Self {
             service_index_url: config.upstreams.nuget.service_index_url.clone(),
-            client: ArtifactDeliveryClient::for_config(config),
+            client,
             metadata_timeout: REQUEST_TIMEOUT,
         }
     }

@@ -12,19 +12,51 @@ use chrono::{DateTime, Utc};
 use futures_util::{Stream, StreamExt};
 use quick_xml::de::from_str;
 use reqwest::{Client, StatusCode, header};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 use std::cmp::Ordering;
 use std::fmt::Display;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_POM_BYTES: usize = 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const METADATA_ENRICHMENT_CONCURRENCY: usize = 16;
+const MAVEN_XML_CONCURRENCY: usize = 8;
+
+static MAVEN_XML_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+async fn parse_xml<T>(body: String, invalid: fn(String) -> MavenError) -> Result<T, MavenError>
+where
+    T: DeserializeOwned + Send + 'static,
+{
+    run_maven_blocking(move || from_str(&body).map_err(|error| invalid(error.to_string()))).await
+}
+
+async fn run_maven_blocking<T, F>(operation: F) -> Result<T, MavenError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, MavenError> + Send + 'static,
+{
+    let semaphore = MAVEN_XML_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(MAVEN_XML_CONCURRENCY)))
+        .clone();
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|error| MavenError::Blocking(format!("XML parser queue closed: {error}")))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|error| MavenError::Blocking(format!("XML parser task failed: {error}")))?
+}
 
 #[derive(Debug, Clone)]
 pub struct MavenRepositoryClient {
@@ -240,8 +272,7 @@ pub async fn lookup_artifact(
 ) -> Result<Artifact, MavenError> {
     let (group_id, artifact_id) = parse_package_name(package)?;
     let metadata = provider.fetch_pom(group_id, artifact_id, version).await?;
-    let project: PomProject =
-        from_str(&metadata.body).map_err(|error| MavenError::InvalidPom(error.to_string()))?;
+    let project: PomProject = parse_xml(metadata.body, MavenError::InvalidPom).await?;
     let effective_group = project
         .group_id
         .as_deref()
@@ -431,8 +462,28 @@ async fn filtered_metadata_from_raw(
     now: DateTime<Utc>,
     raw: MavenRawMetadata,
 ) -> Result<RegistryResponse, MavenError> {
-    let document: MavenMetadataDocument =
-        from_str(&raw.body).map_err(|error| MavenError::InvalidMetadata(error.to_string()))?;
+    let document: MavenMetadataDocument = parse_xml(raw.body, MavenError::InvalidMetadata).await?;
+    filtered_metadata_from_document(
+        config,
+        provider,
+        checker,
+        group_id,
+        artifact_id,
+        now,
+        document,
+    )
+    .await
+}
+
+async fn filtered_metadata_from_document(
+    config: &Config,
+    provider: &dyn MavenMetadataProvider,
+    checker: &dyn MaliciousChecker,
+    group_id: &str,
+    artifact_id: &str,
+    now: DateTime<Utc>,
+    document: MavenMetadataDocument,
+) -> Result<RegistryResponse, MavenError> {
     if document.group_id != group_id || document.artifact_id != artifact_id {
         return Err(MavenError::MetadataCoordinateMismatch {
             expected: format!("{group_id}:{artifact_id}"),
@@ -508,7 +559,7 @@ pub async fn metadata_route_response(
 ) -> Result<RegistryResponse, MavenError> {
     let raw = provider.fetch_metadata(relative_path).await?;
     let probe: MavenMetadataProbe =
-        from_str(&raw.body).map_err(|error| MavenError::InvalidMetadata(error.to_string()))?;
+        parse_xml(raw.body.clone(), MavenError::InvalidMetadata).await?;
     let response = match (
         probe.group_id,
         probe.artifact_id,
@@ -516,24 +567,26 @@ pub async fn metadata_route_response(
         probe.plugins,
     ) {
         (Some(_), Some(_), Some(_), None) => {
-            let document: MavenMetadataDocument = from_str(&raw.body)
-                .map_err(|error| MavenError::InvalidMetadata(error.to_string()))?;
+            let document: MavenMetadataDocument =
+                parse_xml(raw.body.clone(), MavenError::InvalidMetadata).await?;
+            let group_id = document.group_id.clone();
+            let artifact_id = document.artifact_id.clone();
             let expected_path = format!(
                 "{}/{}/maven-metadata.xml",
-                document.group_id.replace('.', "/"),
-                document.artifact_id
+                group_id.replace('.', "/"),
+                artifact_id
             );
             if relative_path != expected_path {
                 return Err(MavenError::InvalidMetadataPath(relative_path.to_string()));
             }
-            filtered_metadata_from_raw(
+            filtered_metadata_from_document(
                 config,
                 provider,
                 checker,
-                &document.group_id,
-                &document.artifact_id,
+                &group_id,
+                &artifact_id,
                 now,
-                raw,
+                document,
             )
             .await?
         }
@@ -1177,6 +1230,8 @@ pub enum MavenError {
     Delivery(#[from] ArtifactDeliveryError),
     #[error("Maven POM coordinate mismatch: expected {expected}, got {actual}")]
     CoordinateMismatch { expected: String, actual: String },
+    #[error("Maven blocking work failed: {0}")]
+    Blocking(String),
     #[error("Maven upstream request failed: {0}")]
     Request(#[from] reqwest::Error),
 }
@@ -1194,6 +1249,63 @@ mod tests {
     use tokio::time::timeout;
 
     struct StaticProvider(MavenPomMetadata);
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn xml_blocking_work_yields_the_runtime_worker() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked = tokio::spawn(async move {
+            run_maven_blocking(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+
+        let heartbeat = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            1_u8
+        });
+        assert_eq!(
+            timeout(Duration::from_millis(100), heartbeat)
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        release_tx.send(()).unwrap();
+        blocked.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn xml_blocking_work_is_concurrency_bounded() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let tasks = (0..MAVEN_XML_CONCURRENCY + 4)
+            .map(|_| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                tokio::spawn(async move {
+                    run_maven_blocking(move || {
+                        let current = active.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                        peak.fetch_max(current, AtomicOrdering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(10));
+                        active.fetch_sub(1, AtomicOrdering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert!(peak.load(AtomicOrdering::SeqCst) > 1);
+        assert!(peak.load(AtomicOrdering::SeqCst) <= MAVEN_XML_CONCURRENCY);
+    }
 
     #[async_trait]
     impl MavenMetadataProvider for StaticProvider {

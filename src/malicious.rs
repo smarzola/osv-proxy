@@ -20,9 +20,10 @@ use std::io::{Cursor, Write};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use zip::ZipArchive;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,6 +37,9 @@ const MAX_OSV_ARCHIVE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MAX_OSV_ARCHIVE_ENTRIES: usize = 1_000_000;
 const MAX_OSV_ARCHIVE_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_OSV_ARCHIVE_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const SQLITE_CHECK_CONCURRENCY: usize = 8;
+
+static SQLITE_CHECK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[async_trait]
 pub trait OsvChecker: Send + Sync {
@@ -585,6 +589,16 @@ impl SqliteMaliciousChecker {
         connection: &Connection,
         artifacts: &[Artifact],
     ) -> Result<Vec<Vec<OsvFinding>>, OsvError> {
+        let mut range_package_loads = 0;
+        self.check_many_with_connection_tracked(connection, artifacts, &mut range_package_loads)
+    }
+
+    fn check_many_with_connection_tracked(
+        &self,
+        connection: &Connection,
+        artifacts: &[Artifact],
+        range_package_loads: &mut usize,
+    ) -> Result<Vec<Vec<OsvFinding>>, OsvError> {
         let ecosystems = artifacts
             .iter()
             .map(|artifact| artifact.ecosystem.osv_name())
@@ -593,39 +607,41 @@ impl SqliteMaliciousChecker {
             ensure_store_healthy(connection, ecosystem, self)?;
         }
 
-        let mut grouped = BTreeMap::<(String, String, String), Vec<usize>>::new();
+        let mut grouped = BTreeMap::<(String, String), BTreeMap<String, Vec<usize>>>::new();
         for (index, artifact) in artifacts.iter().enumerate() {
             grouped
                 .entry((
                     artifact.ecosystem.osv_name().to_string(),
                     artifact.name.clone(),
-                    artifact.version.clone(),
                 ))
+                .or_default()
+                .entry(artifact.version.clone())
                 .or_default()
                 .push(index);
         }
 
-        let mut range_results = BTreeMap::<(String, String, String), Vec<OsvFinding>>::new();
         let mut results = vec![Vec::new(); artifacts.len()];
-        for (_, indexes) in grouped {
-            let artifact = &artifacts[indexes[0]];
-            let mut hits = exact_hits(connection, artifact)?;
-            let range_key = (
-                artifact.ecosystem.osv_name().to_string(),
-                artifact.name.clone(),
-                artifact.version.clone(),
-            );
-            let range_hits = if let Some(hits) = range_results.get(&range_key) {
-                hits.clone()
-            } else {
-                let hits = range_hits(connection, artifact)?;
-                range_results.insert(range_key, hits.clone());
-                hits
-            };
-            hits.extend(range_hits);
-            let hits = consolidate_local_findings(hits)?;
-            for index in indexes {
-                results[index] = hits.clone();
+        for (_, versions) in grouped {
+            let first_index = versions
+                .values()
+                .next()
+                .and_then(|indexes| indexes.first())
+                .copied()
+                .expect("grouped package has at least one artifact");
+            let ranges = stored_ranges(connection, &artifacts[first_index])?;
+            *range_package_loads += 1;
+            for indexes in versions.into_values() {
+                let artifact = &artifacts[indexes[0]];
+                let mut hits = exact_hits(connection, artifact)?;
+                for range in &ranges {
+                    if range_matches_artifact(range, artifact)? {
+                        hits.push(range.advisory.clone());
+                    }
+                }
+                let hits = consolidate_local_findings(hits)?;
+                for index in indexes {
+                    results[index] = hits.clone();
+                }
             }
         }
         Ok(results)
@@ -635,17 +651,47 @@ impl SqliteMaliciousChecker {
 #[async_trait]
 impl OsvChecker for SqliteMaliciousChecker {
     async fn check(&self, artifact: &Artifact) -> Result<Vec<OsvFinding>, OsvError> {
-        let connection = self.open_read_only()?;
-        self.check_with_connection(&connection, artifact)
+        let checker = self.clone();
+        let artifact = artifact.clone();
+        run_sqlite_check(move || {
+            let connection = checker.open_read_only()?;
+            checker.check_with_connection(&connection, &artifact)
+        })
+        .await
     }
 
     async fn check_many(&self, artifacts: &[Artifact]) -> Result<Vec<Vec<OsvFinding>>, OsvError> {
         if artifacts.is_empty() {
             return Ok(Vec::new());
         }
-        let connection = self.open_read_only()?;
-        self.check_many_with_connection(&connection, artifacts)
+        let checker = self.clone();
+        let artifacts = artifacts.to_vec();
+        run_sqlite_check(move || {
+            let connection = checker.open_read_only()?;
+            checker.check_many_with_connection(&connection, &artifacts)
+        })
+        .await
     }
+}
+
+async fn run_sqlite_check<T, F>(operation: F) -> Result<T, OsvError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, OsvError> + Send + 'static,
+{
+    let semaphore = SQLITE_CHECK_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(SQLITE_CHECK_CONCURRENCY)))
+        .clone();
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|error| OsvError::LocalStore(format!("SQLite check queue closed: {error}")))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|error| OsvError::LocalStore(format!("SQLite check task failed: {error}")))?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1998,16 +2044,18 @@ fn stored_ranges(
         .prepare(
             r#"
 SELECT ar.id, a.osv_id, a.summary, a.source, a.modified, ar.range_type,
-       ap.severity_type, ap.severity_vector, ap.severity_score, ap.severity_error
+       ap.severity_type, ap.severity_vector, ap.severity_score, ap.severity_error,
+       e.event_type, e.version
 FROM sync_state s
 JOIN osv_affected_packages ap ON ap.generation_id = s.active_generation_id
 JOIN osv_affected_ranges ar ON ar.affected_package_id = ap.id
 JOIN osv_advisories a ON a.generation_id = ap.generation_id AND a.osv_id = ap.osv_id
+LEFT JOIN osv_affected_range_events e ON e.range_id = ar.id
 WHERE s.ecosystem = ?1
   AND ap.ecosystem = ?1
   AND ap.name = ?2
   AND a.withdrawn IS NULL
-ORDER BY a.osv_id, ar.id
+ORDER BY a.osv_id, ar.id, e.event_order
 "#,
         )
         .map_err(sqlite_error)?;
@@ -2044,44 +2092,29 @@ ORDER BY a.osv_id, ar.id
                         evaluation_error: row.get(9)?,
                     },
                     row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             },
         )
         .map_err(sqlite_error)?;
 
-    let mut ranges = Vec::new();
+    let mut ranges = BTreeMap::<i64, StoredRange>::new();
     for row in rows {
-        let (range_id, advisory, range_type) = row.map_err(sqlite_error)?;
-        ranges.push(StoredRange {
+        let (range_id, advisory, range_type, event_type, version) = row.map_err(sqlite_error)?;
+        let range = ranges.entry(range_id).or_insert_with(|| StoredRange {
             advisory,
             range_type,
-            events: range_events(connection, range_id)?,
+            events: Vec::new(),
         });
+        if let (Some(event_type), Some(version)) = (event_type, version) {
+            range.events.push(RangeEvent {
+                event_type,
+                version,
+            });
+        }
     }
-    Ok(ranges)
-}
-
-fn range_events(connection: &Connection, range_id: i64) -> Result<Vec<RangeEvent>, OsvError> {
-    let mut statement = connection
-        .prepare(
-            r#"
-SELECT event_type, version
-FROM osv_affected_range_events
-WHERE range_id = ?1
-ORDER BY event_order
-"#,
-        )
-        .map_err(sqlite_error)?;
-    let rows = statement
-        .query_map([range_id], |row| {
-            Ok(RangeEvent {
-                event_type: row.get(0)?,
-                version: row.get(1)?,
-            })
-        })
-        .map_err(sqlite_error)?;
-
-    rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
+    Ok(ranges.into_values().collect())
 }
 
 fn range_matches_artifact(range: &StoredRange, artifact: &Artifact) -> Result<bool, OsvError> {
@@ -3275,6 +3308,102 @@ mod tests {
         assert_eq!(results[2][0].osv_id, "MAL-2026-000001");
         assert_eq!(results[3], results[2]);
         assert_eq!(results[4], results[1]);
+    }
+
+    #[test]
+    fn sqlite_batch_loads_ranges_once_per_package() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_range_advisory_with_events(
+            &connection,
+            "GHSA-demo-range",
+            "npm",
+            "demo",
+            "SEMVER",
+            &[("introduced", "1.0.0"), ("fixed", "3.0.0")],
+        );
+        insert_range_advisory_with_events(
+            &connection,
+            "GHSA-other-range",
+            "npm",
+            "other",
+            "SEMVER",
+            &[("introduced", "1.0.0"), ("fixed", "3.0.0")],
+        );
+        let artifacts = vec![
+            Artifact::package(Ecosystem::Npm, "demo", "1.1.0", None),
+            Artifact::package(Ecosystem::Npm, "demo", "1.2.0", None),
+            Artifact::package(Ecosystem::Npm, "demo", "2.0.0", None),
+            Artifact::package(Ecosystem::Npm, "other", "2.0.0", None),
+        ];
+        let checker = checker_for(&db);
+        let mut range_package_loads = 0;
+
+        let results = checker
+            .check_many_with_connection_tracked(&connection, &artifacts, &mut range_package_loads)
+            .unwrap();
+
+        assert_eq!(range_package_loads, 2);
+        assert!(results.iter().all(|hits| hits.len() == 1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_blocking_work_yields_the_runtime_worker() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked = tokio::spawn(async move {
+            run_sqlite_check(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+
+        let heartbeat = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            1_u8
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), heartbeat)
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        release_tx.send(()).unwrap();
+        blocked.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_blocking_work_is_concurrency_bounded() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tasks = (0..SQLITE_CHECK_CONCURRENCY + 4)
+            .map(|_| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                tokio::spawn(async move {
+                    run_sqlite_check(move || {
+                        let current = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(10));
+                        active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) > 1);
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= SQLITE_CHECK_CONCURRENCY);
     }
 
     #[tokio::test]

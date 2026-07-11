@@ -40,13 +40,53 @@ pub fn router(config: Config) -> Router {
     let checker = configured_malicious_checker(&config);
     Router::new()
         .fallback(any(registry_handler))
-        .with_state(Arc::new(AppState { config, checker }))
+        .with_state(Arc::new(AppState::new(config, checker)))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
 }
 
 struct AppState {
     config: Config,
     checker: Arc<dyn MaliciousChecker>,
+    clients: RegistryClients,
+}
+
+impl AppState {
+    fn new(config: Config, checker: Arc<dyn MaliciousChecker>) -> Self {
+        let clients = RegistryClients::new(&config);
+        Self {
+            config,
+            checker,
+            clients,
+        }
+    }
+}
+
+struct RegistryClients {
+    npm: NpmRegistryClient,
+    pypi: PypiSimpleClient,
+    go: GoProxyClient,
+    cargo: CargoRegistryClient,
+    delivery: ArtifactDeliveryClient,
+    nuget: NugetClient,
+    rubygems: RubyGemsClient,
+    maven: MavenRepositoryClient,
+}
+
+impl RegistryClients {
+    fn new(config: &Config) -> Self {
+        let delivery = ArtifactDeliveryClient::for_config(config);
+        let nuget = NugetClient::with_delivery(config, delivery.clone());
+        Self {
+            npm: NpmRegistryClient::new(&config.upstreams.npm.registry_url),
+            pypi: PypiSimpleClient::new(&config.upstreams.pypi.simple_url),
+            go: GoProxyClient::new(&config.upstreams.go.proxy_url),
+            cargo: CargoRegistryClient::new(config),
+            delivery,
+            nuget,
+            rubygems: RubyGemsClient::new(&config.upstreams.rubygems.registry_url),
+            maven: MavenRepositoryClient::new(&config.upstreams.maven.repository_url),
+        }
+    }
 }
 
 struct BackgroundSyncTask {
@@ -105,9 +145,10 @@ async fn registry_handler(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    route_http_request_with_accept_and_headers(
+    route_http_request_with_clients(
         &state.config,
         state.checker.as_ref(),
+        &state.clients,
         &method,
         &path,
         accept.as_deref(),
@@ -385,9 +426,23 @@ fn nuget_error_response(error: crate::nuget::NugetError) -> RegistryResponse {
     RegistryResponse::json(status, &serde_json::json!({"allowed": false, "reason": "nuget_upstream_error", "message": error.to_string()})).expect("static NuGet error response")
 }
 
+#[cfg(test)]
 async fn route_http_request_with_accept_and_headers(
     config: &Config,
     checker: &dyn MaliciousChecker,
+    method: &str,
+    path: &str,
+    accept: Option<&str>,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let clients = RegistryClients::new(config);
+    route_http_request_with_clients(config, checker, &clients, method, path, accept, headers).await
+}
+
+async fn route_http_request_with_clients(
+    config: &Config,
+    checker: &dyn MaliciousChecker,
+    clients: &RegistryClients,
     method: &str,
     path: &str,
     accept: Option<&str>,
@@ -402,14 +457,14 @@ async fn route_http_request_with_accept_and_headers(
         return simple_response(405, "method not allowed").into_http_response();
     }
 
-    let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
-    let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
-    let go_upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
-    let cargo_upstream = CargoRegistryClient::new(config);
-    let delivery = ArtifactDeliveryClient::for_config(config);
-    let nuget_upstream = NugetClient::for_config(config);
-    let rubygems_upstream = RubyGemsClient::new(&config.upstreams.rubygems.registry_url);
-    let maven_upstream = MavenRepositoryClient::new(&config.upstreams.maven.repository_url);
+    let npm_upstream = clients.npm.clone();
+    let pypi_upstream = clients.pypi.clone();
+    let go_upstream = clients.go.clone();
+    let cargo_upstream = clients.cargo.clone();
+    let delivery = clients.delivery.clone();
+    let nuget_upstream = clients.nuget.clone();
+    let rubygems_upstream = clients.rubygems.clone();
+    let maven_upstream = clients.maven.clone();
     let now = Utc::now();
 
     if let Some((relative_path, checksum)) = parse_maven_metadata_route(path) {
@@ -546,7 +601,7 @@ async fn route_http_request_with_accept_and_headers(
                     .map(|(base, _)| format!("{base}/{package}.nuspec"))
                     .unwrap_or(upstream);
             }
-            Ok(ArtifactDeliveryClient::for_config(config)
+            Ok(delivery
                 .deliver(
                     config,
                     crate::artifact::Ecosystem::Nuget,
@@ -967,7 +1022,8 @@ mod tests {
     use super::*;
     use crate::artifact::{Artifact, Ecosystem};
     use crate::config::{
-        AllowlistEntry, ArtifactBehavior, BlocklistEntry, LocalOsvConfig, OsvSource,
+        AllowlistEntry, ArtifactBehavior, BlocklistEntry, LocalOsvConfig, MissingPublishTime,
+        OsvSource,
     };
     use crate::malicious::{MaliciousError, MaliciousHit, OsvDumpClient, SqliteMaliciousChecker};
     use crate::npm::NpmError;
@@ -980,9 +1036,11 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{Cursor, Write};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
     use tower::ServiceExt;
     use zip::{ZipWriter, write::SimpleFileOptions};
 
@@ -2287,6 +2345,189 @@ INSERT INTO advisories (
                 .unwrap()
                 .contains_key("1.0.1")
         );
+    }
+
+    #[tokio::test]
+    async fn app_state_reuses_upstream_connection_across_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(Notify::new());
+        let body = json!({"name":"demo","versions":{},"dist-tags":{},"time":{}}).to_string();
+        let server = {
+            let accepted = Arc::clone(&accepted);
+            let requests = Arc::clone(&requests);
+            let completed = Arc::clone(&completed);
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    accepted.fetch_add(1, AtomicOrdering::SeqCst);
+                    let body = body.clone();
+                    let requests = Arc::clone(&requests);
+                    let completed = Arc::clone(&completed);
+                    tokio::spawn(async move {
+                        loop {
+                            let mut buffer = [0_u8; 4096];
+                            let Ok(bytes) = stream.read(&mut buffer).await else {
+                                return;
+                            };
+                            if bytes == 0 {
+                                return;
+                            }
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            if stream.write_all(response.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            if requests.fetch_add(1, AtomicOrdering::SeqCst) + 1 == 2 {
+                                completed.notify_one();
+                            }
+                        }
+                    });
+                }
+            })
+        };
+        let mut config = Config::default();
+        config.upstreams.npm.registry_url = format!("http://{address}");
+        let app = router(config);
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/npm/demo")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), completed.notified())
+            .await
+            .unwrap();
+
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nuget_metadata_and_artifact_share_the_state_client_pool() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(Notify::new());
+        let server = {
+            let accepted = Arc::clone(&accepted);
+            let requests = Arc::clone(&requests);
+            let completed = Arc::clone(&completed);
+            let origin = origin.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    accepted.fetch_add(1, AtomicOrdering::SeqCst);
+                    let origin = origin.clone();
+                    let requests = Arc::clone(&requests);
+                    let completed = Arc::clone(&completed);
+                    tokio::spawn(async move {
+                        loop {
+                            let mut buffer = [0_u8; 4096];
+                            let Ok(bytes) = stream.read(&mut buffer).await else {
+                                return;
+                            };
+                            if bytes == 0 {
+                                return;
+                            }
+                            let request = String::from_utf8_lossy(&buffer[..bytes]);
+                            let path = request
+                                .lines()
+                                .next()
+                                .and_then(|line| line.split_whitespace().nth(1))
+                                .unwrap_or_default();
+                            let (content_type, body) = match path {
+                                "/v3/index.json" => (
+                                    "application/json",
+                                    json!({"resources":[{
+                                        "@type":"RegistrationsBaseUrl/3.6.0",
+                                        "@id":format!("{origin}/registration")
+                                    }]})
+                                    .to_string(),
+                                ),
+                                "/registration/demo/index.json" => (
+                                    "application/json",
+                                    json!({"items":[{"items":[{
+                                        "catalogEntry":{
+                                            "version":"1.0.0",
+                                            "published":"2020-01-01T00:00:00Z"
+                                        },
+                                        "packageContent":format!("{origin}/packages/demo.1.0.0.nupkg")
+                                    }]}]})
+                                    .to_string(),
+                                ),
+                                "/packages/demo.1.0.0.nupkg" => {
+                                    ("application/octet-stream", "nupkg".to_string())
+                                }
+                                _ => return,
+                            };
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{body}",
+                                body.len()
+                            );
+                            if stream.write_all(response.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            if requests.fetch_add(1, AtomicOrdering::SeqCst) + 1 == 3 {
+                                completed.notify_one();
+                            }
+                        }
+                    });
+                }
+            })
+        };
+        let mut config = Config::default();
+        config.upstreams.nuget.service_index_url = format!("{origin}/v3/index.json");
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.policy.minimum_age = Duration::ZERO;
+        config.policy.missing_publish_time = MissingPublishTime::Allow;
+        config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
+
+        let response = router(config)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/nuget/v3/flatcontainer/demo/1.0.0/demo.1.0.0.nupkg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "nupkg"
+        );
+        tokio::time::timeout(Duration::from_secs(1), completed.notified())
+            .await
+            .unwrap();
+
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+        server.abort();
     }
 
     #[tokio::test]

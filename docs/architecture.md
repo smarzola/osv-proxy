@@ -46,6 +46,11 @@ Metadata filtering evaluates batches of canonical artifacts. Retained download
 URLs point back through `osv-proxy`. Direct artifact routes rebuild the exact
 artifact and re-run policy before redirecting or fetching upstream bytes.
 
+Application state owns one reusable client set for all registry and artifact
+traffic, so request routing reuses connection pools instead of constructing
+clients on the install path. NuGet metadata and artifact delivery share the
+same guarded client pool.
+
 Proxy-mode artifact delivery enforces an egress boundary before contact. It
 permits public HTTPS CDN origins plus exact configured origins for the artifact's
 ecosystem and explicit operator-trusted origins. DNS answers containing a
@@ -67,7 +72,10 @@ The local store uses one active generation per ecosystem. Bootstrap imports an
 archive plus source-timestamp catch-up into staging and activates it atomically;
 failed imports never expose partial data. Existing malicious-only databases are
 version 0 and cannot satisfy vulnerability-enabled readiness. Raw JSON remains
-optional.
+optional. Request-time SQLite reads, version/range evaluation, and Maven XML
+deserialization run in separate bounded blocking pools. Local batch checks load
+all ranges and ordered events once per ecosystem/package, then evaluate every
+requested version in memory.
 
 ## Upstream Body Bounds
 

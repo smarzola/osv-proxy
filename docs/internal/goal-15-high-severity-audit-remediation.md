@@ -131,7 +131,7 @@ The goal is complete only when:
 
 - [x] Milestone 1: Harden dependencies and bound upstream bodies.
 - [x] Milestone 2: Enforce artifact egress and redirect safety.
-- [ ] Milestone 3: Reuse clients and make local policy evaluation async-safe and
+- [x] Milestone 3: Reuse clients and make local policy evaluation async-safe and
   package-batched.
 - [ ] Milestone 4: Isolate ecosystem sync failures and implement background
   retry behavior.
@@ -253,7 +253,20 @@ cargo test --locked --lib malicious::tests
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-Status: Not started.
+Status: Completed 2026-07-11 after two adversarial review rounds. Axum
+application state owns the reusable registry/artifact clients, including one
+guarded pool shared with NuGet, and a two-request regression proves upstream
+connection reuse. Local SQLite opens and queries on an eight-permit blocking
+boundary; batch range/event SQL loads once per package and evaluates all
+versions in memory. Maven XML deserialization uses a separate eight-permit
+blocking boundary. Current-thread yield and concurrency-bound tests cover both
+blocking pools. Verification before review: all 32 server, 55 malicious, and 25
+Maven focused tests passed. The first review found one remaining per-request
+NuGet artifact-client constructor; it now uses the shared state client, and a
+metadata-plus-artifact regression proves all three upstream requests reuse one
+TCP connection. Final verification: `cargo fmt --check` passed; `cargo test
+--locked --lib` passed 278 tests; strict all-target/all-feature Clippy passed;
+the basic configuration validated; `git diff --check` passed.
 
 ## Milestone 4: Isolate Sync Failures And Retry Safely
 
