@@ -111,6 +111,25 @@ impl<'a> PolicyEngine<'a> {
                         decision.cvss_score = score;
                         return decision;
                     }
+                    if let Some(hit) = hits
+                        .iter()
+                        .filter(|hit| hit.evaluation_error.is_some())
+                        .min_by(|left, right| left.osv_id.cmp(&right.osv_id))
+                        && self.config.policy.osv.on_error == OsvErrorBehavior::Block
+                    {
+                        return blocked(
+                            DecisionReason::Vulnerable,
+                            artifact,
+                            format!(
+                                "Blocked because OSV advisory {} could not be evaluated: {}",
+                                hit.osv_id,
+                                hit.evaluation_error.as_deref().unwrap_or("unknown error")
+                            ),
+                            Some(hit.osv_id.clone()),
+                            Some(hit.source.clone()),
+                            None,
+                        );
+                    }
                 }
                 Some(Err(err)) => {
                     if self.config.policy.osv.on_error == OsvErrorBehavior::Block {
@@ -243,6 +262,7 @@ impl<'a> PolicyEngine<'a> {
         let threshold = self.config.policy.osv.minimum_cvss_score;
         hits.iter()
             .filter(|hit| !hit.osv_id.starts_with("MAL-"))
+            .filter(|hit| hit.evaluation_error.is_none())
             .filter(|hit| {
                 threshold == 0.0
                     || hit
@@ -360,6 +380,7 @@ mod tests {
                     source: "osv".to_string(),
                     modified: None,
                     effective_severity: None,
+                    evaluation_error: None,
                 }],
                 fail: false,
                 calls: AtomicU32::new(0),
@@ -551,6 +572,20 @@ mod tests {
         assert!(decision.allowed);
     }
 
+    #[tokio::test]
+    async fn default_zero_threshold_reports_available_score() {
+        let config = Config::default();
+        let decision = PolicyEngine::new(&config)
+            .evaluate(
+                &old_artifact(),
+                now(),
+                &FakeChecker::with_scored_hit("GHSA-scored", 9.8),
+            )
+            .await;
+        assert_eq!(decision.reason, DecisionReason::Vulnerable);
+        assert_eq!(decision.cvss_score, Some(9.8));
+    }
+
     #[test]
     fn malicious_precedes_vulnerabilities_and_vulnerability_order_is_deterministic() {
         let config = Config::default();
@@ -564,6 +599,7 @@ mod tests {
                 vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_string(),
                 base_score: score,
             }),
+            evaluation_error: None,
         };
         let engine = PolicyEngine::new(&config);
         let first = engine.evaluate_with_malicious_result(

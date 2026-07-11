@@ -877,6 +877,7 @@ mod tests {
                     source: "osv".to_string(),
                     modified: None,
                     effective_severity: None,
+                    evaluation_error: None,
                 }])
             } else {
                 Ok(Vec::new())

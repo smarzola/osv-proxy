@@ -63,6 +63,8 @@ pub struct OsvFinding {
     pub source: String,
     pub modified: Option<DateTime<Utc>>,
     pub effective_severity: Option<OsvEffectiveSeverity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluation_error: Option<String>,
 }
 
 pub type MaliciousHit = OsvFinding;
@@ -158,6 +160,10 @@ pub enum OsvError {
     Sync(String),
     #[error("OSV severity evaluation failed: {0}")]
     Severity(#[from] OsvSeverityError),
+    #[error("OSV pagination token repeated for {query}: {token}")]
+    PaginationCycle { query: String, token: String },
+    #[error("OSV detail response ID mismatch: requested {requested}, returned {actual}")]
+    DetailIdentity { requested: String, actual: String },
 }
 
 pub type MaliciousError = OsvError;
@@ -219,7 +225,7 @@ impl OsvHttpClient {
     async fn hydrate_details(
         &self,
         ids: BTreeSet<String>,
-    ) -> Result<BTreeMap<String, OsvVulnerability>, OsvError> {
+    ) -> BTreeMap<String, Result<OsvVulnerability, String>> {
         let mut pending = ids.into_iter();
         let mut in_flight = FuturesUnordered::new();
         let mut details = BTreeMap::new();
@@ -227,25 +233,44 @@ impl OsvHttpClient {
             while in_flight.len() < OSV_DETAIL_CONCURRENCY {
                 let Some(id) = pending.next() else { break };
                 let client = self.client.clone();
-                let url = format!("{}/v1/vulns/{id}", self.api_url);
+                let base = self.api_url.clone();
                 in_flight.push(async move {
-                    let detail = client
-                        .get(url)
-                        .send()
-                        .await?
-                        .error_for_status()?
-                        .json::<OsvVulnerability>()
-                        .await?;
-                    Ok::<_, reqwest::Error>((id, detail))
+                    let result = async {
+                        let mut url =
+                            reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
+                        url.path_segments_mut()
+                            .map_err(|_| "OSV API URL cannot be a base URL".to_string())?
+                            .extend(["v1", "vulns", id.as_str()]);
+                        let detail = client
+                            .get(url)
+                            .send()
+                            .await
+                            .map_err(|error| error.to_string())?
+                            .error_for_status()
+                            .map_err(|error| error.to_string())?
+                            .json::<OsvVulnerability>()
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        if detail.id != id {
+                            return Err(OsvError::DetailIdentity {
+                                requested: id.clone(),
+                                actual: detail.id,
+                            }
+                            .to_string());
+                        }
+                        Ok(detail)
+                    }
+                    .await;
+                    (id, result)
                 });
             }
             let Some(result) = in_flight.next().await else {
                 break;
             };
-            let (id, detail) = result?;
-            details.insert(id, detail);
+            let (id, result) = result;
+            details.insert(id, result);
         }
-        Ok(details)
+        details
     }
 }
 
@@ -261,6 +286,7 @@ impl OsvChecker for OsvHttpClient {
             page_token: None,
         };
         let mut findings = Vec::new();
+        let mut seen_tokens = BTreeSet::new();
         loop {
             let response = self.post_query(&request).await?;
             for vulnerability in response.vulns {
@@ -270,13 +296,22 @@ impl OsvChecker for OsvHttpClient {
                     }
                     continue;
                 }
-                if let Some(finding) = finding_from_vulnerability(vulnerability, artifact)? {
-                    findings.push(finding);
+                let id = vulnerability.id.clone();
+                match finding_from_vulnerability(vulnerability, artifact) {
+                    Ok(Some(finding)) => findings.push(finding),
+                    Ok(None) => {}
+                    Err(error) => findings.push(error_finding(id, error.to_string())),
                 }
             }
             let Some(token) = response.next_page_token.filter(|token| !token.is_empty()) else {
                 break;
             };
+            if !seen_tokens.insert(token.clone()) {
+                return Err(OsvError::PaginationCycle {
+                    query: artifact.identity(),
+                    token,
+                });
+            }
             request.page_token = Some(token);
         }
         findings.sort_by(|left, right| left.osv_id.cmp(&right.osv_id));
@@ -310,9 +345,11 @@ impl OsvChecker for OsvHttpClient {
 
         let mut stubs = vec![Vec::<OsvVulnerability>::new(); artifacts.len()];
         let mut pending = Vec::new();
+        let mut seen_tokens = vec![BTreeSet::new(); artifacts.len()];
         for (index, result) in response.results.into_iter().enumerate() {
             stubs[index].extend(result.vulns);
             if let Some(token) = result.next_page_token.filter(|token| !token.is_empty()) {
+                seen_tokens[index].insert(token.clone());
                 pending.push((index, token));
             }
         }
@@ -336,6 +373,12 @@ impl OsvChecker for OsvHttpClient {
             for ((index, _), result) in pending.into_iter().zip(response.results) {
                 stubs[index].extend(result.vulns);
                 if let Some(token) = result.next_page_token.filter(|token| !token.is_empty()) {
+                    if !seen_tokens[index].insert(token.clone()) {
+                        return Err(OsvError::PaginationCycle {
+                            query: artifacts[index].identity(),
+                            token,
+                        });
+                    }
                     next.push((index, token));
                 }
             }
@@ -348,7 +391,7 @@ impl OsvChecker for OsvHttpClient {
             .filter(|stub| self.block_vulnerabilities && !stub.id.starts_with("MAL-"))
             .map(|stub| stub.id.clone())
             .collect::<BTreeSet<_>>();
-        let details = self.hydrate_details(detail_ids).await?;
+        let details = self.hydrate_details(detail_ids).await;
         let mut results = Vec::with_capacity(artifacts.len());
         for (artifact, artifact_stubs) in artifacts.iter().zip(stubs) {
             let mut findings = Vec::new();
@@ -356,8 +399,15 @@ impl OsvChecker for OsvHttpClient {
                 if stub.id.starts_with("MAL-") {
                     findings.push(stub_finding(stub));
                 } else if let Some(detail) = details.get(&stub.id) {
-                    if let Some(finding) = finding_from_vulnerability(detail.clone(), artifact)? {
-                        findings.push(finding);
+                    match detail {
+                        Ok(detail) => match finding_from_vulnerability(detail.clone(), artifact) {
+                            Ok(Some(finding)) => findings.push(finding),
+                            Ok(None) => {}
+                            Err(error) => {
+                                findings.push(error_finding(stub.id.clone(), error.to_string()))
+                            }
+                        },
+                        Err(error) => findings.push(error_finding(stub.id.clone(), error.clone())),
                     }
                 }
             }
@@ -376,6 +426,18 @@ fn stub_finding(vulnerability: OsvVulnerability) -> OsvFinding {
         source: "osv".to_string(),
         modified: vulnerability.modified,
         effective_severity: None,
+        evaluation_error: None,
+    }
+}
+
+fn error_finding(osv_id: String, error: String) -> OsvFinding {
+    OsvFinding {
+        osv_id,
+        summary: None,
+        source: "osv".to_string(),
+        modified: None,
+        effective_severity: None,
+        evaluation_error: Some(error),
     }
 }
 
@@ -389,20 +451,44 @@ fn finding_from_vulnerability(
     if vulnerability.id.starts_with("MAL-") {
         return Ok(Some(stub_finding(vulnerability)));
     }
-    let matching = vulnerability.affected.iter().find(|affected| {
-        affected.package.ecosystem == artifact.ecosystem.osv_name()
-            && artifact.ecosystem.normalize_name(&affected.package.name) == artifact.name
-    });
-    let effective_severity = effective_osv_severity(
-        &vulnerability.severity,
-        matching.map(|affected| affected.severity.as_slice()),
-    )?;
+    let matching = vulnerability
+        .affected
+        .iter()
+        .filter(|affected| {
+            affected.package.ecosystem == artifact.ecosystem.osv_name()
+                && artifact.ecosystem.normalize_name(&affected.package.name) == artifact.name
+        })
+        .collect::<Vec<_>>();
+    let mut effective_severity = None;
+    if matching.is_empty() {
+        effective_severity = effective_osv_severity(&vulnerability.severity, None)?;
+    } else {
+        for affected in matching {
+            let candidate = effective_osv_severity(
+                &vulnerability.severity,
+                Some(affected.severity.as_slice()),
+            )?;
+            if candidate.as_ref().is_some_and(|candidate| {
+                effective_severity
+                    .as_ref()
+                    .is_none_or(|current: &OsvEffectiveSeverity| {
+                        candidate.base_score > current.base_score
+                            || (candidate.base_score == current.base_score
+                                && (&candidate.severity_type, &candidate.vector)
+                                    < (&current.severity_type, &current.vector))
+                    })
+            }) {
+                effective_severity = candidate;
+            }
+        }
+    }
     Ok(Some(OsvFinding {
         osv_id: vulnerability.id,
         summary: vulnerability.summary,
         source: "osv".to_string(),
         modified: vulnerability.modified,
         effective_severity,
+        evaluation_error: None,
     }))
 }
 
@@ -1308,6 +1394,7 @@ ORDER BY a.osv_id
                     source: row.get(2)?,
                     modified,
                     effective_severity: None,
+                    evaluation_error: None,
                 })
             },
         )
@@ -1382,6 +1469,7 @@ ORDER BY a.osv_id, ar.id
                         source: row.get(3)?,
                         modified,
                         effective_severity: None,
+                        evaluation_error: None,
                     },
                     row.get::<_, String>(5)?,
                 ))
@@ -1728,6 +1816,15 @@ mod tests {
         Json(body): Json<serde_json::Value>,
     ) -> Json<serde_json::Value> {
         state.query_calls.fetch_add(1, AtomicOrdering::SeqCst);
+        if body.get("version").and_then(|value| value.as_str()) == Some("single-cycle") {
+            return Json(serde_json::json!({"vulns":[],"next_page_token":"cycle"}));
+        }
+        if body.get("version").and_then(|value| value.as_str()) == Some("withdrawn") {
+            return Json(serde_json::json!({"vulns":[{
+                "id":"GHSA-withdrawn","modified":"2026-07-11T00:00:00Z",
+                "withdrawn":"2026-07-11T01:00:00Z"
+            }]}));
+        }
         if body.get("version").and_then(|value| value.as_str()) == Some("parity") {
             return Json(serde_json::json!({"vulns": [{
                 "id":"GHSA-shared", "modified":"2026-07-11T00:00:00Z",
@@ -1758,6 +1855,13 @@ mod tests {
     ) -> Json<serde_json::Value> {
         state.batch_calls.fetch_add(1, AtomicOrdering::SeqCst);
         let queries = body["queries"].as_array().unwrap();
+        if queries.iter().any(|query| {
+            query.get("version").and_then(|value| value.as_str()) == Some("batch-cycle")
+        }) {
+            return Json(serde_json::json!({"results":[{
+                "vulns":[],"next_page_token":"batch-cycle-token"
+            }]}));
+        }
         if queries
             .iter()
             .any(|query| query.get("page_token").is_some())
@@ -1770,6 +1874,26 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, _)| {
+                let version = queries[index]
+                    .get("version")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                if version == "mal-bad" {
+                    return serde_json::json!({"vulns":[
+                        {"id":"MAL-2026-known","modified":"2026-07-11T00:00:00Z"},
+                        {"id":"GHSA-bad","modified":"2026-07-11T00:00:00Z"}
+                    ]});
+                }
+                if version == "mismatch" {
+                    return serde_json::json!({"vulns":[
+                        {"id":"GHSA-mismatch","modified":"2026-07-11T00:00:00Z"}
+                    ]});
+                }
+                if version == "withdrawn" {
+                    return serde_json::json!({"vulns":[
+                        {"id":"GHSA-withdrawn","modified":"2026-07-11T00:00:00Z"}
+                    ]});
+                }
                 let mut vulns = vec![serde_json::json!({
                     "id":"GHSA-shared", "modified":"2026-07-11T00:00:00Z"
                 })];
@@ -1803,6 +1927,25 @@ mod tests {
         state.peak_details.fetch_max(active, AtomicOrdering::SeqCst);
         tokio::time::sleep(Duration::from_millis(10)).await;
         state.active_details.fetch_sub(1, AtomicOrdering::SeqCst);
+        if id == "GHSA-bad" {
+            return Json(serde_json::json!({
+                "id":id,"modified":"2026-07-11T00:00:00Z",
+                "severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:BROKEN"}],
+                "affected":[{"package":{"ecosystem":"npm","name":"demo"}}]
+            }));
+        }
+        if id == "GHSA-mismatch" {
+            return Json(serde_json::json!({
+                "id":"GHSA-other","modified":"2026-07-11T00:00:00Z",
+                "affected":[{"package":{"ecosystem":"npm","name":"demo"}}]
+            }));
+        }
+        if id == "GHSA-withdrawn" {
+            return Json(serde_json::json!({
+                "id":id,"modified":"2026-07-11T00:00:00Z",
+                "withdrawn":"2026-07-11T01:00:00Z"
+            }));
+        }
         Json(serde_json::json!({
             "id":id, "modified":"2026-07-11T00:00:00Z",
             "severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
@@ -1878,6 +2021,61 @@ mod tests {
             .find(|finding| finding.osv_id == "GHSA-shared")
             .unwrap();
         assert_eq!(&direct[0], batch_shared);
+    }
+
+    #[tokio::test]
+    async fn repeated_single_and_batch_page_tokens_fail_without_looping() {
+        let (url, _) = live_mock().await;
+        let client = OsvHttpClient::new(url);
+        let single = Artifact::package(Ecosystem::Npm, "demo", "single-cycle", None);
+        assert!(matches!(
+            client.check(&single).await.unwrap_err(),
+            OsvError::PaginationCycle { .. }
+        ));
+        let batch = Artifact::package(Ecosystem::Npm, "demo", "batch-cycle", None);
+        assert!(matches!(
+            client.check_many(&[batch]).await.unwrap_err(),
+            OsvError::PaginationCycle { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn batch_preserves_known_mal_and_isolates_detail_errors() {
+        let (url, _) = live_mock().await;
+        let client = OsvHttpClient::new(url);
+        let bad = Artifact::package(Ecosystem::Npm, "demo", "mal-bad", None);
+        let clean = Artifact::package(Ecosystem::Npm, "demo", "mismatch", None);
+        let results = client.check_many(&[bad.clone(), clean]).await.unwrap();
+        assert!(
+            results[0]
+                .iter()
+                .any(|finding| finding.osv_id.starts_with("MAL-"))
+        );
+        assert!(
+            results[0]
+                .iter()
+                .any(|finding| finding.evaluation_error.is_some())
+        );
+        assert_eq!(results[1].len(), 1);
+        assert!(results[1][0].evaluation_error.is_some());
+
+        let mut config = Config::default();
+        config.policy.osv.on_error = crate::config::OsvErrorBehavior::Allow;
+        let decision = crate::policy::PolicyEngine::new(&config).evaluate_with_malicious_result(
+            &bad,
+            Utc::now(),
+            Some(Ok(results[0].clone())),
+        );
+        assert_eq!(decision.reason, crate::policy::DecisionReason::Malicious);
+    }
+
+    #[tokio::test]
+    async fn withdrawn_live_single_and_batch_findings_are_ignored() {
+        let (url, _) = live_mock().await;
+        let client = OsvHttpClient::new(url);
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "withdrawn", None);
+        assert!(client.check(&artifact).await.unwrap().is_empty());
+        assert!(client.check_many(&[artifact]).await.unwrap()[0].is_empty());
     }
 
     fn severity(severity_type: &str, vector: &str) -> OsvSeverity {
@@ -1996,15 +2194,11 @@ mod tests {
     }
 
     #[test]
-    fn schema_valid_affected_severity_overrides_and_other_package_falls_back() {
-        let advisory: OsvDumpAdvisory = serde_json::from_str(
+    fn schema_valid_package_and_top_level_severity_records_deserialize() {
+        let package_advisory: OsvDumpAdvisory = serde_json::from_str(
             r#"{
               "id": "OSV-TEST-1",
               "modified": "2026-07-11T00:00:00Z",
-              "severity": [{
-                "type": "CVSS_V3",
-                "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
-              }],
               "affected": [{
                 "package": {"ecosystem": "npm", "name": "demo"},
                 "severity": [{
@@ -2018,19 +2212,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            effective_advisory_severity(&advisory, "npm", "demo")
+            effective_advisory_severity(&package_advisory, "npm", "demo")
                 .unwrap()
                 .unwrap()
                 .base_score,
             6.8
         );
+
+        let top_advisory: OsvDumpAdvisory = serde_json::from_str(
+            r#"{
+              "id": "OSV-TEST-2",
+              "modified": "2026-07-11T00:00:00Z",
+              "severity": [{
+                "type": "CVSS_V3",
+                "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+              }],
+              "affected": [{
+                "package": {"ecosystem": "npm", "name": "demo"},
+                "ranges": [{"type": "SEMVER", "events": [{"introduced": "0"}]}]
+              }]
+            }"#,
+        )
+        .unwrap();
         assert_eq!(
-            effective_advisory_severity(&advisory, "npm", "other")
+            effective_advisory_severity(&top_advisory, "npm", "demo")
                 .unwrap()
                 .unwrap()
                 .base_score,
             9.8
         );
+    }
+
+    #[test]
+    fn repeated_matching_affected_entries_choose_highest_package_score() {
+        let vulnerability: OsvVulnerability = serde_json::from_str(
+            r#"{
+              "id":"GHSA-repeated","modified":"2026-07-11T00:00:00Z",
+              "affected":[
+                {"package":{"ecosystem":"npm","name":"demo"},"severity":[{"type":"CVSS_V2","score":"AV:A/AC:H/Au:N/C:C/I:C/A:C"}]},
+                {"package":{"ecosystem":"npm","name":"demo"},"severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None);
+        let finding = finding_from_vulnerability(vulnerability, &artifact)
+            .unwrap()
+            .unwrap();
+        assert_eq!(finding.effective_severity.unwrap().base_score, 9.8);
     }
 
     #[test]

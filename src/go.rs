@@ -441,15 +441,22 @@ pub fn parse_route(path: &str) -> Option<(String, GoRoute<'_>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BlocklistEntry, Config};
+    use crate::config::{BlocklistEntry, Config, OsvErrorBehavior};
     use crate::malicious::{MaliciousError, MaliciousHit};
     use async_trait::async_trait;
 
     struct Clean;
+    struct Failing;
     #[async_trait]
     impl MaliciousChecker for Clean {
         async fn check(&self, _: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
             Ok(Vec::new())
+        }
+    }
+    #[async_trait]
+    impl MaliciousChecker for Failing {
+        async fn check(&self, _: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            Err(MaliciousError::Sync("fixture failure".to_string()))
         }
     }
     struct Fixture;
@@ -481,6 +488,22 @@ mod tests {
                 "https://fixture.invalid/{module}/{version}.{extension}"
             ))
         }
+    }
+    #[tokio::test]
+    async fn go_osv_batch_errors_follow_on_error_policy() {
+        let mut config = Config::default();
+        config.policy.minimum_age = Duration::ZERO;
+        config.policy.osv.on_error = OsvErrorBehavior::Allow;
+        let allowed = filtered_infos(&config, &Fixture, &Failing, "example.com/demo", Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(allowed.len(), 2);
+
+        config.policy.osv.on_error = OsvErrorBehavior::Block;
+        let blocked = filtered_infos(&config, &Fixture, &Failing, "example.com/demo", Utc::now())
+            .await
+            .unwrap();
+        assert!(blocked.is_empty());
     }
     #[test]
     fn escapes_uppercase_path_segments() {

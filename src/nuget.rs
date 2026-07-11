@@ -549,7 +549,7 @@ use chrono::Datelike;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, OsvErrorBehavior};
     use crate::malicious::{MaliciousChecker, MaliciousError, MaliciousHit};
     use serde_json::json;
     use std::collections::HashMap;
@@ -560,10 +560,17 @@ mod tests {
         documents: HashMap<String, Value>,
     }
     struct Clean;
+    struct Failing;
     #[async_trait]
     impl MaliciousChecker for Clean {
         async fn check(&self, _: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
             Ok(Vec::new())
+        }
+    }
+    #[async_trait]
+    impl MaliciousChecker for Failing {
+        async fn check(&self, _: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            Err(MaliciousError::Sync("fixture failure".to_string()))
         }
     }
     #[async_trait]
@@ -611,6 +618,32 @@ mod tests {
             serde_json::from_slice::<Value>(&response.body).unwrap()["versions"],
             json!(["1.0.0"])
         );
+    }
+    #[tokio::test]
+    async fn nuget_osv_batch_errors_follow_on_error_policy() {
+        let mut document = provider()
+            .documents
+            .get("https://upstream/registration/demo/index.json")
+            .unwrap()
+            .clone();
+        let mut config = Config::default();
+        config.policy.minimum_age = Duration::ZERO;
+        config.policy.osv.on_error = OsvErrorBehavior::Allow;
+        filter_registration(&config, &Failing, "demo", &mut document, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(document["items"][0]["items"].as_array().unwrap().len(), 2);
+
+        let mut document = provider()
+            .documents
+            .get("https://upstream/registration/demo/index.json")
+            .unwrap()
+            .clone();
+        config.policy.osv.on_error = OsvErrorBehavior::Block;
+        filter_registration(&config, &Failing, "demo", &mut document, Utc::now())
+            .await
+            .unwrap();
+        assert!(document["items"].as_array().unwrap().is_empty());
     }
     #[tokio::test]
     async fn registration_response_owns_all_emitted_urls() {
