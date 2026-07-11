@@ -3,7 +3,7 @@ use crate::cargo::{CargoIndexProvider, CargoRegistryClient};
 use crate::config::Config;
 use crate::go::{self, GoProxyClient, GoProxyProvider};
 use crate::malicious::{
-    HttpOsvDumpClient, MaliciousChecker, configured_malicious_checker, sync_malicious,
+    HttpOsvDumpClient, MaliciousChecker, configured_malicious_checker, sync_malicious, sync_osv,
 };
 use crate::npm::{NpmMetadataProvider, NpmRegistryClient};
 use crate::nuget::NugetClient;
@@ -164,7 +164,7 @@ pub async fn execute(cli: Cli) -> anyhow::Result<()> {
             let config = Config::load(&config)
                 .with_context(|| format!("config validation failed for {}", config.display()))?;
             let client = HttpOsvDumpClient::new();
-            let report = sync_malicious(&config.policy.osv.local, &client).await?;
+            let report = sync_osv(&config.policy.osv.local, &client).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }

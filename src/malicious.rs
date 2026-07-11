@@ -561,11 +561,9 @@ impl SqliteMaliciousChecker {
         artifact: &Artifact,
     ) -> Result<Vec<OsvFinding>, OsvError> {
         ensure_store_healthy(connection, artifact.ecosystem.osv_name(), self)?;
-        let hits = exact_hits(connection, artifact)?;
-        if !hits.is_empty() {
-            return Ok(hits);
-        }
-        range_hits(connection, artifact)
+        let mut hits = exact_hits(connection, artifact)?;
+        hits.extend(range_hits(connection, artifact)?);
+        consolidate_local_findings(hits)
     }
 
     fn check_many_with_connection(
@@ -597,27 +595,23 @@ impl SqliteMaliciousChecker {
         let mut results = vec![Vec::new(); artifacts.len()];
         for (_, indexes) in grouped {
             let artifact = &artifacts[indexes[0]];
-            let hits = exact_hits(connection, artifact)?;
-            if hits.is_empty() {
-                let range_key = (
-                    artifact.ecosystem.osv_name().to_string(),
-                    artifact.name.clone(),
-                    artifact.version.clone(),
-                );
-                let hits = if let Some(hits) = range_results.get(&range_key) {
-                    hits.clone()
-                } else {
-                    let hits = range_hits(connection, artifact)?;
-                    range_results.insert(range_key, hits.clone());
-                    hits
-                };
-                for index in indexes {
-                    results[index] = hits.clone();
-                }
+            let mut hits = exact_hits(connection, artifact)?;
+            let range_key = (
+                artifact.ecosystem.osv_name().to_string(),
+                artifact.name.clone(),
+                artifact.version.clone(),
+            );
+            let range_hits = if let Some(hits) = range_results.get(&range_key) {
+                hits.clone()
             } else {
-                for index in indexes {
-                    results[index] = hits.clone();
-                }
+                let hits = range_hits(connection, artifact)?;
+                range_results.insert(range_key, hits.clone());
+                hits
+            };
+            hits.extend(range_hits);
+            let hits = consolidate_local_findings(hits)?;
+            for index in indexes {
+                results[index] = hits.clone();
             }
         }
         Ok(results)
@@ -641,22 +635,21 @@ impl OsvChecker for SqliteMaliciousChecker {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MaliciousSyncReport {
-    pub ecosystems: Vec<MaliciousSyncEcosystemReport>,
+pub struct OsvSyncReport {
+    pub ecosystems: Vec<OsvSyncEcosystemReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MaliciousSyncEcosystemReport {
+pub struct OsvSyncEcosystemReport {
     pub ecosystem: String,
-    pub mode: MaliciousSyncMode,
+    pub mode: OsvSyncMode,
     pub imported: usize,
     pub withdrawn: usize,
-    pub skipped_non_malicious: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum MaliciousSyncMode {
+pub enum OsvSyncMode {
     Bootstrap,
     Incremental,
 }
@@ -701,10 +694,10 @@ impl OsvDumpClient for HttpOsvDumpClient {
     }
 }
 
-pub async fn sync_malicious(
+pub async fn sync_osv(
     config: &LocalOsvConfig,
     client: &dyn OsvDumpClient,
-) -> Result<MaliciousSyncReport, OsvError> {
+) -> Result<OsvSyncReport, OsvError> {
     SqliteMaliciousChecker::initialize(&config.sqlite_path)?;
     let mut connection = open_read_write_connection(&config.sqlite_path)?;
     let mut ecosystems = Vec::new();
@@ -725,7 +718,18 @@ pub async fn sync_malicious(
             .await?,
         );
     }
-    Ok(MaliciousSyncReport { ecosystems })
+    Ok(OsvSyncReport { ecosystems })
+}
+
+pub type MaliciousSyncReport = OsvSyncReport;
+pub type MaliciousSyncEcosystemReport = OsvSyncEcosystemReport;
+pub type MaliciousSyncMode = OsvSyncMode;
+
+pub async fn sync_malicious(
+    config: &LocalOsvConfig,
+    client: &dyn OsvDumpClient,
+) -> Result<OsvSyncReport, OsvError> {
+    sync_osv(config, client).await
 }
 
 async fn sync_ecosystem(
@@ -733,7 +737,7 @@ async fn sync_ecosystem(
     client: &dyn OsvDumpClient,
     ecosystem: Ecosystem,
     retain_raw_advisories: bool,
-) -> Result<MaliciousSyncEcosystemReport, OsvError> {
+) -> Result<OsvSyncEcosystemReport, OsvError> {
     let attempted_at = Utc::now();
     let state = sync_state(connection, ecosystem.osv_name())?;
     let result = if state
@@ -776,11 +780,33 @@ async fn sync_bootstrap(
     retain_raw_advisories: bool,
 ) -> Result<MaliciousSyncEcosystemReport, OsvError> {
     let bytes = client.fetch_bytes(&all_zip_url(ecosystem)).await?;
+    let modified_csv = client.fetch_bytes(&modified_id_csv_url(ecosystem)).await?;
+    let modified_rows = parse_modified_id_csv(&modified_csv, None)?;
+    let archive_modified = archive_modified_by_id(&bytes)?;
+    let mut catch_up = Vec::new();
+    for row in &modified_rows {
+        if archive_modified
+            .get(&row.osv_id)
+            .is_none_or(|modified| *modified < row.modified_at)
+        {
+            let advisory = client
+                .fetch_bytes(&advisory_json_url(ecosystem, &row.osv_id))
+                .await?;
+            catch_up.push(parse_osv_advisory_bytes(&advisory, retain_raw_advisories)?);
+        }
+    }
+    let high_watermark = modified_rows
+        .iter()
+        .map(|row| row.modified_at)
+        .max()
+        .map(serialize_high_watermark);
     let stats = import_zip_bootstrap_and_record_success(
         connection,
         ecosystem,
         &bytes,
+        &catch_up,
         attempted_at,
+        high_watermark,
         retain_raw_advisories,
     )?;
     Ok(MaliciousSyncEcosystemReport {
@@ -788,19 +814,46 @@ async fn sync_bootstrap(
         mode: MaliciousSyncMode::Bootstrap,
         imported: stats.imported,
         withdrawn: stats.withdrawn,
-        skipped_non_malicious: stats.skipped_non_malicious,
     })
+}
+
+fn archive_modified_by_id(bytes: &[u8]) -> Result<BTreeMap<String, DateTime<Utc>>, OsvError> {
+    let mut archive = ZipArchive::new(Cursor::new(bytes))
+        .map_err(|error| OsvError::Sync(format!("invalid OSV all.zip: {error}")))?;
+    let mut modified = BTreeMap::new();
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|error| OsvError::Sync(format!("invalid OSV zip entry: {error}")))?;
+        if !file.name().ends_with(".json") {
+            continue;
+        }
+        let mut raw = Vec::new();
+        file.read_to_end(&mut raw)
+            .map_err(|error| OsvError::Sync(format!("failed to read OSV zip entry: {error}")))?;
+        let advisory: OsvDumpAdvisory = serde_json::from_slice(&raw)
+            .map_err(|err| OsvError::Sync(format!("invalid OSV advisory JSON: {err}")))?;
+        let timestamp = advisory
+            .modified
+            .as_deref()
+            .map(parse_modified_timestamp)
+            .transpose()?
+            .unwrap_or(DateTime::<Utc>::MIN_UTC);
+        modified.insert(advisory.id, timestamp);
+    }
+    Ok(modified)
 }
 
 fn import_zip_bootstrap_and_record_success(
     connection: &mut Connection,
     ecosystem: Ecosystem,
     bytes: &[u8],
+    catch_up: &[OsvDumpAdvisory],
     imported_at: DateTime<Utc>,
+    high_watermark: Option<String>,
     retain_raw_advisories: bool,
 ) -> Result<ImportStats, OsvError> {
     let transaction = connection.transaction().map_err(sqlite_error)?;
-    let high_watermark = Some(serialize_high_watermark(imported_at));
     transaction
         .execute(
             "INSERT INTO dataset_generations
@@ -839,6 +892,15 @@ fn import_zip_bootstrap_and_record_success(
         totals.withdrawn += stats.withdrawn;
         totals.skipped_non_malicious += stats.skipped_non_malicious;
     }
+    let catch_up_stats = import_advisories(
+        &transaction,
+        generation_id,
+        ecosystem,
+        catch_up,
+        imported_at,
+    )?;
+    totals.imported += catch_up_stats.imported;
+    totals.withdrawn += catch_up_stats.withdrawn;
     transaction
         .execute(
             "UPDATE dataset_generations SET status='superseded'
@@ -869,7 +931,7 @@ async fn sync_incremental(
     ecosystem: Ecosystem,
     attempted_at: DateTime<Utc>,
     retain_raw_advisories: bool,
-) -> Result<MaliciousSyncEcosystemReport, OsvError> {
+) -> Result<OsvSyncEcosystemReport, OsvError> {
     let previous_high_watermark =
         sync_state(connection, ecosystem.osv_name())?.and_then(|state| state.high_watermark);
     let modified_csv = client.fetch_bytes(&modified_id_csv_url(ecosystem)).await?;
@@ -901,7 +963,6 @@ async fn sync_incremental(
         mode: MaliciousSyncMode::Incremental,
         imported: stats.imported,
         withdrawn: stats.withdrawn,
-        skipped_non_malicious: stats.skipped_non_malicious,
     })
 }
 
@@ -1210,7 +1271,12 @@ INSERT INTO osv_advisories (
                         None,
                     ),
                     Ok(None) => (None, None, None, None),
-                    Err(error) => (None, None, None, Some(error.to_string())),
+                    Err(error) => (
+                        None,
+                        None,
+                        None,
+                        Some(OsvError::Severity(error).to_string()),
+                    ),
                 }
             };
         transaction
@@ -1285,7 +1351,8 @@ fn sync_state(connection: &Connection, ecosystem: &str) -> Result<Option<SyncSta
         .query_row(
             "SELECT s.high_watermark, s.last_success_at, g.dataset_version
              FROM sync_state s
-             LEFT JOIN dataset_generations g ON g.id=s.active_generation_id
+             JOIN dataset_generations g ON g.id=s.active_generation_id
+               AND g.ecosystem=s.ecosystem AND g.status='active'
              WHERE s.ecosystem = ?1",
             [ecosystem],
             |row| {
@@ -1676,7 +1743,8 @@ fn ensure_store_healthy(
         .query_row(
             "SELECT s.last_success_at, s.status, g.dataset_version
              FROM sync_state s
-             LEFT JOIN dataset_generations g ON g.id=s.active_generation_id
+             JOIN dataset_generations g ON g.id=s.active_generation_id
+               AND g.ecosystem=s.ecosystem AND g.status='active'
              WHERE s.ecosystem = ?1",
             [ecosystem],
             |row| {
@@ -1736,7 +1804,8 @@ FROM sync_state s
 JOIN osv_affected_packages ap ON ap.generation_id = s.active_generation_id
 JOIN osv_affected_versions av ON av.affected_package_id = ap.id
 JOIN osv_advisories a ON a.generation_id = ap.generation_id AND a.osv_id = ap.osv_id
-WHERE ap.ecosystem = ?1
+WHERE s.ecosystem = ?1
+  AND ap.ecosystem = ?1
   AND ap.name = ?2
   AND av.version = ?3
   AND a.withdrawn IS NULL
@@ -1849,7 +1918,8 @@ FROM sync_state s
 JOIN osv_affected_packages ap ON ap.generation_id = s.active_generation_id
 JOIN osv_affected_ranges ar ON ar.affected_package_id = ap.id
 JOIN osv_advisories a ON a.generation_id = ap.generation_id AND a.osv_id = ap.osv_id
-WHERE ap.ecosystem = ?1
+WHERE s.ecosystem = ?1
+  AND ap.ecosystem = ?1
   AND ap.name = ?2
   AND a.withdrawn IS NULL
 ORDER BY a.osv_id, ar.id
@@ -3010,6 +3080,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_checker_rejects_wrong_or_superseded_generation_pointer() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        connection
+            .execute(
+                "INSERT INTO dataset_generations (ecosystem,dataset_version,status,staged_at,activated_at) VALUES ('PyPI',1,'active',?1,?1)",
+                [Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        let wrong = connection.last_insert_rowid();
+        connection
+            .execute(
+                "UPDATE sync_state SET active_generation_id=?1 WHERE ecosystem='npm'",
+                [wrong],
+            )
+            .unwrap();
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None);
+        let err = checker_for(&db).check(&artifact).await.unwrap_err();
+        assert!(err.to_string().contains("missing sync_state"));
+
+        connection
+            .execute(
+                "UPDATE dataset_generations SET status='superseded' WHERE id=?1",
+                [wrong],
+            )
+            .unwrap();
+        let err = checker_for(&db).check(&artifact).await.unwrap_err();
+        assert!(err.to_string().contains("missing sync_state"));
+    }
+
+    #[tokio::test]
     async fn configured_checker_uses_sqlite_for_local_source() {
         let dir = tempdir().unwrap();
         let db = initialized_db(dir.path());
@@ -3077,6 +3180,63 @@ mod tests {
         assert_eq!(results[2][0].osv_id, "MAL-2026-000001");
         assert_eq!(results[3], results[2]);
         assert_eq!(results[4], results[1]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_checker_unions_exact_and_range_advisories_with_batch_parity() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_exact_advisory(
+            &connection,
+            "GHSA-exact",
+            "npm",
+            "demo",
+            "1.2.3",
+            Some("exact"),
+        );
+        insert_range_advisory_with_events(
+            &connection,
+            "GHSA-range",
+            "npm",
+            "demo",
+            "SEMVER",
+            &[("introduced", "1.0.0"), ("fixed", "2.0.0")],
+        );
+        connection
+            .execute(
+                "UPDATE osv_affected_packages SET severity_type='CVSS_V3',severity_vector='CVSS:3.1/exact',severity_score=4.0 WHERE osv_id='GHSA-exact'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE osv_affected_packages SET severity_type='CVSS_V3',severity_vector='CVSS:3.1/range',severity_score=9.8 WHERE osv_id='GHSA-range'",
+                [],
+            )
+            .unwrap();
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None);
+        let checker = checker_for(&db);
+
+        let direct = checker.check(&artifact).await.unwrap();
+        let batch = checker
+            .check_many(std::slice::from_ref(&artifact))
+            .await
+            .unwrap();
+
+        assert_eq!(batch[0], direct);
+        assert_eq!(
+            direct
+                .iter()
+                .map(|hit| hit.osv_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["GHSA-exact", "GHSA-range"]
+        );
+        assert_eq!(
+            direct[1].effective_severity.as_ref().unwrap().base_score,
+            9.8
+        );
     }
 
     #[tokio::test]
@@ -3383,7 +3543,6 @@ INSERT INTO advisories (
 
         assert_eq!(report.ecosystems[0].mode, MaliciousSyncMode::Bootstrap);
         assert_eq!(report.ecosystems[0].imported, 2);
-        assert_eq!(report.ecosystems[0].skipped_non_malicious, 0);
         let checker = checker_for(&db);
         let exact_hits = checker
             .check(&Artifact::package(
@@ -3435,6 +3594,184 @@ INSERT INTO advisories (
             .collect::<Result<Vec<_>,_>>()
             .unwrap();
         assert_eq!(statuses.last(), Some(&(1, "active".to_string())));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_catches_up_archive_lag_before_activation() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("catch-up.sqlite");
+        let config = local_config_for(&db);
+        let caught_up = advisory_json(
+            "GHSA-catch-up",
+            "npm",
+            "demo",
+            &["1.2.3"],
+            r#""ranges":[]"#,
+            None,
+        );
+        let client = FixtureDumpClient::new([
+            (all_zip_url(Ecosystem::Npm), zip_bytes([])),
+            (all_zip_url(Ecosystem::Pypi), zip_bytes([])),
+            (all_zip_url(Ecosystem::CratesIo), zip_bytes([])),
+            (
+                modified_id_csv_url(Ecosystem::Npm),
+                b"2026-07-02T00:00:00Z,GHSA-catch-up\n".to_vec(),
+            ),
+            (
+                advisory_json_url(Ecosystem::Npm, "GHSA-catch-up"),
+                caught_up,
+            ),
+        ]);
+
+        sync_osv(&config, &client).await.unwrap();
+
+        let hits = checker_for(&db)
+            .check(&Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None))
+            .await
+            .unwrap();
+        assert_eq!(hits[0].osv_id, "GHSA-catch-up");
+        let connection = Connection::open(&db).unwrap();
+        let watermark: String = connection
+            .query_row(
+                "SELECT high_watermark FROM sync_state WHERE ecosystem='npm'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(watermark, "2026-07-02T00:00:00.000000000Z");
+    }
+
+    #[tokio::test]
+    async fn local_import_matches_live_severity_for_repeated_unscored_and_malformed_records() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("parity.sqlite");
+        let config = local_config_for(&db);
+        let scored = br#"{
+          "id":"GHSA-scored","modified":"2026-07-02T00:00:00Z",
+          "severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:H/PR:H/UI:R/S:U/C:L/I:L/A:L"}],
+          "affected":[
+            {"package":{"ecosystem":"npm","name":"demo"},"versions":["1.2.3"],"severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]},
+            {"package":{"ecosystem":"npm","name":"demo"},"ranges":[{"type":"SEMVER","events":[{"introduced":"1.0.0"},{"fixed":"2.0.0"}]}]}
+          ]
+        }"#;
+        let unscored = br#"{"id":"GHSA-unscored","modified":"2026-07-02T00:00:00Z","affected":[{"package":{"ecosystem":"npm","name":"demo"},"versions":["1.2.3"]}]}"#;
+        let malformed = br#"{"id":"GHSA-malformed","modified":"2026-07-02T00:00:00Z","severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:BROKEN"}],"affected":[{"package":{"ecosystem":"npm","name":"demo"},"versions":["1.2.3"]}]}"#;
+        let client = FixtureDumpClient::new([
+            (
+                all_zip_url(Ecosystem::Npm),
+                zip_bytes([
+                    ("scored.json", scored.as_slice()),
+                    ("unscored.json", unscored.as_slice()),
+                    ("malformed.json", malformed.as_slice()),
+                ]),
+            ),
+            (all_zip_url(Ecosystem::Pypi), zip_bytes([])),
+            (all_zip_url(Ecosystem::CratesIo), zip_bytes([])),
+        ]);
+        sync_osv(&config, &client).await.unwrap();
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None);
+        let local = checker_for(&db).check(&artifact).await.unwrap();
+
+        for raw in [scored.as_slice(), unscored.as_slice(), malformed.as_slice()] {
+            let vulnerability: OsvVulnerability = serde_json::from_slice(raw).unwrap();
+            let expected = match finding_from_vulnerability(vulnerability.clone(), &artifact) {
+                Ok(Some(finding)) => finding,
+                Err(error) => error_finding(vulnerability.id, error.to_string()),
+                Ok(None) => unreachable!(),
+            };
+            let actual = local
+                .iter()
+                .find(|finding| finding.osv_id == expected.osv_id)
+                .unwrap();
+            assert_eq!(actual.effective_severity, expected.effective_severity);
+            assert_eq!(actual.evaluation_error, expected.evaluation_error);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_bootstrap_rolls_back_and_successful_bootstrap_swaps_generations() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let mut connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_exact_advisory(&connection, "MAL-old", "npm", "demo", "1.0.0", None);
+        let old_generation = active_generation_id(&connection, "npm");
+        let malformed = zip_bytes([
+            (
+                "valid.json",
+                advisory_json(
+                    "GHSA-new",
+                    "npm",
+                    "demo",
+                    &["2.0.0"],
+                    r#""ranges":[]"#,
+                    None,
+                )
+                .as_slice(),
+            ),
+            ("broken.json", b"{".as_slice()),
+        ]);
+        let now = Utc::now();
+
+        assert!(
+            import_zip_bootstrap_and_record_success(
+                &mut connection,
+                Ecosystem::Npm,
+                &malformed,
+                &[],
+                now,
+                Some("2026-07-02T00:00:00.000000000Z".to_string()),
+                false,
+            )
+            .is_err()
+        );
+        assert_eq!(active_generation_id(&connection, "npm"), old_generation);
+        let staging: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM dataset_generations WHERE status='staging'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(staging, 0);
+        let old_hits = checker_for(&db)
+            .check(&Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None))
+            .await
+            .unwrap();
+        assert_eq!(old_hits[0].osv_id, "MAL-old");
+
+        let replacement = advisory_json(
+            "GHSA-new",
+            "npm",
+            "demo",
+            &["2.0.0"],
+            r#""ranges":[]"#,
+            None,
+        );
+        import_zip_bootstrap_and_record_success(
+            &mut connection,
+            Ecosystem::Npm,
+            &zip_bytes([("new.json", replacement.as_slice())]),
+            &[],
+            now,
+            Some("2026-07-02T00:00:00.000000000Z".to_string()),
+            false,
+        )
+        .unwrap();
+        assert_ne!(active_generation_id(&connection, "npm"), old_generation);
+        let old_status: String = connection
+            .query_row(
+                "SELECT status FROM dataset_generations WHERE id=?1",
+                [old_generation],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_status, "superseded");
+        let new_hits = checker_for(&db)
+            .check(&Artifact::package(Ecosystem::Npm, "demo", "2.0.0", None))
+            .await
+            .unwrap();
+        assert_eq!(new_hits[0].osv_id, "GHSA-new");
     }
 
     #[tokio::test]
@@ -3634,13 +3971,16 @@ INSERT INTO advisories (
             r#""ranges":[]"#,
             None,
         );
-        let client = FixtureDumpClient::new([
+        let bootstrap_client = FixtureDumpClient::new([
             (
                 all_zip_url(Ecosystem::Npm),
                 zip_bytes([("MAL-2026-000001.json", active.as_slice())]),
             ),
             (all_zip_url(Ecosystem::Pypi), zip_bytes([])),
             (all_zip_url(Ecosystem::CratesIo), zip_bytes([])),
+        ]);
+        sync_malicious(&config, &bootstrap_client).await.unwrap();
+        let client = FixtureDumpClient::new([
             (
                 modified_id_csv_url(Ecosystem::Npm),
                 b"2099-01-01T00:00:00Z,MAL-2026-999999\n".to_vec(),
@@ -3648,8 +3988,6 @@ INSERT INTO advisories (
             (modified_id_csv_url(Ecosystem::Pypi), Vec::new()),
             (modified_id_csv_url(Ecosystem::CratesIo), Vec::new()),
         ]);
-        sync_malicious(&config, &client).await.unwrap();
-
         let err = sync_malicious(&config, &client).await.unwrap_err();
 
         assert!(err.to_string().contains("missing fixture response"));
@@ -3704,6 +4042,9 @@ INSERT INTO advisories (
         async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, OsvError> {
             if let Some(response) = self.responses.get(url) {
                 return Ok(response.clone());
+            }
+            if url.ends_with("/modified_id.csv") {
+                return Ok(Vec::new());
             }
             // Go was added after the existing npm/PyPI fixtures. Empty Go
             // snapshots keep those fixtures focused while exercising its

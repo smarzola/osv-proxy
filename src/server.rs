@@ -3,8 +3,7 @@ use crate::cargo::{self, CargoRegistryClient};
 use crate::config::{Config, LocalOsvConfig, OsvSource};
 use crate::go::{self, GoProxyClient};
 use crate::malicious::{
-    HttpOsvDumpClient, MaliciousChecker, OsvDumpClient, configured_malicious_checker,
-    sync_malicious,
+    HttpOsvDumpClient, MaliciousChecker, OsvDumpClient, configured_malicious_checker, sync_osv,
 };
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
 use crate::nuget::{self, NugetClient};
@@ -30,7 +29,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 }
 
 pub async fn serve_listener(listener: TcpListener, config: Config) -> anyhow::Result<()> {
-    let _background_sync = start_background_malicious_sync_if_enabled(&config);
+    let _background_sync = start_background_osv_sync_if_enabled(&config);
     axum::serve(listener, router(config)).await?;
     Ok(())
 }
@@ -58,28 +57,28 @@ impl Drop for BackgroundSyncTask {
     }
 }
 
-fn start_background_malicious_sync_if_enabled(config: &Config) -> Option<BackgroundSyncTask> {
+fn start_background_osv_sync_if_enabled(config: &Config) -> Option<BackgroundSyncTask> {
     if config.policy.osv.source != OsvSource::Local || !config.policy.osv.local.background_sync {
         return None;
     }
-    Some(spawn_background_malicious_sync(
+    Some(spawn_background_osv_sync(
         config.policy.osv.local.clone(),
         Arc::new(HttpOsvDumpClient::new()),
     ))
 }
 
-fn spawn_background_malicious_sync(
+fn spawn_background_osv_sync(
     local_config: LocalOsvConfig,
     client: Arc<dyn OsvDumpClient>,
 ) -> BackgroundSyncTask {
     let handle = tokio::spawn(async move {
         loop {
-            match sync_malicious(&local_config, client.as_ref()).await {
+            match sync_osv(&local_config, client.as_ref()).await {
                 Ok(report) => println!(
-                    "local malicious background sync completed for {} ecosystems",
+                    "local OSV background sync completed for {} ecosystems",
                     report.ecosystems.len()
                 ),
-                Err(err) => eprintln!("local malicious background sync failed: {err}"),
+                Err(err) => eprintln!("local OSV background sync failed: {err}"),
             }
             tokio::time::sleep(local_config.sync_interval).await;
         }
@@ -900,6 +899,9 @@ mod tests {
     #[async_trait]
     impl OsvDumpClient for FixtureDumpClient {
         async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, MaliciousError> {
+            if url.ends_with("/modified_id.csv") && !self.responses.contains_key(url) {
+                return Ok(Vec::new());
+            }
             self.responses
                 .get(url)
                 .cloned()
@@ -1553,7 +1555,7 @@ mod tests {
             ..LocalOsvConfig::default()
         };
 
-        let _task = spawn_background_malicious_sync(local_config.clone(), Arc::new(client));
+        let _task = spawn_background_osv_sync(local_config.clone(), Arc::new(client));
 
         wait_for_sync_status(&db, "PyPI", "healthy").await;
         let checker = SqliteMaliciousChecker::new(&local_config);
@@ -1576,7 +1578,7 @@ mod tests {
             ..LocalOsvConfig::default()
         };
 
-        let _task = spawn_background_malicious_sync(local_config, Arc::new(client));
+        let _task = spawn_background_osv_sync(local_config, Arc::new(client));
 
         wait_for_sync_status(&db, "npm", "failed").await;
         let connection = Connection::open(&db).unwrap();
