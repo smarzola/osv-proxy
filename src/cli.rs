@@ -5,6 +5,7 @@ use crate::go::{self, GoProxyClient, GoProxyProvider};
 use crate::malicious::{
     HttpOsvDumpClient, MaliciousChecker, configured_malicious_checker, sync_malicious, sync_osv,
 };
+use crate::maven::{MavenMetadataProvider, MavenRepositoryClient};
 use crate::npm::{NpmMetadataProvider, NpmRegistryClient};
 use crate::nuget::NugetClient;
 use crate::policy::{Decision, PolicyEngine};
@@ -195,16 +196,21 @@ async fn registry_check(
     pypi_upstream: &dyn PypiSimpleProvider,
 ) -> anyhow::Result<CheckOutput> {
     let cargo_upstream = CargoRegistryClient::new(config);
-    registry_check_with_upstreams(
-        config,
-        package,
-        now,
-        checker,
-        npm_upstream,
-        pypi_upstream,
-        &cargo_upstream,
-    )
-    .await
+    let maven_upstream = MavenRepositoryClient::new(&config.upstreams.maven.repository_url);
+    let upstreams = RegistryCheckUpstreams {
+        npm: npm_upstream,
+        pypi: pypi_upstream,
+        cargo: &cargo_upstream,
+        maven: &maven_upstream,
+    };
+    registry_check_with_upstreams(config, package, now, checker, &upstreams).await
+}
+
+struct RegistryCheckUpstreams<'a> {
+    npm: &'a dyn NpmMetadataProvider,
+    pypi: &'a dyn PypiSimpleProvider,
+    cargo: &'a dyn CargoIndexProvider,
+    maven: &'a dyn MavenMetadataProvider,
 }
 
 async fn registry_check_with_upstreams(
@@ -212,17 +218,15 @@ async fn registry_check_with_upstreams(
     package: &str,
     now: DateTime<Utc>,
     checker: &dyn MaliciousChecker,
-    npm_upstream: &dyn NpmMetadataProvider,
-    pypi_upstream: &dyn PypiSimpleProvider,
-    cargo_upstream: &dyn CargoIndexProvider,
+    upstreams: &RegistryCheckUpstreams<'_>,
 ) -> anyhow::Result<CheckOutput> {
     let identity = parse_package_identity(package)?;
     let artifacts = match identity.ecosystem {
         Ecosystem::Npm => vec![
-            crate::npm::lookup_artifact(npm_upstream, &identity.name, &identity.version).await?,
+            crate::npm::lookup_artifact(upstreams.npm, &identity.name, &identity.version).await?,
         ],
         Ecosystem::Pypi => {
-            crate::pypi::lookup_artifacts(config, pypi_upstream, &identity.name, &identity.version)
+            crate::pypi::lookup_artifacts(config, upstreams.pypi, &identity.name, &identity.version)
                 .await?
         }
         Ecosystem::Go => {
@@ -235,7 +239,7 @@ async fn registry_check_with_upstreams(
         Ecosystem::CratesIo => vec![
             crate::cargo::lookup_artifact(
                 config,
-                cargo_upstream,
+                upstreams.cargo,
                 &identity.name,
                 &identity.version,
             )
@@ -253,6 +257,10 @@ async fn registry_check_with_upstreams(
             let upstream = RubyGemsClient::new(&config.upstreams.rubygems.registry_url);
             crate::rubygems::lookup_artifacts(&upstream, &identity.name, &identity.version).await?
         }
+        Ecosystem::Maven => vec![
+            crate::maven::lookup_artifact(upstreams.maven, &identity.name, &identity.version)
+                .await?,
+        ],
     };
     let artifacts = evaluate_artifacts(config, artifacts, now, checker).await;
     Ok(CheckOutput {
@@ -290,7 +298,7 @@ fn synthetic_eval_output(artifact: Artifact, decision: Decision) -> CheckOutput 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AllowlistEntry, BlocklistEntry};
+    use crate::config::{AllowlistEntry, BlocklistEntry, MissingPublishTime};
     use crate::policy::DecisionReason;
     use async_trait::async_trait;
     use clap::Parser;
@@ -438,6 +446,22 @@ mod tests {
 
     struct StaticPypi {
         projects: HashMap<String, crate::pypi::SimpleProject>,
+    }
+
+    struct StaticMaven {
+        metadata: crate::maven::MavenPomMetadata,
+    }
+
+    #[async_trait]
+    impl MavenMetadataProvider for StaticMaven {
+        async fn fetch_pom(
+            &self,
+            _group_id: &str,
+            _artifact_id: &str,
+            _version: &str,
+        ) -> Result<crate::maven::MavenPomMetadata, crate::maven::MavenError> {
+            Ok(self.metadata.clone())
+        }
     }
 
     #[async_trait]
@@ -604,6 +628,101 @@ mod tests {
             )
         );
         assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn registry_check_uses_maven_pom_metadata() {
+        let config = Config::default();
+        let cargo = CargoRegistryClient::new(&config);
+        let maven = StaticMaven {
+            metadata: crate::maven::MavenPomMetadata {
+                body: r#"<project><groupId>com.acme</groupId><artifactId>demo</artifactId><version>1.2.3</version></project>"#.to_string(),
+                last_modified: Some("Sun, 01 Jun 2025 00:00:00 GMT".to_string()),
+                sha256: None,
+                upstream_url: "https://repo.example/com/acme/demo/1.2.3/demo-1.2.3.pom"
+                    .to_string(),
+            },
+        };
+        let upstreams = RegistryCheckUpstreams {
+            npm: &empty_npm(),
+            pypi: &empty_pypi(),
+            cargo: &cargo,
+            maven: &maven,
+        };
+        let output = registry_check_with_upstreams(
+            &config,
+            "maven:com.acme:demo@1.2.3",
+            fixed_now(),
+            &CleanChecker {
+                calls: AtomicU32::new(0),
+            },
+            &upstreams,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.package, "maven:com.acme:demo@1.2.3");
+        assert!(output.allowed);
+        assert_eq!(
+            output.artifacts[0].artifact.published_at,
+            Some(timestamp("2025-06-01T00:00:00Z"))
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_check_applies_missing_time_policy_to_malformed_maven_header() {
+        let mut config = Config::default();
+        let cargo = CargoRegistryClient::new(&config);
+        let maven = StaticMaven {
+            metadata: crate::maven::MavenPomMetadata {
+                body: r#"<project><groupId>com.acme</groupId><artifactId>demo</artifactId><version>1.2.3</version></project>"#.to_string(),
+                last_modified: Some("not-an-http-date".to_string()),
+                sha256: None,
+                upstream_url: "https://repo.example/demo.pom".to_string(),
+            },
+        };
+        let checker = CleanChecker {
+            calls: AtomicU32::new(0),
+        };
+        let upstreams = RegistryCheckUpstreams {
+            npm: &empty_npm(),
+            pypi: &empty_pypi(),
+            cargo: &cargo,
+            maven: &maven,
+        };
+        let blocked = registry_check_with_upstreams(
+            &config,
+            "maven:com.acme:demo@1.2.3",
+            fixed_now(),
+            &checker,
+            &upstreams,
+        )
+        .await
+        .unwrap();
+        assert!(!blocked.allowed);
+        assert_eq!(
+            blocked.artifacts[0].decision.reason,
+            DecisionReason::MissingPublishTime
+        );
+
+        config.policy.missing_publish_time = MissingPublishTime::Allow;
+        let cargo = CargoRegistryClient::new(&config);
+        let upstreams = RegistryCheckUpstreams {
+            npm: &empty_npm(),
+            pypi: &empty_pypi(),
+            cargo: &cargo,
+            maven: &maven,
+        };
+        let allowed = registry_check_with_upstreams(
+            &config,
+            "maven:com.acme:demo@1.2.3",
+            fixed_now(),
+            &checker,
+            &upstreams,
+        )
+        .await
+        .unwrap();
+        assert!(allowed.allowed);
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ pub enum Ecosystem {
     Nuget,
     #[serde(rename = "rubygems")]
     RubyGems,
+    Maven,
 }
 
 impl Ecosystem {
@@ -26,6 +27,7 @@ impl Ecosystem {
             Ecosystem::CratesIo => normalize_cargo_name(name),
             Ecosystem::Nuget => normalize_nuget_name(name),
             Ecosystem::RubyGems => name.to_string(),
+            Ecosystem::Maven => name.to_string(),
         }
     }
 
@@ -37,6 +39,7 @@ impl Ecosystem {
             Ecosystem::CratesIo => "crates.io",
             Ecosystem::Nuget => "NuGet",
             Ecosystem::RubyGems => "RubyGems",
+            Ecosystem::Maven => "Maven",
         }
     }
 }
@@ -50,6 +53,7 @@ impl fmt::Display for Ecosystem {
             Ecosystem::CratesIo => write!(f, "crates.io"),
             Ecosystem::Nuget => write!(f, "nuget"),
             Ecosystem::RubyGems => write!(f, "rubygems"),
+            Ecosystem::Maven => write!(f, "maven"),
         }
     }
 }
@@ -65,6 +69,7 @@ impl FromStr for Ecosystem {
             "crates.io" | "cargo" | "crates-io" => Ok(Ecosystem::CratesIo),
             "nuget" | "nuget.org" | "dotnet" => Ok(Ecosystem::Nuget),
             "rubygems" | "rubygem" | "ruby" | "gem" => Ok(Ecosystem::RubyGems),
+            "maven" | "java" => Ok(Ecosystem::Maven),
             other => Err(ArtifactParseError::UnsupportedEcosystem(other.to_string())),
         }
     }
@@ -304,6 +309,20 @@ mod tests {
             assert_eq!(parsed.ecosystem, Ecosystem::RubyGems);
             assert_eq!(parsed.name, "rails");
             assert_eq!(parsed.version, "8.0.2");
+        }
+    }
+
+    #[test]
+    fn parses_maven_identity_and_java_alias() {
+        for identity in [
+            "maven:com.google.guava:guava@33.4.8-jre",
+            "java:com.google.guava:guava@33.4.8-jre",
+        ] {
+            let parsed = parse_package_identity(identity).unwrap();
+            assert_eq!(parsed.ecosystem, Ecosystem::Maven);
+            assert_eq!(parsed.name, "com.google.guava:guava");
+            assert_eq!(parsed.version, "33.4.8-jre");
+            assert_eq!(parsed.identity(), "maven:com.google.guava:guava@33.4.8-jre");
         }
     }
 

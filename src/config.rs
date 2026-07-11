@@ -95,6 +95,7 @@ pub struct UpstreamsConfig {
     pub cargo: CargoUpstreamConfig,
     pub nuget: NugetUpstreamConfig,
     pub rubygems: RubyGemsUpstreamConfig,
+    pub maven: MavenUpstreamConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +179,20 @@ impl Default for RubyGemsUpstreamConfig {
     fn default() -> Self {
         Self {
             registry_url: "https://rubygems.org".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MavenUpstreamConfig {
+    pub repository_url: String,
+}
+
+impl Default for MavenUpstreamConfig {
+    fn default() -> Self {
+        Self {
+            repository_url: "https://repo.maven.apache.org/maven2".to_string(),
         }
     }
 }
@@ -471,6 +486,10 @@ mod tests {
             Duration::from_secs(6 * 60 * 60)
         );
         assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
+        assert_eq!(
+            config.upstreams.maven.repository_url,
+            "https://repo.maven.apache.org/maven2"
+        );
         config.validate().unwrap();
     }
 

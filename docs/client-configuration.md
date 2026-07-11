@@ -76,3 +76,42 @@ additional public source when the proxy is a mandatory policy gate. Support is
 limited to modern Bundler Compact Index restore; legacy RubyGems Marshal
 indexes, standalone `gem install`, search, publishing, yanking, authentication,
 and private registry hosting are unsupported.
+
+## Java / Maven
+
+Configure a mirror in Maven `settings.xml`:
+
+```xml
+<mirrors>
+  <mirror>
+    <id>osv-proxy</id>
+    <url>http://127.0.0.1:8080/maven/</url>
+    <mirrorOf>*</mirrorOf>
+  </mirror>
+</mirrors>
+```
+
+`mirrorOf` must cover every repository when the proxy is a mandatory gate.
+Maven can otherwise resolve through repositories declared by projects or
+plugins. Existing files in the local Maven cache are not revalidated; use a
+clean repository or force refresh when testing a new denial.
+
+## Java / Gradle
+
+Use the proxy as the sole Maven repository and centralize repository policy in
+`settings.gradle`:
+
+```groovy
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories { maven { url = uri("http://127.0.0.1:8080/maven/") } }
+}
+```
+
+Do not also declare Maven Central or another public repository: Gradle can fall
+back to it after a miss. Existing Gradle cache entries cannot be revoked by the
+proxy, so refresh or isolate the cache when validating policy changes.
+
+Maven support is read-only and release-only. Snapshots, private-repository
+authentication, publishing, search, and multi-repository aggregation are not
+supported.

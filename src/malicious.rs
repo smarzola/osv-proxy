@@ -708,6 +708,7 @@ pub async fn sync_osv(
         Ecosystem::CratesIo,
         Ecosystem::Nuget,
         Ecosystem::RubyGems,
+        Ecosystem::Maven,
     ] {
         ecosystems.push(
             sync_ecosystem(
@@ -2050,6 +2051,10 @@ fn range_matches_artifact(range: &StoredRange, artifact: &Artifact) -> Result<bo
             crate::rubygems::compare_versions(&artifact.version, boundary)
                 .map_err(|err| range_error(artifact, err.to_string()))
         }),
+        ("Maven", "ECOSYSTEM") => evaluate_range_events(range, artifact, |boundary| {
+            crate::maven::compare_versions(&artifact.version, boundary)
+                .map_err(|err| range_error(artifact, err.to_string()))
+        }),
         (_, range_type) => Err(range_error(
             artifact,
             format!(
@@ -2922,6 +2927,7 @@ mod tests {
         assert_eq!(pypi.ecosystem.osv_name(), "PyPI");
         assert_eq!(pypi.name, "requests");
         assert_eq!(Ecosystem::RubyGems.osv_name(), "RubyGems");
+        assert_eq!(Ecosystem::Maven.osv_name(), "Maven");
     }
 
     #[test]
@@ -3502,6 +3508,49 @@ INSERT INTO advisories (
                     Ecosystem::RubyGems,
                     "demo",
                     "1.0.0",
+                    None,
+                ))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_checker_handles_maven_ecosystem_ranges() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "Maven");
+        insert_range_advisory_with_events(
+            &connection,
+            "GHSA-maven-range",
+            "Maven",
+            "com.acme:demo",
+            "ECOSYSTEM",
+            &[("introduced", "1.0-rc1"), ("fixed", "1.0")],
+        );
+        let checker = checker_for(&db);
+
+        assert_eq!(
+            checker
+                .check(&Artifact::package(
+                    Ecosystem::Maven,
+                    "com.acme:demo",
+                    "1.0-rc2",
+                    None,
+                ))
+                .await
+                .unwrap()[0]
+                .osv_id,
+            "GHSA-maven-range"
+        );
+        assert!(
+            checker
+                .check(&Artifact::package(
+                    Ecosystem::Maven,
+                    "com.acme:demo",
+                    "1.0",
                     None,
                 ))
                 .await
@@ -4114,6 +4163,12 @@ INSERT INTO advisories (
                 return Ok(zip_bytes([]));
             }
             if url.contains("/RubyGems/modified_id.csv") {
+                return Ok(Vec::new());
+            }
+            if url.contains("/Maven/all.zip") {
+                return Ok(zip_bytes([]));
+            }
+            if url.contains("/Maven/modified_id.csv") {
                 return Ok(Vec::new());
             }
             Err(OsvError::Sync(format!(

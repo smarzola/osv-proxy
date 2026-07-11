@@ -12,6 +12,7 @@ server/router
   Cargo sparse index + crate routes
   Go list/info/mod/zip routes
   NuGet service/registration/flat-container/package routes
+  Maven metadata + artifact routes
         |
         v
 ecosystem adapters -> canonical Artifact
@@ -38,7 +39,7 @@ artifact delivery
 
 All adapters normalize registry data into `Artifact { ecosystem, name,
 version, filename, upstream_url, published_at, hashes }`. Supported ecosystems
-are npm, PyPI, crates.io, Go, and NuGet. Package names and versions are
+are npm, PyPI, crates.io, Go, NuGet, RubyGems, and Maven. Package names and versions are
 normalized according to their registry before policy evaluation.
 
 Metadata filtering evaluates batches of canonical artifacts. Retained download

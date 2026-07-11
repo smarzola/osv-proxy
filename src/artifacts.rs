@@ -78,6 +78,39 @@ impl ArtifactDeliveryClient {
         }
     }
 
+    pub async fn deliver_head(
+        &self,
+        config: &Config,
+        upstream_url: String,
+        request_headers: Option<&HeaderMap>,
+    ) -> Result<ArtifactDeliveryResponse, ArtifactDeliveryError> {
+        match config.artifacts.behavior {
+            ArtifactBehavior::Redirect => Ok(ArtifactDeliveryResponse::Buffered(
+                RegistryResponse::redirect(upstream_url),
+            )),
+            ArtifactBehavior::Proxy => {
+                let mut request = self.client.head(upstream_url);
+                if let Some(headers) = request_headers {
+                    for name in FORWARDED_REQUEST_HEADERS {
+                        if let Some(value) = headers.get(*name) {
+                            request = request.header(*name, value.clone());
+                        }
+                    }
+                }
+                let response = request.send().await?;
+                if response.status().is_client_error() || response.status().is_server_error() {
+                    return Err(ArtifactDeliveryError::UpstreamStatus(
+                        response.status().as_u16(),
+                    ));
+                }
+                Ok(ArtifactDeliveryResponse::Streaming(response))
+            }
+            ArtifactBehavior::ProxyCacheS3 => Err(ArtifactDeliveryError::Unsupported(
+                "artifacts.behavior=proxy_cache_s3 is not supported yet".to_string(),
+            )),
+        }
+    }
+
     pub async fn deliver_registry_response(
         &self,
         config: &Config,
@@ -101,6 +134,7 @@ impl Default for ArtifactDeliveryClient {
 pub struct ArtifactDeliveryOptions<'a> {
     pub client: &'a ArtifactDeliveryClient,
     pub request_headers: Option<&'a HeaderMap>,
+    pub head: bool,
 }
 
 impl<'a> ArtifactDeliveryOptions<'a> {
@@ -108,6 +142,7 @@ impl<'a> ArtifactDeliveryOptions<'a> {
         Self {
             client,
             request_headers: None,
+            head: false,
         }
     }
 
@@ -118,6 +153,18 @@ impl<'a> ArtifactDeliveryOptions<'a> {
         Self {
             client,
             request_headers: Some(request_headers),
+            head: false,
+        }
+    }
+
+    pub fn with_request_headers_for_head(
+        client: &'a ArtifactDeliveryClient,
+        request_headers: &'a HeaderMap,
+    ) -> Self {
+        Self {
+            client,
+            request_headers: Some(request_headers),
+            head: true,
         }
     }
 }

@@ -25,6 +25,305 @@ const RUBYGEMS_ROOT: &str = "osv-proxy-e2e-ruby";
 const RUBYGEMS_DEPENDENCY: &str = "osv-proxy-e2e-ruby-dependency";
 const RUBYGEMS_PLATFORM: &str = "osv-proxy-e2e-ruby-platform";
 const RUBYGEMS_PRERELEASE: &str = "osv-proxy-e2e-ruby-prerelease";
+const MAVEN_GROUP: &str = "com.acme";
+const MAVEN_ROOT: &str = "osv-proxy-e2e-maven";
+const MAVEN_BOM: &str = "osv-proxy-e2e-maven-bom";
+const MAVEN_DEPENDENCY: &str = "osv-proxy-e2e-maven-dependency";
+const MAVEN_GRADLE_DEPENDENCY: &str = "osv-proxy-e2e-gradle-dependency";
+
+#[test]
+fn maven_resolves_redirect_proxy_dynamic_and_pinned_denials() {
+    require_command("java");
+    require_command("mvn");
+    let workspace = TempWorkspace::new("maven-resolver-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+
+    for behavior in [ArtifactBehavior::Redirect, ArtifactBehavior::Proxy] {
+        let proxy = start_axum_proxy(maven_e2e_config(&upstream, behavior, true));
+        let project = workspace.child(match behavior {
+            ArtifactBehavior::Redirect => "maven-redirect",
+            _ => "maven-proxy",
+        });
+        write_maven_extension_project(&project, &proxy, "1.0.0");
+        let repository = workspace.child(match behavior {
+            ArtifactBehavior::Redirect => "maven-repository-redirect",
+            _ => "maven-repository-proxy",
+        });
+        let output = run_maven_validate(&project, &repository);
+        assert_success("Maven extension/transitive resolution", &output);
+        assert!(maven_cached(&repository, MAVEN_ROOT, "1.0.0", "jar"));
+        assert!(maven_cached(&repository, MAVEN_DEPENDENCY, "1.0.0", "jar"));
+        assert!(maven_cached(&repository, MAVEN_BOM, "1.0.0", "pom"));
+    }
+
+    let filtered_proxy = start_axum_proxy(maven_e2e_config(
+        &upstream,
+        ArtifactBehavior::Redirect,
+        true,
+    ));
+    let dynamic = workspace.child("maven-dynamic-filtered");
+    write_maven_extension_project(&dynamic, &filtered_proxy, "[1.0,2.0)");
+    let dynamic_repository = workspace.child("maven-dynamic-repository");
+    let dynamic_output = run_maven_validate(&dynamic, &dynamic_repository);
+    assert_success(
+        "Maven dynamic version selects allowed release",
+        &dynamic_output,
+    );
+    assert!(maven_cached(
+        &dynamic_repository,
+        MAVEN_ROOT,
+        "1.0.0",
+        "jar"
+    ));
+    assert!(!maven_cached(
+        &dynamic_repository,
+        MAVEN_ROOT,
+        "1.0.1",
+        "jar"
+    ));
+
+    let blocked = workspace.child("maven-blocked-fresh");
+    write_maven_extension_project(&blocked, &filtered_proxy, "1.0.1");
+    let blocked_output = run_maven_validate(&blocked, &workspace.child("maven-blocked-cache"));
+    assert_maven_or_gradle_denial("fresh blocked Maven resolution", &blocked_output);
+
+    let blocked_bom = workspace.child("maven-blocked-bom");
+    write_maven_bom_project(&blocked_bom, &filtered_proxy, "1.0.1");
+    let blocked_bom_output =
+        run_maven_validate(&blocked_bom, &workspace.child("maven-blocked-bom-cache"));
+    assert_maven_denial_for(
+        "fresh blocked Maven BOM import",
+        &blocked_bom_output,
+        MAVEN_BOM,
+    );
+
+    let seed_proxy = start_axum_proxy(maven_e2e_config(
+        &upstream,
+        ArtifactBehavior::Redirect,
+        false,
+    ));
+    let pinned = workspace.child("maven-pinned-transition");
+    write_maven_extension_project(&pinned, &seed_proxy, "1.0.1");
+    assert_success(
+        "seed pinned Maven coordinate",
+        &run_maven_validate(&pinned, &workspace.child("maven-pinned-seed-cache")),
+    );
+    replace_file_text(
+        &pinned.join("settings.xml"),
+        &seed_proxy.base_url(),
+        &filtered_proxy.base_url(),
+    );
+    let pinned_output = run_maven_validate(&pinned, &workspace.child("maven-pinned-blocked-cache"));
+    assert_maven_or_gradle_denial("pinned blocked Maven resolution", &pinned_output);
+}
+
+#[test]
+fn gradle_resolves_module_metadata_redirect_proxy_and_lock_denials() {
+    require_command("java");
+    require_command("gradle");
+    let workspace = TempWorkspace::new("gradle-resolver-e2e");
+    let upstream = start_fixture_upstream(FixtureArtifacts::create(workspace.path()));
+
+    for behavior in [ArtifactBehavior::Redirect, ArtifactBehavior::Proxy] {
+        let proxy = start_axum_proxy(maven_e2e_config(&upstream, behavior, true));
+        let project = workspace.child(match behavior {
+            ArtifactBehavior::Redirect => "gradle-redirect",
+            _ => "gradle-proxy",
+        });
+        write_gradle_project(&project, &proxy, "[1.0,2.0)");
+        let output = run_gradle_copy(
+            &project,
+            workspace.child(match behavior {
+                ArtifactBehavior::Redirect => "gradle-home-redirect",
+                _ => "gradle-home-proxy",
+            }),
+            false,
+        );
+        assert_success("Gradle module-metadata resolution", &output);
+        assert!(
+            project
+                .join(format!("resolved/{MAVEN_ROOT}-1.0.0.jar"))
+                .exists()
+        );
+        assert!(
+            project
+                .join(format!("resolved/{MAVEN_GRADLE_DEPENDENCY}-1.0.0.jar"))
+                .exists(),
+            "Gradle did not use the .module dependency graph"
+        );
+        assert!(
+            !project
+                .join(format!("resolved/{MAVEN_DEPENDENCY}-1.0.0.jar"))
+                .exists(),
+            "Gradle unexpectedly used the POM dependency graph"
+        );
+    }
+
+    let blocked_proxy = start_axum_proxy(maven_e2e_config(
+        &upstream,
+        ArtifactBehavior::Redirect,
+        true,
+    ));
+    let blocked = workspace.child("gradle-blocked-fresh");
+    write_gradle_project(&blocked, &blocked_proxy, "1.0.1");
+    let blocked_output = run_gradle_copy(&blocked, workspace.child("gradle-blocked-home"), false);
+    assert_maven_or_gradle_denial("fresh blocked Gradle resolution", &blocked_output);
+
+    let seed_proxy = start_axum_proxy(maven_e2e_config(
+        &upstream,
+        ArtifactBehavior::Redirect,
+        false,
+    ));
+    let locked = workspace.child("gradle-locked-transition");
+    write_gradle_project(&locked, &seed_proxy, "1.0.1");
+    assert_success(
+        "seed Gradle lockfile",
+        &run_gradle_copy(&locked, workspace.child("gradle-lock-seed-home"), true),
+    );
+    replace_file_text(
+        &locked.join("build.gradle"),
+        &seed_proxy.base_url(),
+        &blocked_proxy.base_url(),
+    );
+    let _ = fs::remove_dir_all(locked.join("resolved"));
+    let locked_output =
+        run_gradle_copy(&locked, workspace.child("gradle-lock-blocked-home"), false);
+    assert_maven_or_gradle_denial("locked blocked Gradle resolution", &locked_output);
+}
+
+fn maven_e2e_config(
+    upstream: &TestServer,
+    behavior: ArtifactBehavior,
+    enforce_vulnerability_policy: bool,
+) -> Config {
+    let mut config = Config::default();
+    config.upstreams.maven.repository_url = upstream.base_url();
+    config.policy.osv.api_url = upstream.base_url();
+    config.policy.minimum_age = Duration::ZERO;
+    config.artifacts.behavior = behavior;
+    if !enforce_vulnerability_policy {
+        config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
+    }
+    config
+}
+
+fn write_maven_extension_project(project: &Path, proxy: &TestServer, version: &str) {
+    fs::create_dir_all(project.join(".mvn")).unwrap();
+    write_file(
+        &project.join("pom.xml"),
+        &format!(
+            "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>client</groupId><artifactId>client</artifactId><version>1.0.0</version><dependencyManagement><dependencies><dependency><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_BOM}</artifactId><version>1.0.0</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement><dependencies><dependency><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_DEPENDENCY}</artifactId></dependency></dependencies></project>"
+        ),
+    );
+    write_file(
+        &project.join(".mvn/extensions.xml"),
+        &format!(
+            "<extensions><extension><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_ROOT}</artifactId><version>{version}</version></extension></extensions>"
+        ),
+    );
+    write_file(
+        &project.join("settings.xml"),
+        &format!(
+            "<settings xmlns=\"http://maven.apache.org/SETTINGS/1.2.0\"><mirrors><mirror><id>osv-proxy</id><url>{}/maven/</url><mirrorOf>*</mirrorOf></mirror></mirrors></settings>",
+            proxy.base_url()
+        ),
+    );
+}
+
+fn write_maven_bom_project(project: &Path, proxy: &TestServer, version: &str) {
+    fs::create_dir_all(project).unwrap();
+    write_file(
+        &project.join("pom.xml"),
+        &format!(
+            "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>client</groupId><artifactId>blocked-bom-client</artifactId><version>1.0.0</version><dependencyManagement><dependencies><dependency><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_BOM}</artifactId><version>{version}</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement></project>"
+        ),
+    );
+    write_file(
+        &project.join("settings.xml"),
+        &format!(
+            "<settings xmlns=\"http://maven.apache.org/SETTINGS/1.2.0\"><mirrors><mirror><id>osv-proxy</id><url>{}/maven/</url><mirrorOf>*</mirrorOf></mirror></mirrors></settings>",
+            proxy.base_url()
+        ),
+    );
+}
+
+fn run_maven_validate(project: &Path, repository: &Path) -> Output {
+    fs::create_dir_all(repository).unwrap();
+    Command::new("mvn")
+        .args(["--batch-mode", "--errors", "--settings", "settings.xml"])
+        .arg(format!("-Dmaven.repo.local={}", repository.display()))
+        .arg("validate")
+        .current_dir(project)
+        .env("MAVEN_OPTS", "-Dmaven.wagon.http.retryHandler.count=0")
+        .output()
+        .unwrap()
+}
+
+fn maven_cached(repository: &Path, artifact: &str, version: &str, extension: &str) -> bool {
+    repository
+        .join(MAVEN_GROUP.replace('.', "/"))
+        .join(artifact)
+        .join(version)
+        .join(format!("{artifact}-{version}.{extension}"))
+        .exists()
+}
+
+fn write_gradle_project(project: &Path, proxy: &TestServer, version: &str) {
+    fs::create_dir_all(project).unwrap();
+    write_file(
+        &project.join("settings.gradle"),
+        "rootProject.name = 'client'\n",
+    );
+    write_file(
+        &project.join("build.gradle"),
+        &format!(
+            "repositories {{ maven {{ url = uri('{}/maven/') }} }}\nconfigurations {{ runtimeClasspath }}\ndependencies {{ runtimeClasspath '{MAVEN_GROUP}:{MAVEN_ROOT}:{version}' }}\ndependencyLocking {{ lockAllConfigurations() }}\ntasks.register('copyDeps', Copy) {{ from configurations.runtimeClasspath; into layout.projectDirectory.dir('resolved') }}\n",
+            proxy.base_url()
+        ),
+    );
+}
+
+fn run_gradle_copy(project: &Path, gradle_home: PathBuf, write_locks: bool) -> Output {
+    fs::create_dir_all(&gradle_home).unwrap();
+    let mut command = Command::new("gradle");
+    command.args([
+        "--no-daemon",
+        "--stacktrace",
+        "--refresh-dependencies",
+        "--gradle-user-home",
+    ]);
+    command.arg(gradle_home);
+    if write_locks {
+        command.arg("--write-locks");
+    }
+    command
+        .arg("copyDeps")
+        .current_dir(project)
+        .output()
+        .unwrap()
+}
+
+fn assert_maven_or_gradle_denial(context: &str, output: &Output) {
+    assert_maven_denial_for(context, output, MAVEN_ROOT);
+}
+
+fn assert_maven_denial_for(context: &str, output: &Output, artifact: &str) {
+    assert_failure(context, output);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains(artifact),
+        "{context} did not fail on the protected coordinate: {combined}"
+    );
+    assert!(
+        !combined.contains("repo.maven.apache.org") && !combined.contains("services.gradle.org"),
+        "{context} attempted public repository fallback: {combined}"
+    );
+}
 
 #[test]
 fn bundler_install_uses_proxy_for_resolution_delivery_and_denials() {
@@ -600,6 +899,12 @@ struct FixtureArtifacts {
     nuget_packages: HashMap<String, Vec<u8>>,
     cargo_crates: HashMap<String, Vec<u8>>,
     rubygems: Vec<RubyGemFixture>,
+    maven_files: HashMap<String, MavenFileFixture>,
+}
+
+struct MavenFileFixture {
+    content_type: &'static str,
+    bytes: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -631,6 +936,7 @@ impl FixtureArtifacts {
             nuget_packages: create_nuget_packages(),
             cargo_crates: create_cargo_crates(root),
             rubygems: Vec::new(),
+            maven_files: create_maven_files(),
         }
     }
 
@@ -787,6 +1093,28 @@ fn fixture_response(
     }
     if request.method == "GET" && path == "/v1/vulns/GHSA-e2e-vulnerable" {
         return RegistryResponse::json(200, &e2e_vulnerability()).unwrap();
+    }
+
+    if matches!(request.method.as_str(), "GET" | "HEAD")
+        && let Some(file) = fixture.maven_files.get(path)
+    {
+        let mut response = RegistryResponse {
+            status: 200,
+            headers: vec![
+                ("content-type".to_string(), file.content_type.to_string()),
+                ("content-length".to_string(), file.bytes.len().to_string()),
+                (
+                    "last-modified".to_string(),
+                    "Sun, 01 Jun 2025 00:00:00 GMT".to_string(),
+                ),
+                ("x-checksum-sha256".to_string(), sha256_hex(&file.bytes)),
+            ],
+            body: file.bytes.clone(),
+        };
+        if request.method == "HEAD" {
+            response.body.clear();
+        }
+        return response;
     }
 
     if request.method == "GET" && path == "/versions" {
@@ -1005,6 +1333,143 @@ fn e2e_vulnerability() -> serde_json::Value {
             "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
         }]
     })
+}
+
+fn create_maven_files() -> HashMap<String, MavenFileFixture> {
+    let mut files = HashMap::new();
+    let group_path = MAVEN_GROUP.replace('.', "/");
+    let metadata = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><metadata><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_ROOT}</artifactId><versioning><latest>1.0.1</latest><release>1.0.1</release><versions><version>1.0.0</version><version>1.0.1</version></versions><lastUpdated>20260711000000</lastUpdated></versioning></metadata>"
+    );
+    insert_maven_file(
+        &mut files,
+        format!("/{group_path}/{MAVEN_ROOT}/maven-metadata.xml"),
+        "application/xml",
+        metadata.into_bytes(),
+    );
+
+    for version in ["1.0.0", "1.0.1"] {
+        let jar = maven_jar(MAVEN_ROOT, version);
+        let module = gradle_module_metadata(version, &jar);
+        let pom = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_ROOT}</artifactId><version>{version}</version><!-- do_not_remove: published-with-gradle-metadata --><dependencies><dependency><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_DEPENDENCY}</artifactId><version>1.0.0</version></dependency></dependencies></project>"
+        );
+        let base = format!("/{group_path}/{MAVEN_ROOT}/{version}");
+        insert_maven_file(
+            &mut files,
+            format!("{base}/{MAVEN_ROOT}-{version}.pom"),
+            "application/xml",
+            pom.into_bytes(),
+        );
+        insert_maven_file(
+            &mut files,
+            format!("{base}/{MAVEN_ROOT}-{version}.jar"),
+            "application/java-archive",
+            jar,
+        );
+        insert_maven_file(
+            &mut files,
+            format!("{base}/{MAVEN_ROOT}-{version}.module"),
+            "application/json",
+            module,
+        );
+    }
+
+    for artifact in [MAVEN_DEPENDENCY, MAVEN_GRADLE_DEPENDENCY] {
+        let version = "1.0.0";
+        let pom = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>{MAVEN_GROUP}</groupId><artifactId>{artifact}</artifactId><version>{version}</version></project>"
+        );
+        let base = format!("/{group_path}/{artifact}/{version}");
+        insert_maven_file(
+            &mut files,
+            format!("{base}/{artifact}-{version}.pom"),
+            "application/xml",
+            pom.into_bytes(),
+        );
+        insert_maven_file(
+            &mut files,
+            format!("{base}/{artifact}-{version}.jar"),
+            "application/java-archive",
+            maven_jar(artifact, version),
+        );
+    }
+
+    for version in ["1.0.0", "1.0.1"] {
+        let pom = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_BOM}</artifactId><version>{version}</version><packaging>pom</packaging><dependencyManagement><dependencies><dependency><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_DEPENDENCY}</artifactId><version>1.0.0</version></dependency></dependencies></dependencyManagement></project>"
+        );
+        let base = format!("/{group_path}/{MAVEN_BOM}/{version}");
+        insert_maven_file(
+            &mut files,
+            format!("{base}/{MAVEN_BOM}-{version}.pom"),
+            "application/xml",
+            pom.into_bytes(),
+        );
+    }
+    files
+}
+
+fn insert_maven_file(
+    files: &mut HashMap<String, MavenFileFixture>,
+    path: String,
+    content_type: &'static str,
+    bytes: Vec<u8>,
+) {
+    files.insert(
+        path,
+        MavenFileFixture {
+            content_type,
+            bytes,
+        },
+    );
+}
+
+fn maven_jar(artifact: &str, version: &str) -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer
+        .start_file("META-INF/MANIFEST.MF", SimpleFileOptions::default())
+        .unwrap();
+    writer
+        .write_all(
+            format!("Manifest-Version: 1.0\nImplementation-Title: {artifact}\nImplementation-Version: {version}\n\n").as_bytes(),
+        )
+        .unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+fn gradle_module_metadata(version: &str, jar: &[u8]) -> Vec<u8> {
+    let remainder = serde_json::to_string(&json!({
+        "component": {
+            "group": MAVEN_GROUP,
+            "module": MAVEN_ROOT,
+            "version": version
+        },
+        "createdBy": { "gradle": { "version": "8.14.3" } },
+        "variants": [{
+            "name": "runtimeElements",
+            "attributes": {
+                "org.gradle.category": "library",
+                "org.gradle.dependency.bundling": "external",
+                "org.gradle.jvm.version": 8,
+                "org.gradle.libraryelements": "jar",
+                "org.gradle.usage": "java-runtime"
+            },
+            "dependencies": [{
+                "group": MAVEN_GROUP,
+                "module": MAVEN_GRADLE_DEPENDENCY,
+                "version": { "requires": "1.0.0" }
+            }],
+            "files": [{
+                "name": format!("{MAVEN_ROOT}-{version}.jar"),
+                "url": format!("{MAVEN_ROOT}-{version}.jar"),
+                "size": jar.len(),
+                "sha256": sha256_hex(jar)
+            }]
+        }]
+    }))
+    .unwrap();
+    format!("{{\"formatVersion\":\"1.1\",{}", &remainder[1..]).into_bytes()
 }
 
 fn is_e2e_vulnerable_query(query: &serde_json::Value) -> bool {

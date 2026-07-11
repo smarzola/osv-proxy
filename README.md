@@ -1,7 +1,8 @@
 # osv-proxy
 
 `osv-proxy` is a package-registry security proxy for npm, PyPI,
-Cargo/crates.io, Go modules, NuGet restore, and RubyGems/Bundler. It combines the
+Cargo/crates.io, Go modules, NuGet restore, RubyGems/Bundler, and Maven Central
+for Maven and Gradle. It combines the
 [OSV vulnerability database](https://osv.dev/) with local policy.
 
 It sits between package managers and public registries, filters package metadata
@@ -32,6 +33,8 @@ Implemented now:
   version enumeration, and protected `.nupkg`/`.nuspec` delivery.
 - RubyGems Compact Index filtering and protected `.gem` delivery for modern
   Bundler installs.
+- Maven metadata filtering and protected POM, JAR, Gradle module metadata,
+  classifier, signature, and checksum delivery for Maven and Gradle builds.
 - YAML config loading and validation.
 - `serve`, `check`, `eval`, `config validate`, `osv sync`, and the compatibility
   `malicious sync` commands.
@@ -136,6 +139,21 @@ RubyGems support targets modern Bundler Compact Index installs. Standalone
 legacy `gem install` index protocols, search, publishing, yanking, private
 registry authentication, and gem hosting are unsupported.
 
+Use Maven with a mirror whose `mirrorOf` is `*`:
+
+```xml
+<mirror>
+  <id>osv-proxy</id>
+  <url>http://127.0.0.1:8080/maven/</url>
+  <mirrorOf>*</mirrorOf>
+</mirror>
+```
+
+For Gradle, declare `http://127.0.0.1:8080/maven/` as the sole Maven repository
+and enforce that repository policy in `settings.gradle`. Additional public
+repositories can bypass the proxy. Already-cached artifacts cannot be revoked;
+use a clean or refreshed dependency cache when validating a policy change.
+
 ## Check a Package
 
 `check` fetches upstream registry metadata, builds the same canonical artifact
@@ -162,6 +180,7 @@ npm:@babel/core@7.24.0
 pypi:requests@2.32.3
 go:github.com/pkg/errors@v0.9.1
 rubygems:rails@8.0.2
+maven:org.apache.commons:commons-lang3@3.17.0
 ```
 
 If upstream metadata is missing or malformed, `check` exits non-zero rather than
@@ -199,7 +218,7 @@ artifacts:
 ```
 
 The npm registry, PyPI Simple API, Go module proxy, NuGet service index,
-RubyGems registry, and OSV API default to their public URLs.
+RubyGems registry, Maven Central repository, and OSV API default to their public URLs.
 Set `upstreams` or `policy.osv.api_url` only when using a mirror, fixture, or
 private gateway.
 
