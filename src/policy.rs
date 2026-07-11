@@ -117,15 +117,29 @@ impl<'a> PolicyEngine<'a> {
                         .min_by(|left, right| left.osv_id.cmp(&right.osv_id))
                         && self.config.policy.osv.on_error == OsvErrorBehavior::Block
                     {
+                        let (message, rule_id) = if hit.osv_id.is_empty() {
+                            (
+                                format!(
+                                    "Blocked because OSV query could not be evaluated: {}",
+                                    hit.evaluation_error.as_deref().unwrap_or("unknown error")
+                                ),
+                                None,
+                            )
+                        } else {
+                            (
+                                format!(
+                                    "Blocked because OSV advisory {} could not be evaluated: {}",
+                                    hit.osv_id,
+                                    hit.evaluation_error.as_deref().unwrap_or("unknown error")
+                                ),
+                                Some(hit.osv_id.clone()),
+                            )
+                        };
                         return blocked(
                             DecisionReason::Vulnerable,
                             artifact,
-                            format!(
-                                "Blocked because OSV advisory {} could not be evaluated: {}",
-                                hit.osv_id,
-                                hit.evaluation_error.as_deref().unwrap_or("unknown error")
-                            ),
-                            Some(hit.osv_id.clone()),
+                            message,
+                            rule_id,
                             Some(hit.source.clone()),
                             None,
                         );

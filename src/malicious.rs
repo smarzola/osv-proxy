@@ -287,8 +287,17 @@ impl OsvChecker for OsvHttpClient {
         };
         let mut findings = Vec::new();
         let mut seen_tokens = BTreeSet::new();
+        let mut initial = true;
         loop {
-            let response = self.post_query(&request).await?;
+            let response = match self.post_query(&request).await {
+                Ok(response) => response,
+                Err(error) if initial => return Err(error),
+                Err(error) => {
+                    findings.push(error_finding(String::new(), error.to_string()));
+                    break;
+                }
+            };
+            initial = false;
             for vulnerability in response.vulns {
                 if !self.block_vulnerabilities {
                     if vulnerability.id.starts_with("MAL-") && vulnerability.withdrawn.is_none() {
@@ -307,10 +316,15 @@ impl OsvChecker for OsvHttpClient {
                 break;
             };
             if !seen_tokens.insert(token.clone()) {
-                return Err(OsvError::PaginationCycle {
-                    query: artifact.identity(),
-                    token,
-                });
+                findings.push(error_finding(
+                    String::new(),
+                    OsvError::PaginationCycle {
+                        query: artifact.identity(),
+                        token,
+                    }
+                    .to_string(),
+                ));
+                break;
             }
             request.page_token = Some(token);
         }
@@ -353,31 +367,41 @@ impl OsvChecker for OsvHttpClient {
                 pending.push((index, token));
             }
         }
+        let mut continuation_errors = vec![Vec::<String>::new(); artifacts.len()];
         while !pending.is_empty() {
-            let queries = pending
-                .iter()
-                .map(|(index, token)| {
-                    let mut query = base_queries[*index].clone();
-                    query.page_token = Some(token.clone());
-                    query
-                })
-                .collect::<Vec<_>>();
-            let response = self.post_batch(queries).await?;
-            if response.results.len() != pending.len() {
-                return Err(OsvError::InvalidBatchResponse {
-                    expected: pending.len(),
-                    actual: response.results.len(),
-                });
-            }
             let mut next = Vec::new();
-            for ((index, _), result) in pending.into_iter().zip(response.results) {
+            for (index, previous_token) in pending {
+                let mut query = base_queries[index].clone();
+                query.page_token = Some(previous_token);
+                let response = match self.post_batch(vec![query]).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        continuation_errors[index].push(error.to_string());
+                        continue;
+                    }
+                };
+                if response.results.len() != 1 {
+                    continuation_errors[index].push(
+                        OsvError::InvalidBatchResponse {
+                            expected: 1,
+                            actual: response.results.len(),
+                        }
+                        .to_string(),
+                    );
+                    continue;
+                }
+                let result = response.results.into_iter().next().unwrap();
                 stubs[index].extend(result.vulns);
                 if let Some(token) = result.next_page_token.filter(|token| !token.is_empty()) {
                     if !seen_tokens[index].insert(token.clone()) {
-                        return Err(OsvError::PaginationCycle {
-                            query: artifacts[index].identity(),
-                            token,
-                        });
+                        continuation_errors[index].push(
+                            OsvError::PaginationCycle {
+                                query: artifacts[index].identity(),
+                                token,
+                            }
+                            .to_string(),
+                        );
+                        continue;
                     }
                     next.push((index, token));
                 }
@@ -393,7 +417,7 @@ impl OsvChecker for OsvHttpClient {
             .collect::<BTreeSet<_>>();
         let details = self.hydrate_details(detail_ids).await;
         let mut results = Vec::with_capacity(artifacts.len());
-        for (artifact, artifact_stubs) in artifacts.iter().zip(stubs) {
+        for (index, (artifact, artifact_stubs)) in artifacts.iter().zip(stubs).enumerate() {
             let mut findings = Vec::new();
             for stub in artifact_stubs {
                 if stub.id.starts_with("MAL-") {
@@ -411,6 +435,11 @@ impl OsvChecker for OsvHttpClient {
                     }
                 }
             }
+            findings.extend(
+                continuation_errors[index]
+                    .drain(..)
+                    .map(|error| error_finding(String::new(), error)),
+            );
             findings.sort_by(|left, right| left.osv_id.cmp(&right.osv_id));
             findings.dedup_by(|left, right| left.osv_id == right.osv_id);
             results.push(findings);
@@ -1816,6 +1845,16 @@ mod tests {
         Json(body): Json<serde_json::Value>,
     ) -> Json<serde_json::Value> {
         state.query_calls.fetch_add(1, AtomicOrdering::SeqCst);
+        if body.get("version").and_then(|value| value.as_str()) == Some("direct-mal-cycle") {
+            let vulns = if body.get("page_token").is_none() {
+                vec![serde_json::json!({
+                    "id":"MAL-2026-page-one","modified":"2026-07-11T00:00:00Z"
+                })]
+            } else {
+                Vec::new()
+            };
+            return Json(serde_json::json!({"vulns":vulns,"next_page_token":"cycle"}));
+        }
         if body.get("version").and_then(|value| value.as_str()) == Some("single-cycle") {
             return Json(serde_json::json!({"vulns":[],"next_page_token":"cycle"}));
         }
@@ -1857,6 +1896,7 @@ mod tests {
         let queries = body["queries"].as_array().unwrap();
         if queries.iter().any(|query| {
             query.get("version").and_then(|value| value.as_str()) == Some("batch-cycle")
+                && query.get("page_token").is_some()
         }) {
             return Json(serde_json::json!({"results":[{
                 "vulns":[],"next_page_token":"batch-cycle-token"
@@ -1883,6 +1923,16 @@ mod tests {
                         {"id":"MAL-2026-known","modified":"2026-07-11T00:00:00Z"},
                         {"id":"GHSA-bad","modified":"2026-07-11T00:00:00Z"}
                     ]});
+                }
+                if version == "mal-initial" {
+                    return serde_json::json!({"vulns":[
+                        {"id":"MAL-2026-initial","modified":"2026-07-11T00:00:00Z"}
+                    ]});
+                }
+                if version == "batch-cycle" {
+                    return serde_json::json!({
+                        "vulns":[],"next_page_token":"batch-cycle-token"
+                    });
                 }
                 if version == "mismatch" {
                     return serde_json::json!({"vulns":[
@@ -2024,19 +2074,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_single_and_batch_page_tokens_fail_without_looping() {
+    async fn repeated_single_and_batch_page_tokens_become_scoped_errors() {
         let (url, _) = live_mock().await;
         let client = OsvHttpClient::new(url);
         let single = Artifact::package(Ecosystem::Npm, "demo", "single-cycle", None);
-        assert!(matches!(
-            client.check(&single).await.unwrap_err(),
-            OsvError::PaginationCycle { .. }
-        ));
+        let single = client.check(&single).await.unwrap();
+        assert!(
+            single
+                .iter()
+                .any(|finding| finding.evaluation_error.is_some())
+        );
         let batch = Artifact::package(Ecosystem::Npm, "demo", "batch-cycle", None);
-        assert!(matches!(
-            client.check_many(&[batch]).await.unwrap_err(),
-            OsvError::PaginationCycle { .. }
-        ));
+        let batch = client.check_many(&[batch]).await.unwrap();
+        assert!(
+            batch[0]
+                .iter()
+                .any(|finding| finding.evaluation_error.is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn continuation_cycles_preserve_mal_and_obey_error_policy() {
+        let (url, _) = live_mock().await;
+        let client = OsvHttpClient::new(url);
+        let direct = Artifact::package(Ecosystem::Npm, "demo", "direct-mal-cycle", None);
+        let direct_findings = client.check(&direct).await.unwrap();
+        let mut config = Config::default();
+        config.policy.osv.on_error = crate::config::OsvErrorBehavior::Allow;
+        config.policy.missing_publish_time = crate::config::MissingPublishTime::Allow;
+        let decision = crate::policy::PolicyEngine::new(&config).evaluate_with_malicious_result(
+            &direct,
+            Utc::now(),
+            Some(Ok(direct_findings)),
+        );
+        assert_eq!(decision.reason, crate::policy::DecisionReason::Malicious);
+
+        let mal = Artifact::package(Ecosystem::Npm, "demo", "mal-initial", None);
+        let cycling = Artifact::package(Ecosystem::Npm, "demo", "batch-cycle", None);
+        let results = client
+            .check_many(&[mal.clone(), cycling.clone()])
+            .await
+            .unwrap();
+        let mal_decision = crate::policy::PolicyEngine::new(&config)
+            .evaluate_with_malicious_result(&mal, Utc::now(), Some(Ok(results[0].clone())));
+        assert_eq!(
+            mal_decision.reason,
+            crate::policy::DecisionReason::Malicious
+        );
+        let allowed = crate::policy::PolicyEngine::new(&config).evaluate_with_malicious_result(
+            &cycling,
+            Utc::now(),
+            Some(Ok(results[1].clone())),
+        );
+        assert!(allowed.allowed);
+
+        config.policy.osv.on_error = crate::config::OsvErrorBehavior::Block;
+        let blocked = crate::policy::PolicyEngine::new(&config).evaluate_with_malicious_result(
+            &cycling,
+            Utc::now(),
+            Some(Ok(results[1].clone())),
+        );
+        assert_eq!(blocked.reason, crate::policy::DecisionReason::Vulnerable);
+        assert!(blocked.rule_id.is_none());
+        assert!(blocked.message.contains("OSV query"));
     }
 
     #[tokio::test]
