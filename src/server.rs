@@ -3,8 +3,7 @@ use crate::cargo::{self, CargoRegistryClient};
 use crate::config::{Config, LocalOsvConfig, OsvSource};
 use crate::go::{self, GoProxyClient};
 use crate::malicious::{
-    HttpOsvDumpClient, MaliciousChecker, OsvDumpClient, configured_malicious_checker,
-    sync_malicious,
+    HttpOsvDumpClient, MaliciousChecker, OsvDumpClient, configured_malicious_checker, sync_osv,
 };
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
 use crate::nuget::{self, NugetClient};
@@ -30,7 +29,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 }
 
 pub async fn serve_listener(listener: TcpListener, config: Config) -> anyhow::Result<()> {
-    let _background_sync = start_background_malicious_sync_if_enabled(&config);
+    let _background_sync = start_background_osv_sync_if_enabled(&config);
     axum::serve(listener, router(config)).await?;
     Ok(())
 }
@@ -58,28 +57,28 @@ impl Drop for BackgroundSyncTask {
     }
 }
 
-fn start_background_malicious_sync_if_enabled(config: &Config) -> Option<BackgroundSyncTask> {
+fn start_background_osv_sync_if_enabled(config: &Config) -> Option<BackgroundSyncTask> {
     if config.policy.osv.source != OsvSource::Local || !config.policy.osv.local.background_sync {
         return None;
     }
-    Some(spawn_background_malicious_sync(
+    Some(spawn_background_osv_sync(
         config.policy.osv.local.clone(),
         Arc::new(HttpOsvDumpClient::new()),
     ))
 }
 
-fn spawn_background_malicious_sync(
+fn spawn_background_osv_sync(
     local_config: LocalOsvConfig,
     client: Arc<dyn OsvDumpClient>,
 ) -> BackgroundSyncTask {
     let handle = tokio::spawn(async move {
         loop {
-            match sync_malicious(&local_config, client.as_ref()).await {
+            match sync_osv(&local_config, client.as_ref()).await {
                 Ok(report) => println!(
-                    "local malicious background sync completed for {} ecosystems",
+                    "local OSV background sync completed for {} ecosystems",
                     report.ecosystems.len()
                 ),
-                Err(err) => eprintln!("local malicious background sync failed: {err}"),
+                Err(err) => eprintln!("local OSV background sync failed: {err}"),
             }
             tokio::time::sleep(local_config.sync_interval).await;
         }
@@ -857,12 +856,24 @@ mod tests {
 
     struct MaliciousPackageChecker {
         package: String,
+        osv_id: String,
+        severity: Option<f64>,
     }
 
     impl MaliciousPackageChecker {
         fn new(package: &str) -> Self {
             Self {
                 package: package.to_string(),
+                osv_id: "MAL-2026-000001".to_string(),
+                severity: None,
+            }
+        }
+
+        fn vulnerable(package: &str) -> Self {
+            Self {
+                package: package.to_string(),
+                osv_id: "GHSA-e2e-vulnerable".to_string(),
+                severity: Some(9.8),
             }
         }
     }
@@ -872,10 +883,18 @@ mod tests {
         async fn check(&self, artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
             if artifact.identity() == self.package {
                 Ok(vec![MaliciousHit {
-                    osv_id: "MAL-2026-000001".to_string(),
-                    summary: Some("malicious fixture".to_string()),
+                    osv_id: self.osv_id.clone(),
+                    summary: Some("OSV fixture".to_string()),
                     source: "osv".to_string(),
                     modified: None,
+                    effective_severity: self.severity.map(|base_score| {
+                        crate::malicious::OsvEffectiveSeverity {
+                            severity_type: "CVSS_V3".to_string(),
+                            vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_string(),
+                            base_score,
+                        }
+                    }),
+                    evaluation_error: None,
                 }])
             } else {
                 Ok(Vec::new())
@@ -898,6 +917,9 @@ mod tests {
     #[async_trait]
     impl OsvDumpClient for FixtureDumpClient {
         async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, MaliciousError> {
+            if url.ends_with("/modified_id.csv") && !self.responses.contains_key(url) {
+                return Ok(Vec::new());
+            }
             self.responses
                 .get(url)
                 .cloned()
@@ -1533,6 +1555,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_npm_and_pypi_artifacts_block_vulnerabilities_before_delivery() {
+        let config = Config::default();
+        let npm_upstream = StaticUpstream::with("demo", npm_demo_metadata());
+        let pypi_upstream = StaticPypiUpstream::with("Demo", pypi_simple_fixture());
+
+        let npm = route_request_with_upstreams(
+            &config,
+            "GET",
+            "/npm/demo/-/demo-1.0.1.tgz",
+            now(),
+            &MaliciousPackageChecker::vulnerable("npm:demo@1.0.1"),
+            &npm_upstream,
+            &pypi_upstream,
+        )
+        .await;
+        let pypi = route_request_with_upstreams(
+            &config,
+            "GET",
+            "/pypi/packages/demo/1.0.1/demo-1.0.1.tar.gz",
+            now(),
+            &MaliciousPackageChecker::vulnerable("pypi:demo@1.0.1"),
+            &npm_upstream,
+            &pypi_upstream,
+        )
+        .await;
+
+        for response in [npm, pypi] {
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(response.status, 403);
+            assert_eq!(body["reason"], "vulnerable");
+            assert_eq!(body["rule_id"], "GHSA-e2e-vulnerable");
+        }
+    }
+
+    #[tokio::test]
     async fn background_malicious_sync_runs_immediately_for_local_config() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("malicious.sqlite");
@@ -1551,7 +1608,7 @@ mod tests {
             ..LocalOsvConfig::default()
         };
 
-        let _task = spawn_background_malicious_sync(local_config.clone(), Arc::new(client));
+        let _task = spawn_background_osv_sync(local_config.clone(), Arc::new(client));
 
         wait_for_sync_status(&db, "PyPI", "healthy").await;
         let checker = SqliteMaliciousChecker::new(&local_config);
@@ -1574,7 +1631,7 @@ mod tests {
             ..LocalOsvConfig::default()
         };
 
-        let _task = spawn_background_malicious_sync(local_config, Arc::new(client));
+        let _task = spawn_background_osv_sync(local_config, Arc::new(client));
 
         wait_for_sync_status(&db, "npm", "failed").await;
         let connection = Connection::open(&db).unwrap();
@@ -2026,6 +2083,18 @@ INSERT INTO advisories (
         SqliteMaliciousChecker::initialize(&config.policy.osv.local.sqlite_path).unwrap();
         let connection = Connection::open(&config.policy.osv.local.sqlite_path).unwrap();
         let ecosystem_name = ecosystem.osv_name();
+        let now = Utc::now().to_rfc3339();
+        connection
+            .execute(
+                r#"
+INSERT INTO dataset_generations (
+    ecosystem, dataset_version, status, staged_at, activated_at, high_watermark
+) VALUES (?1, 1, 'active', ?2, ?2, NULL)
+"#,
+                params![ecosystem_name, now],
+            )
+            .unwrap();
+        let generation_id = connection.last_insert_rowid();
         connection
             .execute(
                 r#"
@@ -2036,16 +2105,18 @@ INSERT OR REPLACE INTO sync_state (
     last_success_at,
     last_attempted_at,
     status,
-    error_summary
-) VALUES (?1, 'test', NULL, ?2, ?2, 'healthy', NULL)
+    error_summary,
+    active_generation_id
+) VALUES (?1, 'test', NULL, ?2, ?2, 'healthy', NULL, ?3)
 "#,
-                params![ecosystem_name, Utc::now().to_rfc3339()],
+                params![ecosystem_name, now, generation_id],
             )
             .unwrap();
         connection
             .execute(
                 r#"
-INSERT INTO advisories (
+INSERT INTO osv_advisories (
+    generation_id,
     osv_id,
     summary,
     modified,
@@ -2054,21 +2125,21 @@ INSERT INTO advisories (
     raw_json,
     source,
     imported_at
-) VALUES (?1, 'local malicious fixture', ?2, NULL, NULL, '{}', 'test', ?2)
+) VALUES (?1, ?2, 'local malicious fixture', ?3, NULL, NULL, '{}', 'test', ?3)
 "#,
-                params![osv_id, Utc::now().to_rfc3339()],
+                params![generation_id, osv_id, now],
             )
             .unwrap();
         connection
             .execute(
-                "INSERT INTO affected_packages (osv_id, ecosystem, name) VALUES (?1, ?2, ?3)",
-                params![osv_id, ecosystem_name, ecosystem.normalize_name(name)],
+                "INSERT INTO osv_affected_packages (generation_id, osv_id, ecosystem, name, affected_order) VALUES (?1, ?2, ?3, ?4, 0)",
+                params![generation_id, osv_id, ecosystem_name, ecosystem.normalize_name(name)],
             )
             .unwrap();
         let package_id = connection.last_insert_rowid();
         connection
             .execute(
-                "INSERT INTO affected_versions (affected_package_id, version) VALUES (?1, ?2)",
+                "INSERT INTO osv_affected_versions (affected_package_id, version) VALUES (?1, ?2)",
                 params![package_id, version],
             )
             .unwrap();

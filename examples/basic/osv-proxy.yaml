@@ -14,4 +14,6 @@ policy:
   missing_publish_time: "block"
   osv:
     block_malicious: true
+    block_vulnerabilities: true
+    minimum_cvss_score: 0.0
     on_error: "block"

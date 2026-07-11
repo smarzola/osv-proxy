@@ -926,6 +926,7 @@ dependencies = [
  "humantime",
  "node-semver",
  "pep440_rs",
+ "polycvss",
  "reqwest",
  "rusqlite",
  "semver",
@@ -968,6 +969,12 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "polycvss"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c72d064793cf89e1143b5eab68225f1118d5f88648bb503e2fd27bae12c13de"
 
 [[package]]
 name = "potential_utf"

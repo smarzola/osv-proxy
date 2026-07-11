@@ -424,18 +424,27 @@ async fn filter_registration(
                 .map(|(_, _, artifact)| artifact.clone())
                 .collect::<Vec<_>>(),
         )
-        .await
-        .map_err(|err| NugetError::InvalidMetadata(format!("malicious batch failed: {err}")))?;
-    if checked.len() != selected.len() {
-        return Err(NugetError::InvalidMetadata(
-            "malicious batch returned wrong result count".into(),
-        ));
-    }
-    let results = selected
-        .into_iter()
-        .zip(checked)
-        .map(|((page, leaf, _), hits)| ((page, leaf), hits))
-        .collect::<std::collections::BTreeMap<_, _>>();
+        .await;
+    let results = match checked {
+        Ok(checked) if checked.len() == selected.len() => selected
+            .iter()
+            .zip(checked)
+            .map(|((page, leaf, _), hits)| ((*page, *leaf), Ok(hits)))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        Ok(_) => selected
+            .iter()
+            .map(|(page, leaf, _)| {
+                (
+                    (*page, *leaf),
+                    Err("OSV batch result cardinality mismatch".to_string()),
+                )
+            })
+            .collect(),
+        Err(error) => selected
+            .iter()
+            .map(|(page, leaf, _)| ((*page, *leaf), Err(error.to_string())))
+            .collect(),
+    };
     for (page_index, page) in items.iter_mut().enumerate() {
         let leaves = page
             .get_mut("items")
@@ -452,7 +461,7 @@ async fn filter_registration(
                 .find(|(page, leaf, _)| *page == page_index && *leaf == leaf_index)
                 .expect("collected leaf")
                 .2;
-            let result = results.get(&(page_index, leaf_index)).cloned().map(Ok);
+            let result = results.get(&(page_index, leaf_index)).cloned();
             if policy
                 .evaluate_with_malicious_result(artifact, now, result)
                 .allowed
@@ -540,7 +549,7 @@ use chrono::Datelike;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, OsvErrorBehavior};
     use crate::malicious::{MaliciousChecker, MaliciousError, MaliciousHit};
     use serde_json::json;
     use std::collections::HashMap;
@@ -551,10 +560,17 @@ mod tests {
         documents: HashMap<String, Value>,
     }
     struct Clean;
+    struct Failing;
     #[async_trait]
     impl MaliciousChecker for Clean {
         async fn check(&self, _: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
             Ok(Vec::new())
+        }
+    }
+    #[async_trait]
+    impl MaliciousChecker for Failing {
+        async fn check(&self, _: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            Err(MaliciousError::Sync("fixture failure".to_string()))
         }
     }
     #[async_trait]
@@ -578,7 +594,7 @@ mod tests {
                     "https://upstream/registration/demo/index.json".into(),
                     json!({"items":[{"count":2,"items":[
                         {"catalogEntry":{"version":"1.0.0","published":"2026-01-01T00:00:00Z"},"packageContent":"https://upstream/demo.1.0.0.nupkg"},
-                        {"catalogEntry":{"version":"2.0.0","published":"2026-07-09T00:00:00Z"},"packageContent":"https://upstream/demo.2.0.0.nupkg"}
+                        {"catalogEntry":{"version":"2.0.0","published":"2026-07-11T00:00:00Z"},"packageContent":"https://upstream/demo.2.0.0.nupkg"}
                     ]}]}),
                 ),
                 (
@@ -593,6 +609,7 @@ mod tests {
         let mut config = Config::default();
         config.policy.minimum_age = Duration::from_secs(24 * 60 * 60);
         config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
         let response =
             flat_container_index_response(&config, &provider(), &Clean, "Demo", Utc::now())
                 .await
@@ -603,9 +620,36 @@ mod tests {
         );
     }
     #[tokio::test]
+    async fn nuget_osv_batch_errors_follow_on_error_policy() {
+        let mut document = provider()
+            .documents
+            .get("https://upstream/registration/demo/index.json")
+            .unwrap()
+            .clone();
+        let mut config = Config::default();
+        config.policy.minimum_age = Duration::ZERO;
+        config.policy.osv.on_error = OsvErrorBehavior::Allow;
+        filter_registration(&config, &Failing, "demo", &mut document, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(document["items"][0]["items"].as_array().unwrap().len(), 2);
+
+        let mut document = provider()
+            .documents
+            .get("https://upstream/registration/demo/index.json")
+            .unwrap()
+            .clone();
+        config.policy.osv.on_error = OsvErrorBehavior::Block;
+        filter_registration(&config, &Failing, "demo", &mut document, Utc::now())
+            .await
+            .unwrap();
+        assert!(document["items"].as_array().unwrap().is_empty());
+    }
+    #[tokio::test]
     async fn registration_response_owns_all_emitted_urls() {
         let mut config = Config::default();
         config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
         let response = registration_response(&config, &provider(), &Clean, "demo", Utc::now())
             .await
             .unwrap();

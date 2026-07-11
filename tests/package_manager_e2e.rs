@@ -1,5 +1,5 @@
 use osv_proxy::artifact::Ecosystem;
-use osv_proxy::config::{ArtifactBehavior, BlocklistEntry, Config};
+use osv_proxy::config::{AllowlistEntry, ArtifactBehavior, Config};
 use osv_proxy::response::RegistryResponse;
 use osv_proxy::server;
 use serde_json::json;
@@ -135,15 +135,18 @@ fn nuget_e2e_config(
 ) -> Config {
     let mut config = Config::default();
     config.upstreams.nuget.service_index_url = format!("{}/v3/index.json", upstream.base_url());
+    config.policy.osv.api_url = upstream.base_url();
     config.policy.osv.block_malicious = false;
     config.policy.minimum_age = Duration::from_secs(0);
     config.artifacts.behavior = behavior;
-    if blocked {
-        config.blocklist.push(BlocklistEntry {
+    if !blocked && package == NUGET_ROOT {
+        config.allowlist.push(AllowlistEntry {
             ecosystem: Ecosystem::Nuget,
             name: package.into(),
-            versions: vec![version.into()],
-            reason: "NuGet E2E policy block".into(),
+            version: version.into(),
+            bypass_age_gate: false,
+            bypass_osv: true,
+            reason: "exercise allowed NuGet client path separately".into(),
         });
     }
     config
@@ -160,6 +163,8 @@ fn write_nuget_proxy_config(project: &Path, proxy: &TestServer) {
 }
 
 fn run_dotnet_restore(project: &Path, packages: PathBuf, locked: bool) -> Output {
+    let dotnet_home = project.join(".dotnet-home");
+    fs::create_dir_all(&dotnet_home).unwrap();
     let mut command = Command::new("dotnet");
     command.arg("restore");
     if locked {
@@ -173,6 +178,8 @@ fn run_dotnet_restore(project: &Path, packages: PathBuf, locked: bool) -> Output
             packages.to_str().unwrap(),
         ])
         .current_dir(project)
+        .env("DOTNET_CLI_HOME", dotnet_home)
+        .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
         .output()
         .unwrap()
 }
@@ -494,32 +501,16 @@ fn start_go_proxy(
             config.upstreams.cargo.download_url = format!("{upstream_base_url}/cargo-files");
             config.policy.osv.api_url = upstream_base_url.clone();
             config.artifacts.behavior = behavior;
-            config.blocklist.push(BlocklistEntry {
-                ecosystem: Ecosystem::Npm,
-                name: NPM_PACKAGE.to_string(),
-                versions: vec!["1.0.1".to_string()],
-                reason: "package-manager e2e blocked npm version".to_string(),
-            });
-            if block_go {
-                config.blocklist.push(BlocklistEntry {
+            if !block_go {
+                config.allowlist.push(AllowlistEntry {
                     ecosystem: Ecosystem::Go,
                     name: GO_MODULE.to_string(),
-                    versions: vec!["v1.0.0".to_string()],
-                    reason: "package-manager e2e blocked Go version".to_string(),
+                    version: "v1.0.0".to_string(),
+                    bypass_age_gate: false,
+                    bypass_osv: true,
+                    reason: "exercise allowed Go client path separately".to_string(),
                 });
             }
-            config.blocklist.push(BlocklistEntry {
-                ecosystem: Ecosystem::CratesIo,
-                name: CARGO_PACKAGE.to_string(),
-                versions: vec!["1.0.1".to_string()],
-                reason: "package-manager e2e blocked Cargo version".to_string(),
-            });
-            config.blocklist.push(BlocklistEntry {
-                ecosystem: Ecosystem::Pypi,
-                name: PYPI_PACKAGE.to_string(),
-                versions: vec!["1.0.1".to_string()],
-                reason: "package-manager e2e blocked pypi version".to_string(),
-            });
 
             runtime.block_on(server::route_request_with_accept(
                 &config,
@@ -567,16 +558,36 @@ fn fixture_response(
 ) -> RegistryResponse {
     let path = request.path.split('?').next().unwrap_or(&request.path);
     if request.method == "POST" && path == "/v1/query" {
-        return RegistryResponse::json(200, &json!({ "vulns": [] })).unwrap();
+        let body = serde_json::from_slice::<serde_json::Value>(&request.body).unwrap();
+        let vulnerable = is_e2e_vulnerable_query(&body);
+        return RegistryResponse::json(
+            200,
+            &if vulnerable {
+                json!({ "vulns": [e2e_vulnerability()] })
+            } else {
+                json!({ "vulns": [] })
+            },
+        )
+        .unwrap();
     }
     if request.method == "POST" && path == "/v1/querybatch" {
         let body = serde_json::from_slice::<serde_json::Value>(&request.body).unwrap();
-        let query_count = body["queries"].as_array().map(Vec::len).unwrap_or_default();
-        return RegistryResponse::json(
-            200,
-            &json!({ "results": vec![json!({ "vulns": [] }); query_count] }),
-        )
-        .unwrap();
+        let results = body["queries"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|query| {
+                if is_e2e_vulnerable_query(query) {
+                    json!({ "vulns": [{"id":"GHSA-e2e-vulnerable","modified":"2026-07-11T00:00:00Z"}] })
+                } else {
+                    json!({ "vulns": [] })
+                }
+            })
+            .collect::<Vec<_>>();
+        return RegistryResponse::json(200, &json!({ "results": results })).unwrap();
+    }
+    if request.method == "GET" && path == "/v1/vulns/GHSA-e2e-vulnerable" {
+        return RegistryResponse::json(200, &e2e_vulnerability()).unwrap();
     }
 
     if request.method == "GET" && path == format!("/{NPM_PACKAGE}") {
@@ -714,6 +725,27 @@ fn fixture_response(
         }),
     )
     .unwrap()
+}
+
+fn e2e_vulnerability() -> serde_json::Value {
+    json!({
+        "id": "GHSA-e2e-vulnerable",
+        "modified": "2026-07-11T00:00:00Z",
+        "summary": "hermetic package-manager vulnerability fixture",
+        "severity": [{
+            "type": "CVSS_V3",
+            "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+        }]
+    })
+}
+
+fn is_e2e_vulnerable_query(query: &serde_json::Value) -> bool {
+    let version = query["version"].as_str().unwrap_or_default();
+    let ecosystem = query["package"]["ecosystem"].as_str().unwrap_or_default();
+    let name = query["package"]["name"].as_str().unwrap_or_default();
+    version == "1.0.1"
+        || (ecosystem == "Go" && name == GO_MODULE && version == "1.0.0")
+        || (ecosystem == "NuGet" && name.eq_ignore_ascii_case(NUGET_ROOT) && version == "1.0.0")
 }
 
 fn go_module_zip() -> Vec<u8> {

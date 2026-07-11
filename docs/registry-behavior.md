@@ -7,6 +7,14 @@ validated and policy-filtered without rewriting retained bytes. Filtered index
 responses have a content ETag and support `If-None-Match`; direct `.crate`
 downloads recheck policy before redirecting or proxying exact upstream bytes.
 
+Under the default OSV policy, metadata omits versions matching either `MAL-*`
+or other active advisories at the inclusive CVSS threshold. Direct npm
+tarballs, PyPI files, Cargo crates, Go `.mod`/`.zip` files, and NuGet
+`.nupkg`/`.nuspec` requests rebuild the canonical artifact and re-run the same
+policy before fetching package bytes. Denials use `reason: malicious` for
+`MAL-*` and `reason: vulnerable` for other advisories. An exact allowlist with
+`bypass_osv: true` is the only OSV bypass.
+
 ## HTTP Responses
 
 Blocked requests return HTTP 403 with the structured decision model.
@@ -21,6 +29,34 @@ Malicious block:
   "message": "Blocked by OSV malicious package record MAL-2026-000001",
   "source": "osv",
   "rule_id": "MAL-2026-000001"
+}
+```
+
+Scored vulnerability block:
+
+```json
+{
+  "allowed": false,
+  "reason": "vulnerable",
+  "package": "npm:some-package@1.2.3",
+  "message": "Blocked by OSV vulnerability GHSA-abcd-1234 with CVSS base score 9.8",
+  "source": "osv",
+  "rule_id": "GHSA-abcd-1234",
+  "cvss_score": 9.8
+}
+```
+
+Unscored vulnerability block at the default zero threshold (`cvss_score` is
+omitted when absent):
+
+```json
+{
+  "allowed": false,
+  "reason": "vulnerable",
+  "package": "pypi:some-package@1.2.3",
+  "message": "Blocked by OSV vulnerability GHSA-wxyz-5678",
+  "source": "osv",
+  "rule_id": "GHSA-wxyz-5678"
 }
 ```
 
