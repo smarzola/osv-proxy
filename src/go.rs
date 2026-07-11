@@ -376,21 +376,20 @@ async fn filtered_infos(
         .iter()
         .map(|(_, artifact)| artifact.clone())
         .collect::<Vec<_>>();
-    let results = checker
-        .check_many(&checked)
-        .await
-        .map_err(|err| GoError::InvalidResponse(err.to_string()))?;
-    if results.len() != checked.len() {
-        return Err(GoError::InvalidResponse(
-            "malicious batch result cardinality mismatch".into(),
-        ));
-    }
+    let results = match checker.check_many(&checked).await {
+        Ok(results) if results.len() == checked.len() => Ok(results),
+        Ok(_) => Err("OSV batch result cardinality mismatch".to_string()),
+        Err(error) => Err(error.to_string()),
+    };
     let mut allowed = Vec::new();
     for (index, info) in infos.into_iter().enumerate() {
         let result = selected
             .iter()
             .position(|(original, _)| *original == index)
-            .map(|batch| Ok(results[batch].clone()));
+            .map(|batch| match &results {
+                Ok(results) => Ok(results[batch].clone()),
+                Err(error) => Err(error.clone()),
+            });
         if policy
             .evaluate_with_malicious_result(&artifacts[index], now, result)
             .allowed
