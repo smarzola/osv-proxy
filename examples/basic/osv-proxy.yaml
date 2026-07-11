@@ -11,6 +11,8 @@ upstreams:
     service_index_url: "https://api.nuget.org/v3/index.json"
   rubygems:
     registry_url: "https://rubygems.org"
+  maven:
+    repository_url: "https://repo.maven.apache.org/maven2"
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"

@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod go;
 pub mod malicious;
+pub mod maven;
 pub mod npm;
 pub mod nuget;
 pub mod policy;
