@@ -1,12 +1,18 @@
 //! Maven Repository Layout metadata, identity, and version semantics.
 
 use crate::artifact::{Artifact, ArtifactHashes, Ecosystem};
+use crate::config::Config;
+use crate::malicious::MaliciousChecker;
+use crate::policy::{Decision, PolicyEngine};
+use crate::response::RegistryResponse;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::{Stream, StreamExt};
 use quick_xml::de::from_str;
 use reqwest::{Client, StatusCode, header};
 use serde::Deserialize;
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha512};
 use std::cmp::Ordering;
 use std::fmt::Display;
 use std::time::Duration;
@@ -15,6 +21,8 @@ use thiserror::Error;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_POM_BYTES: usize = 1024 * 1024;
+const MAX_METADATA_BYTES: usize = 2 * 1024 * 1024;
+const METADATA_ENRICHMENT_CONCURRENCY: usize = 16;
 
 #[derive(Debug, Clone)]
 pub struct MavenRepositoryClient {
@@ -43,6 +51,11 @@ pub struct MavenPomMetadata {
     pub upstream_url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MavenRawMetadata {
+    pub body: String,
+}
+
 #[async_trait]
 pub trait MavenMetadataProvider: Send + Sync {
     async fn fetch_pom(
@@ -51,6 +64,10 @@ pub trait MavenMetadataProvider: Send + Sync {
         artifact_id: &str,
         version: &str,
     ) -> Result<MavenPomMetadata, MavenError>;
+
+    async fn fetch_metadata(&self, _relative_path: &str) -> Result<MavenRawMetadata, MavenError> {
+        Err(MavenError::UnsupportedMetadataRoute)
+    }
 }
 
 #[async_trait]
@@ -90,6 +107,33 @@ impl MavenMetadataProvider for MavenRepositoryClient {
             sha256,
             upstream_url: url,
         })
+    }
+
+    async fn fetch_metadata(&self, relative_path: &str) -> Result<MavenRawMetadata, MavenError> {
+        if relative_path.is_empty()
+            || relative_path.starts_with('/')
+            || relative_path
+                .split('/')
+                .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        {
+            return Err(MavenError::InvalidMetadataPath(relative_path.to_string()));
+        }
+        let url = format!("{}/{}", self.repository_url, relative_path);
+        let response = self.client.get(url).send().await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(MavenError::MetadataNotFound(relative_path.to_string()));
+        }
+        let response = response.error_for_status()?;
+        ensure_content_length(response.content_length(), MAX_METADATA_BYTES, "metadata")?;
+        let body = collect_bounded_body(
+            response.bytes_stream(),
+            MAX_METADATA_BYTES,
+            "Maven metadata",
+        )
+        .await?;
+        let body = String::from_utf8(body)
+            .map_err(|error| MavenError::InvalidMetadataEncoding(error.to_string()))?;
+        Ok(MavenRawMetadata { body })
     }
 }
 
@@ -171,10 +215,7 @@ pub async fn lookup_artifact(
 }
 
 fn ensure_pom_content_length(content_length: Option<u64>) -> Result<(), MavenError> {
-    if content_length.is_some_and(|length| length > MAX_POM_BYTES as u64) {
-        return Err(MavenError::PomTooLarge(MAX_POM_BYTES));
-    }
-    Ok(())
+    ensure_content_length(content_length, MAX_POM_BYTES, "POM")
 }
 
 async fn collect_bounded_pom<S, T, E>(mut stream: S) -> Result<Vec<u8>, MavenError>
@@ -183,15 +224,472 @@ where
     T: AsRef<[u8]>,
     E: Display,
 {
+    collect_bounded_body(&mut stream, MAX_POM_BYTES, "Maven POM").await
+}
+
+fn ensure_content_length(
+    content_length: Option<u64>,
+    limit: usize,
+    kind: &'static str,
+) -> Result<(), MavenError> {
+    if content_length.is_some_and(|length| length > limit as u64) {
+        return Err(MavenError::BodyTooLarge { kind, limit });
+    }
+    Ok(())
+}
+
+async fn collect_bounded_body<S, T, E>(
+    mut stream: S,
+    limit: usize,
+    kind: &'static str,
+) -> Result<Vec<u8>, MavenError>
+where
+    S: Stream<Item = Result<T, E>> + Unpin,
+    T: AsRef<[u8]>,
+    E: Display,
+{
     let mut body = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| MavenError::BodyRead(error.to_string()))?;
-        if body.len().saturating_add(chunk.as_ref().len()) > MAX_POM_BYTES {
-            return Err(MavenError::PomTooLarge(MAX_POM_BYTES));
+        if body.len().saturating_add(chunk.as_ref().len()) > limit {
+            return Err(MavenError::BodyTooLarge { kind, limit });
         }
         body.extend_from_slice(chunk.as_ref());
     }
     Ok(body)
+}
+
+#[derive(Debug, Deserialize)]
+struct MavenMetadataDocument {
+    #[serde(rename = "groupId")]
+    group_id: String,
+    #[serde(rename = "artifactId")]
+    artifact_id: String,
+    versioning: MavenVersioning,
+}
+
+#[derive(Debug, Deserialize)]
+struct MavenMetadataProbe {
+    #[serde(rename = "groupId")]
+    group_id: Option<String>,
+    #[serde(rename = "artifactId")]
+    artifact_id: Option<String>,
+    versioning: Option<MavenVersioning>,
+    plugins: Option<MavenPlugins>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MavenPlugins {
+    #[serde(rename = "plugin", default)]
+    values: Vec<MavenPlugin>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MavenPlugin {
+    prefix: String,
+    #[serde(rename = "artifactId")]
+    artifact_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MavenVersioning {
+    versions: MavenVersions,
+    #[serde(rename = "lastUpdated")]
+    last_updated: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MavenVersions {
+    #[serde(rename = "version", default)]
+    values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataChecksum {
+    Md5,
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+impl MetadataChecksum {
+    pub fn from_suffix(suffix: &str) -> Option<Self> {
+        match suffix {
+            "md5" => Some(Self::Md5),
+            "sha1" => Some(Self::Sha1),
+            "sha256" => Some(Self::Sha256),
+            "sha512" => Some(Self::Sha512),
+            _ => None,
+        }
+    }
+}
+
+pub async fn filtered_metadata_response(
+    config: &Config,
+    provider: &dyn MavenMetadataProvider,
+    checker: &dyn MaliciousChecker,
+    group_id: &str,
+    artifact_id: &str,
+    now: DateTime<Utc>,
+) -> Result<RegistryResponse, MavenError> {
+    validate_coordinate(group_id, artifact_id, "placeholder")?;
+    let relative_path = format!(
+        "{}/{artifact_id}/maven-metadata.xml",
+        group_id.replace('.', "/")
+    );
+    let raw = provider.fetch_metadata(&relative_path).await?;
+    filtered_metadata_from_raw(config, provider, checker, group_id, artifact_id, now, raw).await
+}
+
+async fn filtered_metadata_from_raw(
+    config: &Config,
+    provider: &dyn MavenMetadataProvider,
+    checker: &dyn MaliciousChecker,
+    group_id: &str,
+    artifact_id: &str,
+    now: DateTime<Utc>,
+    raw: MavenRawMetadata,
+) -> Result<RegistryResponse, MavenError> {
+    let document: MavenMetadataDocument =
+        from_str(&raw.body).map_err(|error| MavenError::InvalidMetadata(error.to_string()))?;
+    if document.group_id != group_id || document.artifact_id != artifact_id {
+        return Err(MavenError::MetadataCoordinateMismatch {
+            expected: format!("{group_id}:{artifact_id}"),
+            actual: format!("{}:{}", document.group_id, document.artifact_id),
+        });
+    }
+    let mut versions = document.versioning.versions.values;
+    if versions.is_empty() {
+        return Err(MavenError::InvalidMetadata(
+            "artifact metadata has no versions".to_string(),
+        ));
+    }
+    for version in &versions {
+        validate_coordinate(group_id, artifact_id, version)?;
+        compare_versions(version, version)?;
+        if version.to_ascii_uppercase().ends_with("-SNAPSHOT") {
+            return Err(MavenError::SnapshotsUnsupported(version.clone()));
+        }
+    }
+    versions.sort_by(|left, right| {
+        compare_versions(left, right)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.cmp(right))
+    });
+    versions.dedup();
+
+    let package = format!("{group_id}:{artifact_id}");
+    let enriched = futures_util::stream::iter(versions.into_iter().map(|version| {
+        let package = package.clone();
+        async move {
+            let result = lookup_artifact(provider, &package, &version).await;
+            (version, result)
+        }
+    }))
+    .buffered(METADATA_ENRICHMENT_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+    let mut artifacts = Vec::new();
+    for (version, result) in enriched {
+        match result {
+            Ok(artifact) => artifacts.push(artifact),
+            Err(MavenError::VersionNotFound(_)) => {}
+            Err(error) => {
+                return Err(MavenError::VersionEnrichment {
+                    version,
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+    let decisions = evaluate_artifacts(config, checker, &artifacts, now).await;
+    let retained = artifacts
+        .iter()
+        .zip(decisions)
+        .filter_map(|(artifact, decision)| decision.allowed.then_some(artifact.version.clone()))
+        .collect::<Vec<_>>();
+    let body = render_metadata(
+        group_id,
+        artifact_id,
+        &retained,
+        document.versioning.last_updated.as_deref(),
+    );
+    Ok(metadata_body_response(body))
+}
+
+pub async fn metadata_route_response(
+    config: &Config,
+    provider: &dyn MavenMetadataProvider,
+    checker: &dyn MaliciousChecker,
+    relative_path: &str,
+    checksum: Option<MetadataChecksum>,
+    now: DateTime<Utc>,
+) -> Result<RegistryResponse, MavenError> {
+    let raw = provider.fetch_metadata(relative_path).await?;
+    let probe: MavenMetadataProbe =
+        from_str(&raw.body).map_err(|error| MavenError::InvalidMetadata(error.to_string()))?;
+    let response = match (
+        probe.group_id,
+        probe.artifact_id,
+        probe.versioning,
+        probe.plugins,
+    ) {
+        (Some(_), Some(_), Some(_), None) => {
+            let document: MavenMetadataDocument = from_str(&raw.body)
+                .map_err(|error| MavenError::InvalidMetadata(error.to_string()))?;
+            let expected_path = format!(
+                "{}/{}/maven-metadata.xml",
+                document.group_id.replace('.', "/"),
+                document.artifact_id
+            );
+            if relative_path != expected_path {
+                return Err(MavenError::InvalidMetadataPath(relative_path.to_string()));
+            }
+            filtered_metadata_from_raw(
+                config,
+                provider,
+                checker,
+                &document.group_id,
+                &document.artifact_id,
+                now,
+                raw,
+            )
+            .await?
+        }
+        (group_id, None, None, Some(plugins)) => {
+            if plugins.values.is_empty()
+                || plugins.values.iter().any(|plugin| {
+                    validate_metadata_token(&plugin.prefix).is_err()
+                        || validate_metadata_token(&plugin.artifact_id).is_err()
+                })
+            {
+                return Err(MavenError::InvalidMetadata(
+                    "group metadata has invalid plugin entries".to_string(),
+                ));
+            }
+            let _ = group_id;
+            RegistryResponse {
+                status: 200,
+                headers: vec![
+                    ("content-type".to_string(), "application/xml".to_string()),
+                    ("cache-control".to_string(), "no-cache".to_string()),
+                ],
+                body: raw.body.into_bytes(),
+            }
+        }
+        _ => {
+            return Err(MavenError::InvalidMetadata(
+                "metadata mixes group and artifact-level fields".to_string(),
+            ));
+        }
+    };
+    Ok(checksum.map_or_else(
+        || response.clone(),
+        |kind| checksum_response(&response, kind),
+    ))
+}
+
+fn validate_metadata_token(value: &str) -> Result<(), MavenError> {
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(MavenError::InvalidMetadata(format!(
+            "invalid plugin metadata token {value}"
+        )));
+    }
+    Ok(())
+}
+
+pub async fn group_metadata_response(
+    provider: &dyn MavenMetadataProvider,
+    relative_path: &str,
+) -> Result<RegistryResponse, MavenError> {
+    let raw = provider.fetch_metadata(relative_path).await?;
+    Ok(RegistryResponse {
+        status: 200,
+        headers: vec![
+            ("content-type".to_string(), "application/xml".to_string()),
+            ("cache-control".to_string(), "no-cache".to_string()),
+        ],
+        body: raw.body.into_bytes(),
+    })
+}
+
+fn render_metadata(
+    group_id: &str,
+    artifact_id: &str,
+    versions: &[String],
+    last_updated: Option<&str>,
+) -> Vec<u8> {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<metadata>\n");
+    xml.push_str(&format!("  <groupId>{}</groupId>\n", xml_escape(group_id)));
+    xml.push_str(&format!(
+        "  <artifactId>{}</artifactId>\n  <versioning>\n",
+        xml_escape(artifact_id)
+    ));
+    if let Some(latest) = versions.last() {
+        xml.push_str(&format!("    <latest>{}</latest>\n", xml_escape(latest)));
+        xml.push_str(&format!("    <release>{}</release>\n", xml_escape(latest)));
+    }
+    xml.push_str("    <versions>\n");
+    for version in versions {
+        xml.push_str(&format!(
+            "      <version>{}</version>\n",
+            xml_escape(version)
+        ));
+    }
+    xml.push_str("    </versions>\n");
+    if let Some(last_updated) = last_updated {
+        xml.push_str(&format!(
+            "    <lastUpdated>{}</lastUpdated>\n",
+            xml_escape(last_updated)
+        ));
+    }
+    xml.push_str("  </versioning>\n</metadata>\n");
+    xml.into_bytes()
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn metadata_body_response(body: Vec<u8>) -> RegistryResponse {
+    let etag = format!("\"{}\"", hex_digest::<Sha256>(&body));
+    RegistryResponse {
+        status: 200,
+        headers: vec![
+            ("content-type".to_string(), "application/xml".to_string()),
+            ("cache-control".to_string(), "no-cache".to_string()),
+            ("etag".to_string(), etag),
+        ],
+        body,
+    }
+}
+
+pub fn checksum_response(
+    metadata: &RegistryResponse,
+    checksum: MetadataChecksum,
+) -> RegistryResponse {
+    let digest = match checksum {
+        MetadataChecksum::Md5 => format!("{:x}", md5::compute(&metadata.body)),
+        MetadataChecksum::Sha1 => hex_digest::<Sha1>(&metadata.body),
+        MetadataChecksum::Sha256 => hex_digest::<Sha256>(&metadata.body),
+        MetadataChecksum::Sha512 => hex_digest::<Sha512>(&metadata.body),
+    };
+    RegistryResponse {
+        status: 200,
+        headers: vec![("content-type".to_string(), "text/plain".to_string())],
+        body: format!("{digest}\n").into_bytes(),
+    }
+}
+
+fn hex_digest<D: Digest + Default>(body: &[u8]) -> String {
+    let mut digest = D::new();
+    digest.update(body);
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub fn apply_if_none_match(
+    mut response: RegistryResponse,
+    if_none_match: Option<&str>,
+) -> RegistryResponse {
+    if response.status != 200 {
+        return response;
+    }
+    let etag = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("etag"))
+        .map(|(_, value)| value.as_str());
+    if if_none_match.is_some_and(|value| {
+        value.split(',').map(str::trim).any(|candidate| {
+            candidate == "*"
+                || etag.is_some_and(|etag| weak_entity_tag(candidate) == weak_entity_tag(etag))
+        })
+    }) {
+        response.status = 304;
+        response.body.clear();
+    }
+    response
+}
+
+fn weak_entity_tag(value: &str) -> &str {
+    value.strip_prefix("W/").unwrap_or(value)
+}
+
+pub fn error_response(error: &MavenError) -> RegistryResponse {
+    let status = match error {
+        MavenError::MetadataNotFound(_) | MavenError::VersionNotFound(_) => 404,
+        _ => 502,
+    };
+    RegistryResponse::json(
+        status,
+        &serde_json::json!({
+            "allowed": false,
+            "reason": "maven_upstream_error",
+            "message": error.to_string()
+        }),
+    )
+    .expect("static Maven error response should serialize")
+}
+
+async fn evaluate_artifacts(
+    config: &Config,
+    checker: &dyn MaliciousChecker,
+    artifacts: &[Artifact],
+    now: DateTime<Utc>,
+) -> Vec<Decision> {
+    let policy = PolicyEngine::new(config);
+    let indexed = artifacts
+        .iter()
+        .enumerate()
+        .filter(|(_, artifact)| policy.should_check_osv(artifact))
+        .map(|(index, artifact)| (index, artifact.clone()))
+        .collect::<Vec<_>>();
+    let checked = indexed
+        .iter()
+        .map(|(_, artifact)| artifact.clone())
+        .collect::<Vec<_>>();
+    let results = if checked.is_empty() {
+        Ok(Vec::new())
+    } else {
+        match checker.check_many(&checked).await {
+            Ok(results) if results.len() == checked.len() => Ok(results),
+            Ok(results) => Err(format!(
+                "Maven OSV batch returned {} results for {} artifacts",
+                results.len(),
+                checked.len()
+            )),
+            Err(error) => Err(error.to_string()),
+        }
+    };
+    artifacts
+        .iter()
+        .enumerate()
+        .map(|(index, artifact)| {
+            let result = indexed
+                .iter()
+                .position(|(artifact_index, _)| *artifact_index == index)
+                .map(|batch_index| match &results {
+                    Ok(results) => results.get(batch_index).cloned().ok_or_else(|| {
+                        format!("Maven OSV batch result missing for {}", artifact.identity())
+                    }),
+                    Err(error) => Err(error.clone()),
+                });
+            policy.evaluate_with_malicious_result(artifact, now, result)
+        })
+        .collect()
 }
 
 pub fn parse_package_name(package: &str) -> Result<(&str, &str), MavenError> {
@@ -427,12 +925,28 @@ pub enum MavenError {
     VersionNotFound(String),
     #[error("invalid Maven POM: {0}")]
     InvalidPom(String),
-    #[error("Maven POM exceeds the {0}-byte limit")]
-    PomTooLarge(usize),
+    #[error("{kind} exceeds the {limit}-byte limit")]
+    BodyTooLarge { kind: &'static str, limit: usize },
     #[error("Maven POM body could not be read: {0}")]
     BodyRead(String),
     #[error("Maven POM is not valid UTF-8: {0}")]
     InvalidPomEncoding(String),
+    #[error("Maven metadata is not valid UTF-8: {0}")]
+    InvalidMetadataEncoding(String),
+    #[error("invalid Maven metadata: {0}")]
+    InvalidMetadata(String),
+    #[error("invalid Maven metadata path: {0}")]
+    InvalidMetadataPath(String),
+    #[error("Maven metadata not found: {0}")]
+    MetadataNotFound(String),
+    #[error("Maven metadata coordinate mismatch: expected {expected}, got {actual}")]
+    MetadataCoordinateMismatch { expected: String, actual: String },
+    #[error("Maven snapshots are unsupported: {0}")]
+    SnapshotsUnsupported(String),
+    #[error("Maven metadata route is unsupported by this provider")]
+    UnsupportedMetadataRoute,
+    #[error("failed to enrich Maven version {version}: {message}")]
+    VersionEnrichment { version: String, message: String },
     #[error("Maven POM coordinate mismatch: expected {expected}, got {actual}")]
     CoordinateMismatch { expected: String, actual: String },
     #[error("Maven upstream request failed: {0}")]
@@ -442,6 +956,10 @@ pub enum MavenError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{BlocklistEntry, MissingPublishTime};
+    use crate::malicious::{MaliciousHit, OsvError};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     struct StaticProvider(MavenPomMetadata);
 
@@ -455,6 +973,115 @@ mod tests {
         ) -> Result<MavenPomMetadata, MavenError> {
             Ok(self.0.clone())
         }
+    }
+
+    struct StaticMetadataProvider {
+        metadata: String,
+        poms: HashMap<String, MavenPomMetadata>,
+        current: AtomicUsize,
+        maximum: AtomicUsize,
+        delay: bool,
+    }
+
+    #[async_trait]
+    impl MavenMetadataProvider for StaticMetadataProvider {
+        async fn fetch_pom(
+            &self,
+            _group_id: &str,
+            _artifact_id: &str,
+            version: &str,
+        ) -> Result<MavenPomMetadata, MavenError> {
+            let current = self.current.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            self.maximum.fetch_max(current, AtomicOrdering::SeqCst);
+            if self.delay {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            self.current.fetch_sub(1, AtomicOrdering::SeqCst);
+            self.poms
+                .get(version)
+                .cloned()
+                .ok_or_else(|| MavenError::VersionNotFound(format!("com.acme:demo@{version}")))
+        }
+
+        async fn fetch_metadata(
+            &self,
+            _relative_path: &str,
+        ) -> Result<MavenRawMetadata, MavenError> {
+            Ok(MavenRawMetadata {
+                body: self.metadata.clone(),
+            })
+        }
+    }
+
+    struct BatchChecker(AtomicUsize);
+
+    #[async_trait]
+    impl MaliciousChecker for BatchChecker {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, OsvError> {
+            panic!("metadata filtering should use check_many")
+        }
+
+        async fn check_many(
+            &self,
+            artifacts: &[Artifact],
+        ) -> Result<Vec<Vec<MaliciousHit>>, OsvError> {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(vec![Vec::new(); artifacts.len()])
+        }
+    }
+
+    struct MaliciousBatchChecker(AtomicUsize);
+
+    #[async_trait]
+    impl MaliciousChecker for MaliciousBatchChecker {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, OsvError> {
+            panic!("metadata filtering should use check_many")
+        }
+
+        async fn check_many(
+            &self,
+            artifacts: &[Artifact],
+        ) -> Result<Vec<Vec<MaliciousHit>>, OsvError> {
+            self.0.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(artifacts
+                .iter()
+                .map(|artifact| {
+                    (artifact.version == "4.0")
+                        .then(|| {
+                            vec![MaliciousHit {
+                                osv_id: "MAL-2026-000001".to_string(),
+                                summary: None,
+                                source: "osv".to_string(),
+                                modified: None,
+                                effective_severity: None,
+                                evaluation_error: None,
+                            }]
+                        })
+                        .unwrap_or_default()
+                })
+                .collect())
+        }
+    }
+
+    fn pom_metadata(version: &str) -> MavenPomMetadata {
+        MavenPomMetadata {
+            body: format!(
+                "<project><groupId>com.acme</groupId><artifactId>demo</artifactId><version>{version}</version></project>"
+            ),
+            last_modified: Some("Sun, 01 Jun 2025 00:00:00 GMT".to_string()),
+            sha256: None,
+            upstream_url: format!("https://repo.example/demo/{version}/demo-{version}.pom"),
+        }
+    }
+
+    fn metadata_xml(versions: &[String]) -> String {
+        format!(
+            "<metadata><groupId>com.acme</groupId><artifactId>demo</artifactId><versioning><latest>ignored</latest><release>ignored</release><versions>{}</versions><lastUpdated>20260711000000</lastUpdated></versioning></metadata>",
+            versions
+                .iter()
+                .map(|version| format!("<version>{version}</version>"))
+                .collect::<String>()
+        )
     }
 
     #[test]
@@ -555,7 +1182,10 @@ mod tests {
     fn rejects_oversized_declared_pom_length() {
         assert!(matches!(
             ensure_pom_content_length(Some(MAX_POM_BYTES as u64 + 1)),
-            Err(MavenError::PomTooLarge(MAX_POM_BYTES))
+            Err(MavenError::BodyTooLarge {
+                kind: "POM",
+                limit: MAX_POM_BYTES
+            })
         ));
         ensure_pom_content_length(Some(MAX_POM_BYTES as u64)).unwrap();
     }
@@ -568,7 +1198,10 @@ mod tests {
         ]);
         assert!(matches!(
             collect_bounded_pom(chunks).await,
-            Err(MavenError::PomTooLarge(MAX_POM_BYTES))
+            Err(MavenError::BodyTooLarge {
+                kind: "Maven POM",
+                limit: MAX_POM_BYTES
+            })
         ));
     }
 
@@ -616,5 +1249,259 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(artifact.published_at, None);
+    }
+
+    #[tokio::test]
+    async fn metadata_filters_policy_denials_and_missing_versions_in_one_batch() {
+        let mut config = Config::default();
+        config.policy.missing_publish_time = MissingPublishTime::Allow;
+        config.blocklist.push(BlocklistEntry {
+            ecosystem: Ecosystem::Maven,
+            name: "com.acme:demo".to_string(),
+            versions: vec!["2.0".to_string()],
+            reason: "blocked fixture".to_string(),
+        });
+        let provider = StaticMetadataProvider {
+            metadata: metadata_xml(&[
+                "1.0".into(),
+                "2.0".into(),
+                "2.5".into(),
+                "3.0".into(),
+                "4.0".into(),
+            ]),
+            poms: HashMap::from([
+                ("1.0".to_string(), pom_metadata("1.0")),
+                ("2.0".to_string(), pom_metadata("2.0")),
+                (
+                    "2.5".to_string(),
+                    MavenPomMetadata {
+                        last_modified: Some("Fri, 10 Jul 2026 12:00:00 GMT".to_string()),
+                        ..pom_metadata("2.5")
+                    },
+                ),
+                ("4.0".to_string(), pom_metadata("4.0")),
+            ]),
+            current: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+            delay: false,
+        };
+        let checker = MaliciousBatchChecker(AtomicUsize::new(0));
+
+        let response = filtered_metadata_response(
+            &config,
+            &provider,
+            &checker,
+            "com.acme",
+            "demo",
+            DateTime::parse_from_rfc3339("2026-07-11T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .await
+        .unwrap();
+        let body = String::from_utf8(response.body.clone()).unwrap();
+        assert!(body.contains("<latest>1.0</latest>"));
+        assert!(body.contains("<release>1.0</release>"));
+        assert!(body.contains("<version>1.0</version>"));
+        assert!(!body.contains("<version>2.0</version>"));
+        assert!(!body.contains("<version>2.5</version>"));
+        assert!(!body.contains("<version>3.0</version>"));
+        assert!(!body.contains("<version>4.0</version>"));
+        assert_eq!(checker.0.load(AtomicOrdering::SeqCst), 1);
+
+        let etag = response
+            .headers
+            .iter()
+            .find(|(name, _)| name == "etag")
+            .unwrap()
+            .1
+            .clone();
+        let conditional = apply_if_none_match(response.clone(), Some(&etag));
+        assert_eq!(conditional.status, 304);
+        assert!(conditional.body.is_empty());
+        for checksum in [
+            MetadataChecksum::Md5,
+            MetadataChecksum::Sha1,
+            MetadataChecksum::Sha256,
+            MetadataChecksum::Sha512,
+        ] {
+            let sidecar = checksum_response(&response, checksum);
+            assert_eq!(sidecar.status, 200);
+            assert!(sidecar.body.ends_with(b"\n"));
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_enrichment_never_exceeds_concurrency_bound() {
+        let versions = (0..24)
+            .map(|index| format!("1.0.{index}"))
+            .collect::<Vec<_>>();
+        let provider = StaticMetadataProvider {
+            metadata: metadata_xml(&versions),
+            poms: versions
+                .iter()
+                .map(|version| (version.clone(), pom_metadata(version)))
+                .collect(),
+            current: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+            delay: true,
+        };
+        let mut config = Config::default();
+        config.policy.minimum_age = Duration::ZERO;
+        config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
+        let checker = BatchChecker(AtomicUsize::new(0));
+
+        filtered_metadata_response(&config, &provider, &checker, "com.acme", "demo", Utc::now())
+            .await
+            .unwrap();
+        assert!(provider.maximum.load(AtomicOrdering::SeqCst) <= 16);
+        assert!(provider.maximum.load(AtomicOrdering::SeqCst) > 1);
+    }
+
+    #[tokio::test]
+    async fn metadata_rejects_coordinate_mismatch_and_snapshots() {
+        let config = Config::default();
+        let checker = BatchChecker(AtomicUsize::new(0));
+        let mismatch = StaticMetadataProvider {
+            metadata: "<metadata><groupId>other</groupId><artifactId>demo</artifactId><versioning><versions><version>1.0</version></versions></versioning></metadata>".to_string(),
+            poms: HashMap::new(),
+            current: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+            delay: false,
+        };
+        assert!(matches!(
+            filtered_metadata_response(
+                &config,
+                &mismatch,
+                &checker,
+                "com.acme",
+                "demo",
+                Utc::now()
+            )
+            .await,
+            Err(MavenError::MetadataCoordinateMismatch { .. })
+        ));
+
+        let snapshot = StaticMetadataProvider {
+            metadata: metadata_xml(&["1.0-SNAPSHOT".to_string()]),
+            poms: HashMap::new(),
+            current: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+            delay: false,
+        };
+        assert!(matches!(
+            filtered_metadata_response(
+                &config,
+                &snapshot,
+                &checker,
+                "com.acme",
+                "demo",
+                Utc::now()
+            )
+            .await,
+            Err(MavenError::SnapshotsUnsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn metadata_route_passes_group_plugin_metadata_and_owns_checksum() {
+        let raw = "<metadata><plugins><plugin><name>Compiler</name><prefix>compiler</prefix><artifactId>maven-compiler-plugin</artifactId></plugin></plugins></metadata>";
+        let provider = StaticMetadataProvider {
+            metadata: raw.to_string(),
+            poms: HashMap::new(),
+            current: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+            delay: false,
+        };
+        let response = metadata_route_response(
+            &Config::default(),
+            &provider,
+            &BatchChecker(AtomicUsize::new(0)),
+            "org/apache/maven/plugins/maven-metadata.xml",
+            None,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.body, raw.as_bytes());
+
+        let checksum = metadata_route_response(
+            &Config::default(),
+            &provider,
+            &BatchChecker(AtomicUsize::new(0)),
+            "org/apache/maven/plugins/maven-metadata.xml",
+            Some(MetadataChecksum::Sha256),
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(checksum.body).unwrap(),
+            format!("{}\n", hex_digest::<Sha256>(raw.as_bytes()))
+        );
+    }
+
+    #[test]
+    fn conditional_metadata_uses_weak_entity_tag_comparison() {
+        let response = metadata_body_response(b"metadata".to_vec());
+        let etag = response
+            .headers
+            .iter()
+            .find(|(name, _)| name == "etag")
+            .unwrap()
+            .1
+            .clone();
+        assert_eq!(
+            apply_if_none_match(response.clone(), Some(&format!("W/{etag}"))).status,
+            304
+        );
+        assert_eq!(
+            apply_if_none_match(response.clone(), Some(&format!("\"other\", W/{etag}"))).status,
+            304
+        );
+        assert_eq!(
+            apply_if_none_match(response, Some("W/\"other\"")).status,
+            200
+        );
+    }
+
+    #[test]
+    fn conditional_metadata_wildcard_only_applies_to_existing_representation() {
+        let response = metadata_body_response(b"metadata".to_vec());
+        assert_eq!(apply_if_none_match(response, Some("*")).status, 304);
+
+        for status in [404, 502] {
+            let error =
+                RegistryResponse::json(status, &serde_json::json!({"message": "upstream failure"}))
+                    .unwrap();
+            let preserved = apply_if_none_match(error.clone(), Some("*"));
+            assert_eq!(preserved, error);
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_route_does_not_pass_through_malformed_artifact_metadata() {
+        let provider = StaticMetadataProvider {
+            metadata:
+                "<metadata><groupId>com.acme</groupId><artifactId>demo</artifactId><versioning>"
+                    .to_string(),
+            poms: HashMap::new(),
+            current: AtomicUsize::new(0),
+            maximum: AtomicUsize::new(0),
+            delay: false,
+        };
+        assert!(matches!(
+            metadata_route_response(
+                &Config::default(),
+                &provider,
+                &BatchChecker(AtomicUsize::new(0)),
+                "com/acme/demo/maven-metadata.xml",
+                None,
+                Utc::now()
+            )
+            .await,
+            Err(MavenError::InvalidMetadata(_))
+        ));
     }
 }

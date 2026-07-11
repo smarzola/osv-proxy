@@ -5,6 +5,7 @@ use crate::go::{self, GoProxyClient};
 use crate::malicious::{
     HttpOsvDumpClient, MaliciousChecker, OsvDumpClient, configured_malicious_checker, sync_osv,
 };
+use crate::maven::{self, MavenRepositoryClient, MetadataChecksum};
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
 use crate::nuget::{self, NugetClient};
 use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
@@ -400,7 +401,27 @@ async fn route_http_request_with_accept_and_headers(
     let delivery = ArtifactDeliveryClient::new();
     let nuget_upstream = NugetClient::new(&config.upstreams.nuget.service_index_url);
     let rubygems_upstream = RubyGemsClient::new(&config.upstreams.rubygems.registry_url);
+    let maven_upstream = MavenRepositoryClient::new(&config.upstreams.maven.repository_url);
     let now = Utc::now();
+
+    if let Some((relative_path, checksum)) = parse_maven_metadata_route(path) {
+        return maven::apply_if_none_match(
+            maven::metadata_route_response(
+                config,
+                &maven_upstream,
+                checker,
+                &relative_path,
+                checksum,
+                now,
+            )
+            .await
+            .unwrap_or_else(|error| maven::error_response(&error)),
+            headers
+                .get(header::IF_NONE_MATCH)
+                .and_then(|value| value.to_str().ok()),
+        )
+        .into_http_response();
+    }
 
     if let Some(route) = parse_rubygems_route(path) {
         return match route {
@@ -665,6 +686,31 @@ enum RubyGemsRoute {
     Versions,
     Info { name: String },
     Artifact { filename: String },
+}
+
+fn parse_maven_metadata_route(path: &str) -> Option<(String, Option<MetadataChecksum>)> {
+    let path = path.split('?').next().unwrap_or(path);
+    let relative = path.strip_prefix("/maven/")?;
+    if relative.contains('%')
+        || relative
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        return None;
+    }
+    let (base, checksum) = if let Some((base, suffix)) = relative.rsplit_once('.') {
+        if base.ends_with("maven-metadata.xml") {
+            (base, Some(MetadataChecksum::from_suffix(suffix)?))
+        } else {
+            (relative, None)
+        }
+    } else {
+        (relative, None)
+    };
+    if !base.ends_with("maven-metadata.xml") || base.split('/').count() < 2 {
+        return None;
+    }
+    Some((base.to_string(), checksum))
 }
 
 fn parse_rubygems_route(path: &str) -> Option<RubyGemsRoute> {
@@ -1202,6 +1248,44 @@ mod tests {
         );
         assert_eq!(parse_rubygems_route("/rubygems/api/v1/gems"), None);
         assert_eq!(parse_rubygems_route("/rubygems/info/../secret"), None);
+    }
+
+    #[test]
+    fn parses_only_strict_maven_metadata_routes() {
+        assert_eq!(
+            parse_maven_metadata_route("/maven/com/acme/demo/maven-metadata.xml"),
+            Some(("com/acme/demo/maven-metadata.xml".to_string(), None))
+        );
+        assert_eq!(
+            parse_maven_metadata_route("/maven/com/acme/demo/maven-metadata.xml.sha256"),
+            Some((
+                "com/acme/demo/maven-metadata.xml".to_string(),
+                Some(MetadataChecksum::Sha256)
+            ))
+        );
+        assert_eq!(
+            parse_maven_metadata_route("/maven/org/plugins/maven-metadata.xml.sha1?x=1"),
+            Some((
+                "org/plugins/maven-metadata.xml".to_string(),
+                Some(MetadataChecksum::Sha1)
+            ))
+        );
+        assert_eq!(
+            parse_maven_metadata_route("/maven/com/acme/demo/1.0/demo-1.0.jar"),
+            None
+        );
+        assert_eq!(
+            parse_maven_metadata_route("/maven/com/acme/../secret/maven-metadata.xml"),
+            None
+        );
+        assert_eq!(
+            parse_maven_metadata_route("/maven/com/acme%2Fdemo/maven-metadata.xml"),
+            None
+        );
+        assert_eq!(
+            parse_maven_metadata_route("/maven/com/acme/demo/maven-metadata.xml.sha3"),
+            None
+        );
     }
 
     #[tokio::test]

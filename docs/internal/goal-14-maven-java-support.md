@@ -172,7 +172,7 @@ The goal is complete only when:
 ## Milestones
 
 - [x] Milestone 1: Maven identity, configuration, version semantics, OSV, and CLI
-- [ ] Milestone 2: Policy-filtered Maven metadata and response semantics
+- [x] Milestone 2: Policy-filtered Maven metadata and response semantics
 - [ ] Milestone 3: Protected coordinate-scoped delivery and routing
 - [ ] Milestone 4: Real Maven/Gradle workflows, CI, docs, and full regression
 
@@ -268,7 +268,16 @@ cargo test maven::tests
 cargo test server::tests
 ```
 
-Status: Not started.
+Status: Completed 2026-07-11. Added bounded artifact/group metadata fetching,
+strict Maven XML shape validation, at-most-16 concurrent POM enrichment,
+single-batch OSV evaluation, filtering for missing and policy-denied releases,
+derived latest/release values, proxy-owned ETag/conditional handling, and
+MD5/SHA-1/SHA-256/SHA-512 sidecars. Verification passed:
+`cargo test maven::tests` (16), `cargo test server::tests` (29), and
+`git diff --check`. Adversarial review required two repair rounds for the real
+rootless Maven Central plugin-prefix metadata shape, weak entity-tag comparison,
+and preserving `404`/`502` responses under wildcard conditionals. Final
+re-review reported no findings and no blocking findings remain.
 
 ## Milestone 3: Protected Release Delivery
 
