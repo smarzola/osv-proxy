@@ -5,6 +5,24 @@ source for GitHub release notes.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-11
+
+### Added
+
+- Add Maven Central repository support for Maven and Gradle through `/maven/`,
+  with policy-filtered release metadata and Maven-compatible version ordering.
+- Protect POMs, JARs, Gradle module metadata, classifiers, signatures, and
+  checksums through policy-aware redirect or proxy delivery.
+- Add live and local OSV evaluation for canonical Maven coordinates, including
+  Maven advisory synchronization and CLI `check`/`eval` identities.
+- Add hermetic Maven and Gradle coverage for transitive graphs, BOM imports,
+  dynamic versions, Gradle Module Metadata, lock state, and policy denials.
+
+### Changed
+
+- Provision pinned Java 21, Maven 3.9.11, and Gradle 8.14.3 clients in CI and
+  tagged release tests.
+
 ## [0.6.0] - 2026-07-11
 
 ### Added

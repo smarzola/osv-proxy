@@ -91,6 +91,34 @@ jobs:
           rustup default stable
           rustup component add rustfmt
 
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.7+6.0.LTS'
+
+      - name: Install Maven
+        shell: bash
+        env:
+          MAVEN_VERSION: '3.9.11'
+          MAVEN_SHA512: 'bcfe4fe305c962ace56ac7b5fc7a08b87d5abd8b7e89027ab251069faebee516b0ded8961445d6d91ec1985dfe30f8153268843c89aa392733d1a3ec956c9978'
+        run: |
+          set -euo pipefail
+          archive="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          base="https://archive.apache.org/dist/maven/maven-3/${MAVEN_VERSION}/binaries"
+          mkdir -p "${RUNNER_TEMP}/maven"
+          cd "${RUNNER_TEMP}/maven"
+          curl --fail --location --retry 3 --output "${archive}" "${base}/${archive}"
+          echo "${MAVEN_SHA512}  ${archive}" | sha512sum --check --strict
+          tar --extract --gzip --file "${archive}"
+          echo "${RUNNER_TEMP}/maven/apache-maven-${MAVEN_VERSION}/bin" >> "${GITHUB_PATH}"
+
+      - name: Install Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+          cache-disabled: true
+
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
