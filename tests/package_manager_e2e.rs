@@ -163,6 +163,8 @@ fn write_nuget_proxy_config(project: &Path, proxy: &TestServer) {
 }
 
 fn run_dotnet_restore(project: &Path, packages: PathBuf, locked: bool) -> Output {
+    let dotnet_home = project.join(".dotnet-home");
+    fs::create_dir_all(&dotnet_home).unwrap();
     let mut command = Command::new("dotnet");
     command.arg("restore");
     if locked {
@@ -176,6 +178,8 @@ fn run_dotnet_restore(project: &Path, packages: PathBuf, locked: bool) -> Output
             packages.to_str().unwrap(),
         ])
         .current_dir(project)
+        .env("DOTNET_CLI_HOME", dotnet_home)
+        .env("DOTNET_SKIP_FIRST_TIME_EXPERIENCE", "1")
         .output()
         .unwrap()
 }
