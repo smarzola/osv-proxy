@@ -261,5 +261,14 @@ and `If-Modified-Since`. It preserves useful upstream artifact response headers
 such as `Content-Type`, `Content-Length`, `ETag`, `Last-Modified`,
 `Accept-Ranges`, `Content-Range`, `Cache-Control`, and `Expires`.
 
+Before connecting, proxy mode validates the URL and every resolved address.
+Public HTTPS CDN origins are accepted. Plain HTTP and non-public destinations
+are accepted only for an exact configured ecosystem origin or an explicit
+`artifacts.trusted_origins` entry. A configured origin cannot be borrowed by a
+different ecosystem or contacted on a different port. System proxy settings
+are ignored, and upstream redirects fail with `502` rather than being followed.
+NuGet applies the same checks to service-index registration resources and
+registration page links before fetching their bounded JSON metadata.
+
 `proxy_cache_s3` is not implemented. Configurations that select it are rejected
 until a future S3 cache milestone implements cache reads and writes.

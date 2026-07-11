@@ -205,6 +205,7 @@ pub async fn artifact_delivery_response(
         .client
         .deliver(
             config,
+            artifact.ecosystem,
             artifact
                 .upstream_url
                 .clone()
@@ -223,7 +224,7 @@ pub async fn artifact_response(
     version: &str,
     now: DateTime<Utc>,
 ) -> RegistryResponse {
-    let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+    let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(config);
     match artifact_delivery_response(
         config,
         provider,

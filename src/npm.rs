@@ -98,7 +98,7 @@ pub async fn artifact_response(
     tarball: &str,
     now: DateTime<Utc>,
 ) -> Result<NpmResponse, NpmError> {
-    let delivery = ArtifactDeliveryClient::new();
+    let delivery = ArtifactDeliveryClient::for_config(config);
     let response = artifact_delivery_response(
         config,
         upstream,
@@ -139,7 +139,7 @@ pub async fn artifact_delivery_response(
             .ok_or_else(|| NpmError::MissingTarballUrl(route.package.to_string(), version))?;
         Ok(delivery
             .client
-            .deliver(config, location, delivery.request_headers)
+            .deliver(config, Ecosystem::Npm, location, delivery.request_headers)
             .await?)
     } else {
         let body = serde_json::to_value(decision)?;
@@ -855,6 +855,12 @@ mod tests {
              npm-tarball",
         )
         .await;
+        config.artifacts.trusted_origins.push(
+            reqwest::Url::parse(&tarball_url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        );
         let metadata = json!({
             "name": "demo",
             "time": { "1.0.0": "2026-06-01T00:00:00Z" },
@@ -868,7 +874,7 @@ mod tests {
         });
         let upstream = StaticUpstream::new("demo", metadata);
         let checker = CleanChecker::new();
-        let delivery = ArtifactDeliveryClient::new();
+        let delivery = ArtifactDeliveryClient::for_config(&config);
         let mut headers = HeaderMap::new();
         headers.insert(header::RANGE, "bytes=0-10".parse().unwrap());
 

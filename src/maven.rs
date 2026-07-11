@@ -839,13 +839,23 @@ pub async fn artifact_delivery_response(
     if delivery.head {
         delivery
             .client
-            .deliver_head(config, upstream_url, delivery.request_headers)
+            .deliver_head(
+                config,
+                Ecosystem::Maven,
+                upstream_url,
+                delivery.request_headers,
+            )
             .await
             .map_err(MavenError::Delivery)
     } else {
         delivery
             .client
-            .deliver(config, upstream_url, delivery.request_headers)
+            .deliver(
+                config,
+                Ecosystem::Maven,
+                upstream_url,
+                delivery.request_headers,
+            )
             .await
             .map_err(MavenError::Delivery)
     }
@@ -1840,7 +1850,7 @@ mod tests {
             validations: AtomicUsize::new(0),
         };
         let route = parse_release_path("com/acme/demo/1.0/demo-1.0.jar").unwrap();
-        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(&config);
         let response = artifact_delivery_response(
             &config,
             &provider,
@@ -1878,7 +1888,7 @@ mod tests {
         };
         let checker = CapturingChecker(Mutex::new(None));
         let route = parse_release_path("com/acme/demo/1.0/demo-1.0.jar").unwrap();
-        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(&config);
         artifact_delivery_response(
             &config,
             &provider,
@@ -1903,7 +1913,7 @@ mod tests {
             validations: AtomicUsize::new(0),
         };
         let route = parse_release_path("com/acme/demo/1.0/demo-1.0.jar").unwrap();
-        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(&config);
         let error = match artifact_delivery_response(
             &config,
             &provider,
@@ -1941,7 +1951,7 @@ mod tests {
             validations: AtomicUsize::new(0),
         };
         let route = parse_release_path("com/acme/demo/1.0/demo-1.0.jar").unwrap();
-        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(&config);
         let error = match artifact_delivery_response(
             &config,
             &provider,
@@ -1977,7 +1987,7 @@ mod tests {
             validations: AtomicUsize::new(0),
         };
         let route = parse_release_path("com/acme/demo/1.0/demo-1.0.jar").unwrap();
-        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(&config);
         let response = artifact_delivery_response(
             &config,
             &provider,

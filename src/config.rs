@@ -39,6 +39,9 @@ impl Config {
                 "artifacts.behavior=proxy_cache_s3 is not supported yet".to_string(),
             ));
         }
+        for origin in &self.artifacts.trusted_origins {
+            validate_trusted_origin(origin)?;
+        }
         self.policy.osv.validate()?;
         for entry in &self.allowlist {
             if entry.version == "*" {
@@ -346,12 +349,14 @@ pub enum LocalOsvStaleBehavior {
 #[serde(default, deny_unknown_fields)]
 pub struct ArtifactsConfig {
     pub behavior: ArtifactBehavior,
+    pub trusted_origins: Vec<String>,
 }
 
 impl Default for ArtifactsConfig {
     fn default() -> Self {
         Self {
             behavior: ArtifactBehavior::Redirect,
+            trusted_origins: Vec::new(),
         }
     }
 }
@@ -421,6 +426,27 @@ fn looks_like_range(version: &str) -> bool {
         || version.contains('^')
         || version.contains(',')
         || version.contains(' ')
+}
+
+fn validate_trusted_origin(value: &str) -> Result<(), ConfigError> {
+    let url = reqwest::Url::parse(value).map_err(|error| {
+        ConfigError::Invalid(format!(
+            "artifacts.trusted_origins entry {value:?} is not a valid URL: {error}"
+        ))
+    })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ConfigError::Invalid(format!(
+            "artifacts.trusted_origins entry {value:?} must be an http(s) origin without credentials, path, query, or fragment"
+        )));
+    }
+    Ok(())
 }
 
 mod duration_format {
@@ -735,6 +761,35 @@ artifacts:
         .unwrap();
 
         assert_eq!(config.artifacts.behavior, ArtifactBehavior::Proxy);
+    }
+
+    #[test]
+    fn artifact_trusted_origins_require_exact_http_origins() {
+        let config = load(
+            r#"
+artifacts:
+  behavior: proxy
+  trusted_origins:
+    - https://cdn.example
+    - http://127.0.0.1:8081
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.artifacts.trusted_origins.len(), 2);
+
+        for invalid in [
+            "ftp://cdn.example",
+            "https://user@cdn.example",
+            "https://cdn.example/path",
+            "https://cdn.example?query=yes",
+            "not-a-url",
+        ] {
+            let error = load(&format!(
+                "artifacts:\n  trusted_origins:\n    - {invalid}\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("trusted_origins"));
+        }
     }
 
     #[test]

@@ -247,7 +247,7 @@ async fn registry_check_with_upstreams(
         ],
         Ecosystem::Nuget => vec![
             crate::nuget::lookup_artifact(
-                &NugetClient::new(&config.upstreams.nuget.service_index_url),
+                &NugetClient::for_config(config),
                 &identity.name,
                 &identity.version,
             )

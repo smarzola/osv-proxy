@@ -629,7 +629,12 @@ pub async fn artifact_delivery_response(
         .ok_or_else(|| RubyGemsError::InvalidMetadata("resolved gem has no upstream URL".into()))?;
     delivery
         .client
-        .deliver(config, upstream, delivery.request_headers)
+        .deliver(
+            config,
+            Ecosystem::RubyGems,
+            upstream,
+            delivery.request_headers,
+        )
         .await
         .map_err(RubyGemsError::ArtifactDelivery)
 }
@@ -1128,7 +1133,7 @@ mod tests {
         config.policy.minimum_age = Duration::ZERO;
         config.policy.osv.block_malicious = false;
         config.policy.osv.block_vulnerabilities = false;
-        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(&config);
         let allowed = artifact_delivery_response(
             &config,
             &provider,
@@ -1199,14 +1204,20 @@ mod tests {
                 .unwrap();
         });
         let mut metadata = gem("1.0.0", "ruby", false);
-        metadata.gem_uri = url;
+        metadata.gem_uri = url.clone();
         let provider = StaticProvider(HashMap::from([("demo".into(), vec![metadata])]));
         let mut config = Config::default();
         config.artifacts.behavior = crate::config::ArtifactBehavior::Proxy;
+        config.artifacts.trusted_origins.push(
+            reqwest::Url::parse(&url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        );
         config.policy.minimum_age = Duration::ZERO;
         config.policy.osv.block_malicious = false;
         config.policy.osv.block_vulnerabilities = false;
-        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(&config);
         let response = artifact_delivery_response(
             &config,
             &provider,

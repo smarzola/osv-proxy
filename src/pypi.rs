@@ -154,7 +154,7 @@ pub async fn artifact_response(
     filename: &str,
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, PypiError> {
-    let delivery = ArtifactDeliveryClient::new();
+    let delivery = ArtifactDeliveryClient::for_config(config);
     let response = artifact_delivery_response(
         config,
         upstream,
@@ -217,7 +217,7 @@ pub async fn artifact_delivery_response(
             .ok_or_else(|| PypiError::MissingFileUrl(route.filename.to_string()))?;
         Ok(delivery
             .client
-            .deliver(config, location, delivery.request_headers)
+            .deliver(config, Ecosystem::Pypi, location, delivery.request_headers)
             .await?)
     } else {
         let body = serde_json::to_value(decision)?;
@@ -1162,12 +1162,18 @@ mod tests {
              pypi-file",
         )
         .await;
+        config.artifacts.trusted_origins.push(
+            reqwest::Url::parse(&file_url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        );
         let mut simple = simple_fixture();
         simple.files = vec![file("demo-1.0.0.tar.gz", &file_url, Some(old_time()))];
         simple.versions = vec!["1.0.0".to_string()];
         let upstream = StaticSimple::new("demo", simple);
         let checker = CleanChecker::new();
-        let delivery = ArtifactDeliveryClient::new();
+        let delivery = ArtifactDeliveryClient::for_config(&config);
         let mut headers = HeaderMap::new();
         headers.insert(header::RANGE, "bytes=0-8".parse().unwrap());
 

@@ -25,6 +25,7 @@ policy:
     on_error: "block"
 artifacts:
   behavior: redirect
+  trusted_origins: []
 ```
 
 Validate it with:
@@ -87,14 +88,28 @@ local configs can omit this section.
 ```yaml
 artifacts:
   behavior: redirect
+  trusted_origins:
+    - "http://packages.internal.example:8081"
 ```
 
 - `behavior`: `redirect` or `proxy`. Defaults to `redirect`.
+- `trusted_origins`: exact HTTP or HTTPS origins that artifact delivery may
+  contact in addition to the configured ecosystem upstreams. Entries must not
+  contain credentials, paths, queries, or fragments. Keep this list minimal;
+  it is shared by all ecosystems and may explicitly permit private addresses.
 - `redirect`: after the second policy check, allowed artifact requests return
   `302 Location` to the upstream tarball or file URL.
 - `proxy`: after the second policy check, allowed artifact requests fetch the
   verified upstream artifact URL and stream the upstream response through
   `osv-proxy`.
+
+Artifact destinations are restricted before any proxy connection. Public HTTPS
+origins are allowed so registries can use their public CDNs. Plain HTTP and
+private, loopback, link-local, or otherwise non-public addresses require an
+exact origin configured for that ecosystem under `upstreams` or listed in
+`trusted_origins`. Artifact requests do not use system HTTP proxies, and
+upstream redirects are rejected instead of followed. NuGet registration URLs
+discovered through service-index and page metadata use the same boundary.
 
 `proxy_cache_s3` is reserved for future S3-compatible artifact caching and is
 rejected as unsupported.

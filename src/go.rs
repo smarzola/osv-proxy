@@ -321,6 +321,7 @@ pub async fn route_response(
                 .client
                 .deliver(
                     config,
+                    Ecosystem::Go,
                     upstream.resource_url(module, version, extension)?,
                     delivery.request_headers,
                 )
@@ -560,7 +561,7 @@ mod tests {
             versions: vec!["v1.0.1".into()],
             reason: "test".into(),
         });
-        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(&config);
         let response = route_response(
             &config,
             &Fixture,

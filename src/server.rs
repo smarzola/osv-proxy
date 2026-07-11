@@ -150,7 +150,7 @@ pub async fn route_request_with_accept(
             .await
             .unwrap_or_else(|error| rubygems::error_response(&error)),
             RubyGemsRoute::Artifact { filename } => {
-                let delivery = ArtifactDeliveryClient::new();
+                let delivery = ArtifactDeliveryClient::for_config(config);
                 match rubygems::artifact_delivery_response(
                     config,
                     &rubygems_upstream,
@@ -168,7 +168,7 @@ pub async fn route_request_with_accept(
         };
     }
     if let Some((module, route)) = go::parse_route(path) {
-        let delivery = ArtifactDeliveryClient::new();
+        let delivery = ArtifactDeliveryClient::for_config(config);
         return go::route_response(
             config,
             &go_upstream,
@@ -226,7 +226,7 @@ pub async fn route_request_with_upstreams(
     pypi_upstream: &dyn PypiSimpleProvider,
 ) -> RegistryResponse {
     if let Some((module, route)) = go::parse_route(path) {
-        let delivery = ArtifactDeliveryClient::new();
+        let delivery = ArtifactDeliveryClient::for_config(config);
         let go_upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
         return go::route_response(
             config,
@@ -282,7 +282,7 @@ async fn route_request_with_dependencies(
                 .unwrap_or_else(|err| cargo::error_response(&err))
         }
         Some(CargoRoute::Artifact { name, version }) => {
-            let delivery = ArtifactDeliveryClient::new();
+            let delivery = ArtifactDeliveryClient::for_config(config);
             match cargo::artifact_delivery_response(
                 config,
                 &cargo_upstream,
@@ -377,6 +377,9 @@ fn nuget_error_response(error: crate::nuget::NugetError) -> RegistryResponse {
         {
             404
         }
+        crate::nuget::NugetError::Egress(
+            crate::artifacts::ArtifactDeliveryError::UpstreamStatus(404 | 410),
+        ) => 404,
         _ => 502,
     };
     RegistryResponse::json(status, &serde_json::json!({"allowed": false, "reason": "nuget_upstream_error", "message": error.to_string()})).expect("static NuGet error response")
@@ -403,8 +406,8 @@ async fn route_http_request_with_accept_and_headers(
     let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
     let go_upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
     let cargo_upstream = CargoRegistryClient::new(config);
-    let delivery = ArtifactDeliveryClient::new();
-    let nuget_upstream = NugetClient::new(&config.upstreams.nuget.service_index_url);
+    let delivery = ArtifactDeliveryClient::for_config(config);
+    let nuget_upstream = NugetClient::for_config(config);
     let rubygems_upstream = RubyGemsClient::new(&config.upstreams.rubygems.registry_url);
     let maven_upstream = MavenRepositoryClient::new(&config.upstreams.maven.repository_url);
     let now = Utc::now();
@@ -543,8 +546,13 @@ async fn route_http_request_with_accept_and_headers(
                     .map(|(base, _)| format!("{base}/{package}.nuspec"))
                     .unwrap_or(upstream);
             }
-            Ok(ArtifactDeliveryClient::new()
-                .deliver(config, upstream, Some(headers))
+            Ok(ArtifactDeliveryClient::for_config(config)
+                .deliver(
+                    config,
+                    crate::artifact::Ecosystem::Nuget,
+                    upstream,
+                    Some(headers),
+                )
                 .await
                 .map_err(|err| crate::nuget::NugetError::InvalidMetadata(err.to_string()))?
                 .into_http_response())
@@ -2355,6 +2363,12 @@ INSERT INTO advisories (
         let mut config = Config::default();
         config.artifacts.behavior = ArtifactBehavior::Proxy;
         config.upstreams.npm.registry_url = registry_url;
+        config.artifacts.trusted_origins.push(
+            reqwest::Url::parse(&artifact_base_url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        );
 
         let response = router(config)
             .oneshot(

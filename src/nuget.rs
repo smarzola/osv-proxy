@@ -1,4 +1,5 @@
 use crate::artifact::{Artifact, Ecosystem, normalize_nuget_name, normalize_nuget_version};
+use crate::artifacts::{ArtifactDeliveryClient, ArtifactDeliveryError};
 use crate::config::Config;
 use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
@@ -7,12 +8,10 @@ use crate::response::RegistryResponse;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::stream::{FuturesUnordered, StreamExt};
-use reqwest::Client;
 use serde_json::Value;
 use std::time::Duration;
 use thiserror::Error;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REGISTRATION_PAGES: usize = 64;
 const MAX_NUGET_JSON_BYTES: usize = 32 * 1024 * 1024;
@@ -21,18 +20,37 @@ const REGISTRATION_PAGE_CONCURRENCY: usize = 8;
 #[derive(Debug, Clone)]
 pub struct NugetClient {
     service_index_url: String,
-    client: Client,
+    client: ArtifactDeliveryClient,
+    metadata_timeout: Duration,
 }
 
 impl NugetClient {
-    pub fn new(service_index_url: impl Into<String>) -> Self {
+    pub fn for_config(config: &Config) -> Self {
         Self {
-            service_index_url: service_index_url.into(),
-            client: Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(REQUEST_TIMEOUT)
-                .build()
-                .expect("NuGet HTTP client should build"),
+            service_index_url: config.upstreams.nuget.service_index_url.clone(),
+            client: ArtifactDeliveryClient::for_config(config),
+            metadata_timeout: REQUEST_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_dns_overrides(
+        config: &Config,
+        dns_overrides: std::collections::HashMap<String, Vec<std::net::SocketAddr>>,
+    ) -> Self {
+        Self {
+            service_index_url: config.upstreams.nuget.service_index_url.clone(),
+            client: ArtifactDeliveryClient::with_dns_overrides(config, dns_overrides),
+            metadata_timeout: REQUEST_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_timeout(config: &Config, metadata_timeout: Duration) -> Self {
+        Self {
+            service_index_url: config.upstreams.nuget.service_index_url.clone(),
+            client: ArtifactDeliveryClient::for_config(config),
+            metadata_timeout,
         }
     }
 }
@@ -49,7 +67,16 @@ impl NugetProvider for NugetClient {
         self.fetch_json(&self.service_index_url).await
     }
     async fn fetch_json(&self, url: &str) -> Result<Value, NugetError> {
-        let response = self.client.get(url).send().await?.error_for_status()?;
+        let response = self
+            .client
+            .fetch(Ecosystem::Nuget, url, self.metadata_timeout)
+            .await?;
+        if !response.status().is_success() {
+            return Err(NugetError::InvalidMetadata(format!(
+                "NuGet metadata returned HTTP status {}",
+                response.status().as_u16()
+            )));
+        }
         Ok(http_body::collect_json(response, MAX_NUGET_JSON_BYTES, "NuGet V3 metadata").await?)
     }
 }
@@ -153,6 +180,8 @@ fn parse_published(value: &str) -> Option<DateTime<Utc>> {
 pub enum NugetError {
     #[error("NuGet upstream request failed: {0}")]
     Upstream(#[from] reqwest::Error),
+    #[error("NuGet metadata destination failed egress validation: {0}")]
+    Egress(#[from] ArtifactDeliveryError),
     #[error("NuGet upstream body failed validation: {0}")]
     Body(#[from] HttpBodyError),
     #[error("NuGet response serialization failed: {0}")]
@@ -553,6 +582,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::time::timeout;
 
     struct Static {
         documents: HashMap<String, Value>,
@@ -794,6 +827,189 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn service_index_cannot_select_private_registration_origin() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/registration", target.local_addr().unwrap());
+        let (upstream, origin) = bind_fixture().await;
+        let served = serve_fixture(
+            upstream,
+            vec![json_response(&json!({"resources":[{
+                "@type":"RegistrationsBaseUrl/3.6.0", "@id":target_url
+            }]}))],
+        );
+        let mut config = Config::default();
+        config.upstreams.nuget.service_index_url = format!("{origin}/index.json");
+
+        let error = lookup_artifact(&NugetClient::for_config(&config), "demo", "1.0.0")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, NugetError::Egress(_)));
+        served.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn service_index_private_dns_answer_is_rejected_before_contact() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap();
+        let registration = format!(
+            "https://metadata.test:{}/registration",
+            target_address.port()
+        );
+        let (upstream, origin) = bind_fixture().await;
+        let served = serve_fixture(
+            upstream,
+            vec![json_response(&json!({"resources":[{
+                "@type":"RegistrationsBaseUrl/3.6.0", "@id":registration
+            }]}))],
+        );
+        let mut config = Config::default();
+        config.upstreams.nuget.service_index_url = format!("{origin}/index.json");
+        let client = NugetClient::with_dns_overrides(
+            &config,
+            HashMap::from([("metadata.test".to_string(), vec![target_address])]),
+        );
+
+        let error = lookup_artifact(&client, "demo", "1.0.0").await.unwrap_err();
+
+        assert!(matches!(error, NugetError::Egress(_)));
+        served.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_page_cannot_select_private_origin() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let page_url = format!("http://{}/page.json", target.local_addr().unwrap());
+        let (upstream, origin) = bind_fixture().await;
+        let registration = format!("{origin}/registration");
+        let served = serve_fixture(
+            upstream,
+            vec![
+                json_response(&json!({"resources":[{
+                    "@type":"RegistrationsBaseUrl/3.6.0", "@id":registration
+                }]})),
+                json_response(&json!({"items":[{"@id":page_url}]})),
+            ],
+        );
+        let mut config = Config::default();
+        config.upstreams.nuget.service_index_url = format!("{origin}/index.json");
+
+        let error = lookup_artifact(&NugetClient::for_config(&config), "demo", "1.0.0")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, NugetError::Egress(_)));
+        served.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_redirect_to_private_origin_is_not_followed() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_url = format!("http://{}/secret", target.local_addr().unwrap());
+        let (upstream, origin) = bind_fixture().await;
+        let registration = format!("{origin}/registration");
+        let served = serve_fixture(
+            upstream,
+            vec![
+                json_response(&json!({"resources":[{
+                    "@type":"RegistrationsBaseUrl/3.6.0", "@id":registration
+                }]})),
+                format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {target_url}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                ),
+            ],
+        );
+        let mut config = Config::default();
+        config.upstreams.nuget.service_index_url = format!("{origin}/index.json");
+
+        let error = lookup_artifact(&NugetClient::for_config(&config), "demo", "1.0.0")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, NugetError::Egress(_)));
+        served.await.unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), target.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_total_deadline_stops_a_progressing_body() {
+        let (listener, origin) = bind_fixture().await;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _bytes_read = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 64\r\nconnection: close\r\n\r\n[",
+                )
+                .await
+                .unwrap();
+            for _ in 0..63 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if stream.write_all(b" ").await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut config = Config::default();
+        config.upstreams.nuget.service_index_url = format!("{origin}/index.json");
+        let client = NugetClient::with_timeout(&config, Duration::from_millis(35));
+
+        let started = tokio::time::Instant::now();
+        let error = client.fetch_service_index().await.unwrap_err();
+
+        assert!(matches!(error, NugetError::Body(_)));
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.await.unwrap();
+    }
+
+    async fn bind_fixture() -> (TcpListener, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        (listener, origin)
+    }
+
+    fn serve_fixture(listener: TcpListener, responses: Vec<String>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let _bytes_read = stream.read(&mut request).await.unwrap();
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        })
+    }
+
+    fn json_response(value: &Value) -> String {
+        let body = serde_json::to_vec(value).unwrap();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            String::from_utf8(body).unwrap()
+        )
+    }
+
     #[test]
     fn service_index_owns_only_restore_resources() {
         let response = service_index_response(&Config::default()).unwrap();

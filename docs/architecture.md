@@ -46,6 +46,15 @@ Metadata filtering evaluates batches of canonical artifacts. Retained download
 URLs point back through `osv-proxy`. Direct artifact routes rebuild the exact
 artifact and re-run policy before redirecting or fetching upstream bytes.
 
+Proxy-mode artifact delivery enforces an egress boundary before contact. It
+permits public HTTPS CDN origins plus exact configured origins for the artifact's
+ecosystem and explicit operator-trusted origins. DNS answers containing a
+loopback, private, link-local, or otherwise non-public address are rejected
+unless that exact hostname origin was trusted. Artifact delivery ignores system
+proxy settings and does not follow upstream redirects. NuGet service-index and
+registration-page follow-up requests use this boundary before parsing their
+bounded JSON bodies because those URLs are also metadata-derived.
+
 ## OSV Boundary
 
 The policy engine consumes OSV findings and does not depend on whether they came

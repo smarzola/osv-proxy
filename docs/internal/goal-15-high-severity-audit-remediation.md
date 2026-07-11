@@ -130,7 +130,7 @@ The goal is complete only when:
 ## Milestones
 
 - [x] Milestone 1: Harden dependencies and bound upstream bodies.
-- [ ] Milestone 2: Enforce artifact egress and redirect safety.
+- [x] Milestone 2: Enforce artifact egress and redirect safety.
 - [ ] Milestone 3: Reuse clients and make local policy evaluation async-safe and
   package-batched.
 - [ ] Milestone 4: Isolate ecosystem sync failures and implement background
@@ -207,7 +207,23 @@ cargo test --locked --lib proxy
 cargo run --locked -- config validate --config examples/basic/osv-proxy.yaml
 ```
 
-Status: Not started.
+Status: Completed 2026-07-11 after three adversarial review rounds. The first review
+found unguarded metadata-derived NuGet follow-up URLs, accidental rejection of
+conditional `304` responses, and incomplete IPv6 special-use classification.
+Repairs route NuGet registrations/pages through the same boundary, preserve
+`304` for GET and HEAD, and align IPv4/IPv6 checks with the IANA special-purpose
+registries. The second review found that the guarded NuGet path had lost its prior
+10-second total request deadline; the safe fetch path now applies that deadline
+without constraining artifact streaming, with a progressing-body timeout test.
+Artifact delivery validates ecosystem-scoped exact origins and
+literal addresses, rejects forbidden DNS answers before contact, ignores system
+proxy settings, and disables upstream redirects; explicitly configured private
+origins remain supported. Verification after repair: `cargo fmt --check` passed;
+`cargo test --locked --lib` passed 271 tests; all 11 artifact tests and all 14
+NuGet tests passed;
+passed, including never-contact cases; `cargo clippy --locked --all-targets
+--all-features -- -D warnings` passed; the basic configuration validated; `git
+diff --check` passed.
 
 ## Milestone 3: Reuse Clients And Make Local Evaluation Async-Safe
 
