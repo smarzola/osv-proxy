@@ -386,6 +386,14 @@ Then create a fresh same-directory Codex app reviewer thread and audit the full
 branch against every target-state bullet and success criterion. Repair and
 re-review until no blocking findings remain, then rerun final verification.
 
+Status: Completed 2026-07-11. Final verification passed formatting, 251 unit
+tests, all 14 real-client E2Es, doc tests, strict Clippy, example config
+validation, branch diff checks, and a clean committed worktree. The independent
+full-goal audit found that the core-extension workflow did not satisfy the
+explicit BOM-or-plugin criterion. A real Maven BOM import was added for both
+redirect and proxy success plus a clean-cache vulnerable-BOM denial. The full
+suite remained green, and re-audit reported CLEAN with no blocking findings.
+
 Do not treat a checkbox or commit as proof that a command passed. Inspect
 failures and fix in-scope regressions rather than weakening tests. For an
 unrelated pre-existing failure, record the command, result summary, and evidence

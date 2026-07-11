@@ -27,6 +27,7 @@ const RUBYGEMS_PLATFORM: &str = "osv-proxy-e2e-ruby-platform";
 const RUBYGEMS_PRERELEASE: &str = "osv-proxy-e2e-ruby-prerelease";
 const MAVEN_GROUP: &str = "com.acme";
 const MAVEN_ROOT: &str = "osv-proxy-e2e-maven";
+const MAVEN_BOM: &str = "osv-proxy-e2e-maven-bom";
 const MAVEN_DEPENDENCY: &str = "osv-proxy-e2e-maven-dependency";
 const MAVEN_GRADLE_DEPENDENCY: &str = "osv-proxy-e2e-gradle-dependency";
 
@@ -52,6 +53,7 @@ fn maven_resolves_redirect_proxy_dynamic_and_pinned_denials() {
         assert_success("Maven extension/transitive resolution", &output);
         assert!(maven_cached(&repository, MAVEN_ROOT, "1.0.0", "jar"));
         assert!(maven_cached(&repository, MAVEN_DEPENDENCY, "1.0.0", "jar"));
+        assert!(maven_cached(&repository, MAVEN_BOM, "1.0.0", "pom"));
     }
 
     let filtered_proxy = start_axum_proxy(maven_e2e_config(
@@ -84,6 +86,16 @@ fn maven_resolves_redirect_proxy_dynamic_and_pinned_denials() {
     write_maven_extension_project(&blocked, &filtered_proxy, "1.0.1");
     let blocked_output = run_maven_validate(&blocked, &workspace.child("maven-blocked-cache"));
     assert_maven_or_gradle_denial("fresh blocked Maven resolution", &blocked_output);
+
+    let blocked_bom = workspace.child("maven-blocked-bom");
+    write_maven_bom_project(&blocked_bom, &filtered_proxy, "1.0.1");
+    let blocked_bom_output =
+        run_maven_validate(&blocked_bom, &workspace.child("maven-blocked-bom-cache"));
+    assert_maven_denial_for(
+        "fresh blocked Maven BOM import",
+        &blocked_bom_output,
+        MAVEN_BOM,
+    );
 
     let seed_proxy = start_axum_proxy(maven_e2e_config(
         &upstream,
@@ -200,12 +212,31 @@ fn write_maven_extension_project(project: &Path, proxy: &TestServer, version: &s
     fs::create_dir_all(project.join(".mvn")).unwrap();
     write_file(
         &project.join("pom.xml"),
-        "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>client</groupId><artifactId>client</artifactId><version>1.0.0</version></project>",
+        &format!(
+            "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>client</groupId><artifactId>client</artifactId><version>1.0.0</version><dependencyManagement><dependencies><dependency><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_BOM}</artifactId><version>1.0.0</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement><dependencies><dependency><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_DEPENDENCY}</artifactId></dependency></dependencies></project>"
+        ),
     );
     write_file(
         &project.join(".mvn/extensions.xml"),
         &format!(
             "<extensions><extension><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_ROOT}</artifactId><version>{version}</version></extension></extensions>"
+        ),
+    );
+    write_file(
+        &project.join("settings.xml"),
+        &format!(
+            "<settings xmlns=\"http://maven.apache.org/SETTINGS/1.2.0\"><mirrors><mirror><id>osv-proxy</id><url>{}/maven/</url><mirrorOf>*</mirrorOf></mirror></mirrors></settings>",
+            proxy.base_url()
+        ),
+    );
+}
+
+fn write_maven_bom_project(project: &Path, proxy: &TestServer, version: &str) {
+    fs::create_dir_all(project).unwrap();
+    write_file(
+        &project.join("pom.xml"),
+        &format!(
+            "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>client</groupId><artifactId>blocked-bom-client</artifactId><version>1.0.0</version><dependencyManagement><dependencies><dependency><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_BOM}</artifactId><version>{version}</version><type>pom</type><scope>import</scope></dependency></dependencies></dependencyManagement></project>"
         ),
     );
     write_file(
@@ -274,6 +305,10 @@ fn run_gradle_copy(project: &Path, gradle_home: PathBuf, write_locks: bool) -> O
 }
 
 fn assert_maven_or_gradle_denial(context: &str, output: &Output) {
+    assert_maven_denial_for(context, output, MAVEN_ROOT);
+}
+
+fn assert_maven_denial_for(context: &str, output: &Output, artifact: &str) {
     assert_failure(context, output);
     let combined = format!(
         "{}\n{}",
@@ -281,7 +316,7 @@ fn assert_maven_or_gradle_denial(context: &str, output: &Output) {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains(MAVEN_ROOT),
+        combined.contains(artifact),
         "{context} did not fail on the protected coordinate: {combined}"
     );
     assert!(
@@ -1357,6 +1392,19 @@ fn create_maven_files() -> HashMap<String, MavenFileFixture> {
             format!("{base}/{artifact}-{version}.jar"),
             "application/java-archive",
             maven_jar(artifact, version),
+        );
+    }
+
+    for version in ["1.0.0", "1.0.1"] {
+        let pom = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><project xmlns=\"http://maven.apache.org/POM/4.0.0\"><modelVersion>4.0.0</modelVersion><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_BOM}</artifactId><version>{version}</version><packaging>pom</packaging><dependencyManagement><dependencies><dependency><groupId>{MAVEN_GROUP}</groupId><artifactId>{MAVEN_DEPENDENCY}</artifactId><version>1.0.0</version></dependency></dependencies></dependencyManagement></project>"
+        );
+        let base = format!("/{group_path}/{MAVEN_BOM}/{version}");
+        insert_maven_file(
+            &mut files,
+            format!("{base}/{MAVEN_BOM}-{version}.pom"),
+            "application/xml",
+            pom.into_bytes(),
         );
     }
     files
