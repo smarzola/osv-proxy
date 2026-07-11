@@ -11,7 +11,7 @@ configured artifact behavior.
 ## What It Does
 
 - Blocks package versions that are too new for the configured minimum age.
-- Blocks package versions with OSV malicious-package records.
+- Blocks package versions with active OSV malicious-package and vulnerability records.
 - Supports exact-version allowlist exceptions.
 - Supports exact-version and whole-package blocklist entries.
 - Filters npm metadata and PyPI Simple project metadata so blocked versions are
@@ -29,10 +29,10 @@ Implemented now:
 - NuGet V3 restore service discovery, registration filtering, flat-container
   version enumeration, and protected `.nupkg`/`.nuspec` delivery.
 - YAML config loading and validation.
-- `serve`, `check`, `eval`, `config validate`, and `malicious sync`
+- `serve`, `check`, `eval`, `config validate`, `osv sync`, and the compatibility `malicious sync`
   commands.
 - Live OSV API checks during request handling.
-- Local SQLite malicious-package checks with explicit and background OSV dump
+- Local SQLite OSV advisory checks with explicit and background OSV dump
   sync.
 - Redirect artifact behavior and plain artifact proxy behavior.
 
@@ -40,7 +40,7 @@ Not implemented yet:
 
 - Metadata caching.
 - S3 artifact caching.
-- Authentication, publishing, license policy, vulnerability severity policy, or
+- Authentication, publishing, license policy, or
   broad package scanning.
 
 ## Install
@@ -175,6 +175,8 @@ policy:
   missing_publish_time: "block"
   osv:
     block_malicious: true
+    block_vulnerabilities: true
+    minimum_cvss_score: 0
     source: live
     on_error: "block"
 artifacts:
@@ -185,18 +187,18 @@ The npm registry, PyPI Simple API, Go module proxy, and OSV API default to their
 Set `upstreams` or `policy.osv.api_url` only when using a mirror, fixture, or
 private gateway.
 
-### Malicious Data Source
+### OSV Data Source
 
 `policy.osv.source: live` is the default. Live mode calls the OSV API during
 metadata filtering, artifact serving, `check`, and `eval`.
 
-`policy.osv.source: local` reads synchronized malicious-package data from
+`policy.osv.source: local` reads synchronized OSV advisory data from
 SQLite instead. In local mode, install request handling performs indexed SQLite
 reads plus in-memory exact-version and range evaluation; it does not call OSV.
 Populate or refresh the local database with:
 
 ```sh
-osv-proxy malicious sync --config /path/to/osv-proxy.yaml
+osv-proxy osv sync --config /path/to/osv-proxy.yaml
 ```
 
 Local mode configuration:
@@ -205,6 +207,8 @@ Local mode configuration:
 policy:
   osv:
     block_malicious: true
+    block_vulnerabilities: true
+    minimum_cvss_score: 0
     source: local
     on_error: block
     local:
@@ -217,7 +221,7 @@ policy:
 ```
 
 `on_error: block` and `on_stale: block` fail closed by default. Missing,
-corrupt, unhealthy, or stale local data blocks malicious checks instead of
+corrupt, incomplete, unhealthy, or stale local data blocks OSV checks instead of
 silently allowing installs. `background_sync: true` makes `serve` run one sync
 immediately on startup and then repeat after `sync_interval`; failed background
 syncs record health state and keep serving against the last usable snapshot.
@@ -230,10 +234,15 @@ advisory JSON for audit or debugging.
 For every package version or file, `osv-proxy` evaluates:
 
 1. Exact-version allowlist.
-2. OSV malicious records, using only `MAL-*` IDs by default.
-3. Manual blocklist.
-4. Minimum package age.
-5. Missing publish time behavior.
+2. OSV `MAL-*` records when malicious blocking is enabled.
+3. Other active OSV advisories whose score is at least `minimum_cvss_score`.
+   The default threshold is zero, so matching unscored advisories also block.
+4. Manual blocklist.
+5. Minimum package age and missing publish time behavior.
+
+This default is behavior-changing for operators upgrading from malicious-only
+policy. Set `block_vulnerabilities: false` for the compatibility escape hatch;
+`MAL-*` blocking remains controlled independently by `block_malicious`.
 
 Blocked artifact requests return HTTP `403` with a structured JSON decision.
 Allowed artifact requests return HTTP `302` to the upstream tarball or file URL
@@ -262,7 +271,7 @@ cargo test e2e
 ```
 
 Run only the package-manager end-to-end tests. These start local fixture
-registries and a local proxy, then run `npm install` and `uv pip install`
+registries and a local proxy, then run npm, uv/pip, Cargo, Go, and .NET clients
 against the proxy:
 
 ```sh
@@ -281,5 +290,6 @@ cargo fmt --check
 - [Configuration reference](docs/configuration.md)
 - [Registry behavior](docs/registry-behavior.md)
 - [Client configuration](docs/client-configuration.md)
+- [OSV advisory data](docs/osv-data.md)
 - [Architecture notes](docs/architecture.md)
 - [Milestones](docs/milestones.md)

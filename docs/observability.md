@@ -59,5 +59,13 @@ Each blocked decision should log:
 - `osv_proxy_metadata_cache_misses_total`
 - `osv_proxy_artifact_cache_hits_total`
 - `osv_proxy_artifact_cache_misses_total`
-- `osv_proxy_malicious_sync_last_success_timestamp`
-- `osv_proxy_malicious_sync_records_total`
+- `osv_proxy_osv_sync_last_success_timestamp` (planned canonical name; retain
+  the existing malicious-prefixed metric as a compatibility alias when metrics
+  are implemented)
+- `osv_proxy_osv_sync_records_total`
+
+Policy decision records must distinguish `reason=malicious` from
+`reason=vulnerable`, include the OSV ID as `rule_id`, and include the selected
+base score in the message when one exists. Sync logs use general OSV wording and
+report ecosystem, bootstrap/incremental mode, imported/withdrawn counts, and
+failure state without claiming a partial generation is healthy.

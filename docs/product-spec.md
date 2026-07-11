@@ -1,6 +1,7 @@
 # Product Specification
 
-`osv-proxy` is a policy-enforcing package registry proxy for npm, PyPI, and read-only Cargo sparse source replacement.
+`osv-proxy` is a policy-enforcing package registry proxy for npm, PyPI,
+Cargo/crates.io, Go modules, and NuGet restore.
 
 ```text
 npm / pnpm / yarn / bun / pip / uv / poetry
@@ -9,7 +10,7 @@ npm / pnpm / yarn / bun / pip / uv / poetry
     osv-proxy
         |
         +-- policy engine
-        +-- OSV malicious package checks
+        +-- OSV malicious and vulnerability checks
         +-- minimum age gate
         +-- exact-version allowlist
         +-- optional metadata cache via cachebox
@@ -25,7 +26,7 @@ npm registry / PyPI / files.pythonhosted.org
 
 - filtering package metadata before clients see versions or files
 - enforcing a configurable minimum age gate
-- blocking known malicious packages from OSV `MAL-*` records
+- blocking known malicious packages and active vulnerabilities from OSV
 - supporting exact-version allowlist overrides
 - supporting manual package and version blocklists
 - optionally proxying or caching package artifacts
@@ -49,7 +50,7 @@ Recommended stack:
 - `tracing` for structured logs
 - `tower` for middleware
 - `chrono` for time handling
-- `rusqlite` for local malicious storage
+- `rusqlite` for local OSV advisory storage
 - `object_store` or `aws-sdk-s3` for S3-compatible artifact cache
 - `semver` for npm version helpers
 - `pep440_rs` for PyPI version helpers, if useful
@@ -80,7 +81,7 @@ Developer mode can be more permissive, but must be explicit.
 - Allowlist bypasses are exact-version only.
 - Malicious bypass requires explicit config and a reason.
 - Live OSV mode may call OSV during request handling.
-- Local malicious mode must not call OSV during install-request handling.
+- Local OSV mode must not call OSV during install-request handling.
 - Metadata cache is either disabled or cachebox-backed.
 - There is no memory metadata cache.
 - Redirect mode rewrites artifact URLs to `osv-proxy` URLs, not upstream URLs.
@@ -92,13 +93,13 @@ Developer mode can be more permissive, but must be explicit.
 It provides:
 
 - minimum age gate for newly published packages
-- built-in malicious package blocking using OSV `MAL-*` records
+- built-in OSV malicious and CVSS-threshold vulnerability blocking
 - exact-version allowlist escape hatches
 - manual blocklist
 - metadata filtering
 - artifact redirect, proxy, and S3-cache modes
 - live OSV API mode
-- local SQLite malicious store mode
+- local SQLite all-advisory store mode
 - possible future MongoDB-compatible malicious storage
 - cachebox support for metadata caching
 - YAML configuration

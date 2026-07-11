@@ -1,5 +1,14 @@
 # Milestones
 
+## OSV Vulnerability Severity Policy
+
+The current implementation blocks active OSV vulnerabilities by default across
+npm, PyPI, Cargo, Go, and NuGet. It supports inclusive CVSS thresholds,
+unscored and malformed-severity behavior, bounded live detail hydration, and a
+generation-scoped all-advisory SQLite store. `osv sync` is canonical;
+`malicious sync` is retained as an alias. See [policy](policy.md) and
+[OSV advisory data](osv-data.md).
+
 Cargo/crates.io sparse replacement filters index records, rechecks policy at
 artifact delivery, and supports redirect or proxy artifact behavior.
 

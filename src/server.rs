@@ -856,12 +856,24 @@ mod tests {
 
     struct MaliciousPackageChecker {
         package: String,
+        osv_id: String,
+        severity: Option<f64>,
     }
 
     impl MaliciousPackageChecker {
         fn new(package: &str) -> Self {
             Self {
                 package: package.to_string(),
+                osv_id: "MAL-2026-000001".to_string(),
+                severity: None,
+            }
+        }
+
+        fn vulnerable(package: &str) -> Self {
+            Self {
+                package: package.to_string(),
+                osv_id: "GHSA-e2e-vulnerable".to_string(),
+                severity: Some(9.8),
             }
         }
     }
@@ -871,11 +883,17 @@ mod tests {
         async fn check(&self, artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
             if artifact.identity() == self.package {
                 Ok(vec![MaliciousHit {
-                    osv_id: "MAL-2026-000001".to_string(),
-                    summary: Some("malicious fixture".to_string()),
+                    osv_id: self.osv_id.clone(),
+                    summary: Some("OSV fixture".to_string()),
                     source: "osv".to_string(),
                     modified: None,
-                    effective_severity: None,
+                    effective_severity: self.severity.map(|base_score| {
+                        crate::malicious::OsvEffectiveSeverity {
+                            severity_type: "CVSS_V3".to_string(),
+                            vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H".to_string(),
+                            base_score,
+                        }
+                    }),
                     evaluation_error: None,
                 }])
             } else {
@@ -1534,6 +1552,41 @@ mod tests {
         assert_eq!(blocked_artifact_response.status, 403);
         assert_eq!(blocked_body["reason"], "malicious");
         assert_eq!(blocked_body["rule_id"], "MAL-2026-000001");
+    }
+
+    #[tokio::test]
+    async fn direct_npm_and_pypi_artifacts_block_vulnerabilities_before_delivery() {
+        let config = Config::default();
+        let npm_upstream = StaticUpstream::with("demo", npm_demo_metadata());
+        let pypi_upstream = StaticPypiUpstream::with("Demo", pypi_simple_fixture());
+
+        let npm = route_request_with_upstreams(
+            &config,
+            "GET",
+            "/npm/demo/-/demo-1.0.1.tgz",
+            now(),
+            &MaliciousPackageChecker::vulnerable("npm:demo@1.0.1"),
+            &npm_upstream,
+            &pypi_upstream,
+        )
+        .await;
+        let pypi = route_request_with_upstreams(
+            &config,
+            "GET",
+            "/pypi/packages/demo/1.0.1/demo-1.0.1.tar.gz",
+            now(),
+            &MaliciousPackageChecker::vulnerable("pypi:demo@1.0.1"),
+            &npm_upstream,
+            &pypi_upstream,
+        )
+        .await;
+
+        for response in [npm, pypi] {
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(response.status, 403);
+            assert_eq!(body["reason"], "vulnerable");
+            assert_eq!(body["rule_id"], "GHSA-e2e-vulnerable");
+        }
     }
 
     #[tokio::test]

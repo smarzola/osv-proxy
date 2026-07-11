@@ -3,6 +3,24 @@
 All notable changes to `osv-proxy` are tracked here. Release sections are the
 source for GitHub release notes.
 
+## [Unreleased]
+
+### Added
+
+- Block active OSV vulnerability advisories by default, with CVSS v2, v3, and
+  v4 base-score evaluation, package-level severity precedence, and configurable
+  `policy.osv.minimum_cvss_score`.
+- Add canonical `osv sync` and generation-scoped local storage for all supported
+  OSV advisories, with atomic bootstrap/catch-up and indexed exact/range lookup.
+
+### Changed
+
+- The default OSV policy now blocks matching unscored vulnerabilities at the
+  default zero threshold. Set `policy.osv.block_vulnerabilities: false` to keep
+  malicious-only behavior.
+- Full local OSV storage is materially larger than the former `MAL-*`-only
+  dataset; raw advisory JSON remains opt-in.
+
 ## [0.4.1] - 2026-07-09
 
 ### Changed

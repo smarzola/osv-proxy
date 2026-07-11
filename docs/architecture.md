@@ -137,17 +137,18 @@ PyPI:
 Use traits for external services:
 
 - OSV client
-- malicious package store
+- OSV advisory store
 - metadata cache
 - artifact backend
 - audit sink
 
-The policy engine should not know whether malicious data comes from OSV live
-calls or the local store.
+The policy engine does not depend on whether OSV findings come from live calls
+or the local generation-scoped store.
 
-The implemented local malicious store is SQLite. It stores advisory metadata,
-normalized affected packages, exact affected versions, range events, and sync
-state. Full raw OSV advisory JSON retention is optional. Request handling
+The implemented local OSV store is SQLite. It stores advisory metadata,
+normalized affected occurrences, selected CVSS data, exact affected versions,
+range events, generation readiness, and sync state. Full raw OSV advisory JSON
+retention is optional. Request handling
 performs indexed SQLite reads and evaluates exact versions and ranges in memory
 without OSV network calls.
 
