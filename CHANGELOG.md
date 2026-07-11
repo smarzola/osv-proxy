@@ -5,6 +5,13 @@ source for GitHub release notes.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-11
+
+### Changed
+
+- Fix tagged release validation so annotated tags do not conflict with a
+  redundant tag fetch before tests and binary builds.
+
 ## [0.7.0] - 2026-07-11
 
 ### Added
