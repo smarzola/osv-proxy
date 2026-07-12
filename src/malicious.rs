@@ -1271,6 +1271,7 @@ fn import_zip_bootstrap_and_record_success<R: Read + Seek>(
         high_watermark,
         generation_id,
     )?;
+    refresh_lookup_statistics(&transaction)?;
     transaction.commit().map_err(sqlite_error)?;
     Ok(totals)
 }
@@ -1576,8 +1577,20 @@ fn import_advisories_and_record_success(
             params![generation_id, high_watermark],
         )
         .map_err(sqlite_error)?;
+    if bootstrap || !advisories.is_empty() {
+        refresh_lookup_statistics(&transaction)?;
+    }
     transaction.commit().map_err(sqlite_error)?;
     Ok(stats)
+}
+
+fn refresh_lookup_statistics(transaction: &rusqlite::Transaction<'_>) -> Result<(), OsvError> {
+    transaction
+        .execute_batch(
+            "ANALYZE osv_advisories;
+             ANALYZE osv_affected_packages;",
+        )
+        .map_err(sqlite_error)
 }
 
 fn import_advisories(
@@ -4185,6 +4198,14 @@ INSERT INTO advisories (
             .collect::<Result<Vec<_>,_>>()
             .unwrap();
         assert_eq!(statuses.last(), Some(&(1, "active".to_string())));
+        let lookup_statistics = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl IN ('osv_advisories', 'osv_affected_packages')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(lookup_statistics, 3);
     }
 
     #[tokio::test]
