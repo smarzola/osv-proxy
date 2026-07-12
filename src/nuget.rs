@@ -645,10 +645,12 @@ mod tests {
         config.policy.minimum_age = Duration::from_secs(24 * 60 * 60);
         config.policy.osv.block_malicious = false;
         config.policy.osv.block_vulnerabilities = false;
-        let response =
-            flat_container_index_response(&config, &provider(), &Clean, "Demo", Utc::now())
-                .await
-                .unwrap();
+        let now = DateTime::parse_from_rfc3339("2026-07-11T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let response = flat_container_index_response(&config, &provider(), &Clean, "Demo", now)
+            .await
+            .unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&response.body).unwrap()["versions"],
             json!(["1.0.0"])
