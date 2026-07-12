@@ -5,6 +5,29 @@ source for GitHub release notes.
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-07-12
+
+### Added
+
+- Add exact `artifacts.trusted_origins` exceptions for explicitly configured
+  private registry and artifact origins.
+- Add Clippy and RustSec dependency-audit gates to CI and tagged releases.
+
+### Changed
+
+- Bound all registry metadata and OSV response bodies while streaming, and
+  spool OSV archives to bounded temporary storage before import.
+- Restrict artifact and metadata-derived NuGet egress by scheme, exact origin,
+  DNS result, IANA special-purpose address ranges, redirect behavior, and
+  system-proxy bypass prevention.
+- Reuse registry connection pools across requests and move SQLite evaluation,
+  range processing, and Maven XML parsing behind bounded blocking workers.
+- Attempt OSV synchronization independently per ecosystem, retry only failed
+  ecosystems with bounded backoff, and reject overlapping same-store syncs
+  across processes.
+- Upgrade `quick-xml` to 0.41.0 to resolve the reachable XML parser denial-of-
+  service advisories reported by RustSec.
+
 ## [0.7.1] - 2026-07-11
 
 ### Changed
