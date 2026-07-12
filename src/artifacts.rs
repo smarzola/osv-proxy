@@ -470,6 +470,7 @@ fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
         || (a == 192 && b == 168)
         || (a == 192 && b == 0 && c == 0 && d != 9 && d != 10)
         || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
         || (a == 198 && (b == 18 || b == 19))
         || (a == 198 && b == 51 && c == 100)
         || (a == 203 && b == 0 && c == 113)
@@ -482,18 +483,24 @@ fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
     }
     let segments = ip.segments();
     let value = u128::from_be_bytes(ip.octets());
+    let globally_reachable_translation = matches!(segments, [0x64, 0xff9b, 0, 0, 0, 0, _, _]);
+    let allocated_global_unicast = segments[0] & 0xe000 == 0x2000;
     ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
+        || (!globally_reachable_translation && !allocated_global_unicast)
         || matches!(segments, [0x64, 0xff9b, 1, _, _, _, _, _])
         || matches!(segments, [0x100, 0, 0, 0, _, _, _, _])
+        || matches!(segments, [0x100, 0, 0, 1, _, _, _, _])
         || (matches!(segments, [0x2001, b, _, _, _, _, _, _] if b < 0x200)
             && !(value == 0x2001_0001_0000_0000_0000_0000_0000_0001
                 || value == 0x2001_0001_0000_0000_0000_0000_0000_0002
+                || value == 0x2001_0001_0000_0000_0000_0000_0000_0003
                 || matches!(segments, [0x2001, 3, _, _, _, _, _, _])
                 || matches!(segments, [0x2001, 4, 0x112, _, _, _, _, _])
                 || matches!(segments, [0x2001, b, _, _, _, _, _, _] if (0x20..=0x3f).contains(&b))))
         || matches!(segments, [0x2002, _, _, _, _, _, _, _])
+        || matches!(segments, [0x2001, 0x0db8, _, _, _, _, _, _])
         || matches!(segments, [0x3fff, 0..=0x0fff, _, _, _, _, _, _])
         || matches!(segments, [0x5f00, ..])
         || segments[0] & 0xfe00 == 0xfc00
@@ -714,9 +721,13 @@ mod tests {
             "https://[::ffff:127.0.0.1]/file",
             "https://[64:ff9b:1::1]/file",
             "https://[100::1]/file",
+            "https://[100:0:0:1::1]/file",
             "https://[2001:2::1]/file",
+            "https://[2001:db8::1]/file",
             "https://[3fff::1]/file",
             "https://[5f00::1]/file",
+            "https://[fec0::1]/file",
+            "https://192.88.99.2/file",
         ] {
             assert!(
                 client.validated_url(Ecosystem::Npm, url).is_err(),
@@ -731,6 +742,30 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn accepts_precise_globally_reachable_iana_exceptions() {
+        let client = ArtifactDeliveryClient::new();
+        for url in [
+            "https://192.0.0.9/file",
+            "https://192.0.0.10/file",
+            "https://[64:ff9b::1]/file",
+            "https://[2001:1::1]/file",
+            "https://[2001:1::2]/file",
+            "https://[2001:1::3]/file",
+            "https://[2001:3::1]/file",
+            "https://[2001:4:112::1]/file",
+            "https://[2001:20::1]/file",
+            "https://[2001:2f::1]/file",
+            "https://[2001:30::1]/file",
+            "https://[2001:3f::1]/file",
+        ] {
+            assert!(
+                client.validated_url(Ecosystem::Npm, url).is_ok(),
+                "globally reachable IANA exception was rejected: {url}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -761,13 +796,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn special_use_ipv6_dns_answers_are_rejected() {
+    async fn special_use_dns_answers_are_rejected() {
         for address in [
+            "192.88.99.2:443",
             "[64:ff9b:1::1]:443",
             "[100::1]:443",
+            "[100:0:0:1::1]:443",
             "[2001:2::1]:443",
+            "[2001:db8::1]:443",
             "[3fff::1]:443",
             "[5f00::1]:443",
+            "[fec0::1]:443",
         ] {
             let mut config = Config::default();
             config.artifacts.behavior = ArtifactBehavior::Proxy;
