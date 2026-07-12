@@ -10,7 +10,8 @@ use node_semver as npm_semver;
 use pep440_rs as pep440;
 use polycvss::{Vector as CvssVector, Version as CvssVersion};
 use reqwest::Client;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::types::ToSql;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use semver::Version as cargo_semver;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -39,6 +40,7 @@ const MAX_OSV_ARCHIVE_ENTRIES: usize = 1_000_000;
 const MAX_OSV_ARCHIVE_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_OSV_ARCHIVE_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const SQLITE_CHECK_CONCURRENCY: usize = 8;
+const SQLITE_EXACT_VERSION_BATCH_SIZE: usize = 512;
 
 static SQLITE_CHECK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static ACTIVE_SYNC_PATHS: OnceLock<StdMutex<BTreeSet<PathBuf>>> = OnceLock::new();
@@ -725,9 +727,12 @@ impl SqliteMaliciousChecker {
                 .expect("grouped package has at least one artifact");
             let ranges = stored_ranges(connection, &artifacts[first_index])?;
             *range_package_loads += 1;
-            for indexes in versions.into_values() {
+            let version_names = versions.keys().cloned().collect::<Vec<_>>();
+            let exact_hits =
+                exact_hits_for_versions(connection, &artifacts[first_index], &version_names)?;
+            for (version, indexes) in versions {
                 let artifact = &artifacts[indexes[0]];
-                let mut hits = exact_hits(connection, artifact)?;
+                let mut hits = exact_hits.get(&version).cloned().unwrap_or_default();
                 for range in &ranges {
                     if range_matches_artifact(range, artifact)? {
                         hits.push(range.advisory.clone());
@@ -2223,38 +2228,119 @@ ORDER BY a.osv_id
                 artifact.name,
                 osv_query_version(artifact)
             ],
-            |row| {
-                let modified = row
-                    .get::<_, Option<String>>(3)?
-                    .map(|value| parse_timestamp(&value))
-                    .transpose()
-                    .map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })?;
-                Ok(OsvFinding {
-                    osv_id: row.get(0)?,
-                    summary: row.get(1)?,
-                    source: row.get(2)?,
-                    modified,
-                    effective_severity: match row.get::<_, Option<f64>>(6)? {
-                        Some(base_score) => Some(OsvEffectiveSeverity {
-                            severity_type: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                            vector: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                            base_score,
-                        }),
-                        None => None,
-                    },
-                    evaluation_error: row.get(7)?,
-                })
-            },
+            |row| osv_finding_from_row(row, 0),
         )
         .map_err(sqlite_error)?;
 
     consolidate_local_findings(rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?)
+}
+
+fn exact_hits_for_versions(
+    connection: &Connection,
+    artifact: &Artifact,
+    versions: &[String],
+) -> Result<BTreeMap<String, Vec<OsvFinding>>, OsvError> {
+    let mut query_to_input_versions = BTreeMap::<String, Vec<String>>::new();
+    for version in versions {
+        query_to_input_versions
+            .entry(osv_query_version_for(artifact.ecosystem, version))
+            .or_default()
+            .push(version.clone());
+    }
+
+    let query_versions = query_to_input_versions.keys().collect::<Vec<_>>();
+    let mut hits_by_query_version = BTreeMap::<String, Vec<OsvFinding>>::new();
+    for chunk in query_versions.chunks(SQLITE_EXACT_VERSION_BATCH_SIZE) {
+        let placeholders = (3..3 + chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+SELECT av.version, a.osv_id, a.summary, a.source, a.modified,
+       ap.severity_type, ap.severity_vector, ap.severity_score, ap.severity_error
+FROM sync_state s
+JOIN osv_affected_packages ap ON ap.generation_id = s.active_generation_id
+JOIN osv_affected_versions av ON av.affected_package_id = ap.id
+JOIN osv_advisories a ON a.generation_id = ap.generation_id AND a.osv_id = ap.osv_id
+WHERE s.ecosystem = ?1
+  AND ap.ecosystem = ?1
+  AND ap.name = ?2
+  AND av.version IN ({placeholders})
+  AND a.withdrawn IS NULL
+ORDER BY av.version, a.osv_id
+"#
+        );
+        let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
+        let ecosystem = artifact.ecosystem.osv_name();
+        let name = artifact.name.as_str();
+        let mut parameter_values: Vec<&dyn ToSql> = Vec::with_capacity(2 + chunk.len());
+        parameter_values.push(&ecosystem);
+        parameter_values.push(&name);
+        parameter_values.extend(chunk.iter().map(|version| version as &dyn ToSql));
+        let rows = statement
+            .query_map(params_from_iter(parameter_values), |row| {
+                Ok((row.get::<_, String>(0)?, osv_finding_from_row(row, 1)?))
+            })
+            .map_err(sqlite_error)?;
+        for row in rows {
+            let (version, finding) = row.map_err(sqlite_error)?;
+            hits_by_query_version
+                .entry(version)
+                .or_default()
+                .push(finding);
+        }
+    }
+
+    let mut hits_by_input_version = BTreeMap::new();
+    for (query_version, input_versions) in query_to_input_versions {
+        let hits = hits_by_query_version
+            .remove(&query_version)
+            .map(consolidate_local_findings)
+            .transpose()?
+            .unwrap_or_default();
+        for input_version in input_versions {
+            hits_by_input_version.insert(input_version, hits.clone());
+        }
+    }
+    Ok(hits_by_input_version)
+}
+
+fn osv_finding_from_row(
+    row: &rusqlite::Row<'_>,
+    column_offset: usize,
+) -> rusqlite::Result<OsvFinding> {
+    let modified_column = column_offset + 3;
+    let modified = row
+        .get::<_, Option<String>>(modified_column)?
+        .map(|value| parse_timestamp(&value))
+        .transpose()
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                modified_column,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?;
+    Ok(OsvFinding {
+        osv_id: row.get(column_offset)?,
+        summary: row.get(column_offset + 1)?,
+        source: row.get(column_offset + 2)?,
+        modified,
+        effective_severity: match row.get::<_, Option<f64>>(column_offset + 6)? {
+            Some(base_score) => Some(OsvEffectiveSeverity {
+                severity_type: row
+                    .get::<_, Option<String>>(column_offset + 4)?
+                    .unwrap_or_default(),
+                vector: row
+                    .get::<_, Option<String>>(column_offset + 5)?
+                    .unwrap_or_default(),
+                base_score,
+            }),
+            None => None,
+        },
+        evaluation_error: row.get(column_offset + 7)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -2507,10 +2593,14 @@ fn compare_nuget_prerelease(left: &str, right: &str) -> Ordering {
 }
 
 fn osv_query_version(artifact: &Artifact) -> String {
-    if artifact.ecosystem == Ecosystem::Go {
-        go::osv_version(&artifact.version).unwrap_or_else(|_| artifact.version.clone())
+    osv_query_version_for(artifact.ecosystem, &artifact.version)
+}
+
+fn osv_query_version_for(ecosystem: Ecosystem, version: &str) -> String {
+    if ecosystem == Ecosystem::Go {
+        go::osv_version(version).unwrap_or_else(|_| version.to_string())
     } else {
-        artifact.version.clone()
+        version.to_string()
     }
 }
 
@@ -3602,6 +3692,39 @@ mod tests {
         assert_eq!(results[2][0].osv_id, "MAL-2026-000001");
         assert_eq!(results[3], results[2]);
         assert_eq!(results[4], results[1]);
+    }
+
+    #[tokio::test]
+    async fn sqlite_checker_batches_exact_version_lookups_across_chunks() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_exact_advisory(
+            &connection,
+            "MAL-2026-000003",
+            "npm",
+            "demo",
+            "1.512.0",
+            Some("chunk boundary hit"),
+        );
+        let artifacts = (0..SQLITE_EXACT_VERSION_BATCH_SIZE + 1)
+            .map(|index| Artifact::package(Ecosystem::Npm, "demo", format!("1.{index}.0"), None))
+            .collect::<Vec<_>>();
+        let checker = checker_for(&db);
+
+        let results = checker.check_many(&artifacts).await.unwrap();
+
+        assert_eq!(results.len(), SQLITE_EXACT_VERSION_BATCH_SIZE + 1);
+        assert!(
+            results[..SQLITE_EXACT_VERSION_BATCH_SIZE]
+                .iter()
+                .all(Vec::is_empty)
+        );
+        assert_eq!(
+            results[SQLITE_EXACT_VERSION_BATCH_SIZE][0].osv_id,
+            "MAL-2026-000003"
+        );
     }
 
     #[test]
