@@ -12,6 +12,7 @@ use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::{Decision, PolicyEngine};
 use crate::response::RegistryResponse;
+use crate::runtime::{BudgetError, RuntimeBudgets};
 use async_trait::async_trait;
 use axum::http::{HeaderMap, header};
 use base64::Engine;
@@ -22,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -41,10 +43,18 @@ const COMPACT_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
 pub struct RubyGemsClient {
     registry_url: String,
     client: Client,
+    budgets: Arc<RuntimeBudgets>,
 }
 
 impl RubyGemsClient {
     pub fn new(registry_url: impl Into<String>) -> Self {
+        Self::with_budgets(
+            registry_url,
+            Arc::new(RuntimeBudgets::new(&Config::default().limits)),
+        )
+    }
+
+    pub fn with_budgets(registry_url: impl Into<String>, budgets: Arc<RuntimeBudgets>) -> Self {
         Self {
             registry_url: registry_url.into().trim_end_matches('/').to_string(),
             client: Client::builder()
@@ -52,6 +62,7 @@ impl RubyGemsClient {
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("RubyGems HTTP client should build"),
+            budgets,
         }
     }
 
@@ -76,6 +87,7 @@ pub trait RubyGemsProvider: Send + Sync {
 #[async_trait]
 impl RubyGemsProvider for RubyGemsClient {
     async fn fetch_versions(&self, name: &str) -> Result<Vec<GemVersion>, RubyGemsError> {
+        let _permit = self.budgets.install_egress().await?;
         let response = self
             .client
             .get(self.versions_url(name)?)
@@ -113,6 +125,7 @@ impl CompactIndexProvider for RubyGemsClient {
         &self,
         request_headers: Option<&HeaderMap>,
     ) -> Result<RegistryResponse, RubyGemsError> {
+        let _permit = self.budgets.install_egress().await?;
         let mut request = self.client.get(format!("{}/versions", self.registry_url));
         if let Some(headers) = request_headers {
             for name in [
@@ -169,6 +182,7 @@ impl CompactIndexProvider for RubyGemsClient {
     }
 
     async fn fetch_info(&self, name: &str) -> Result<Vec<u8>, RubyGemsError> {
+        let _permit = self.budgets.install_egress().await?;
         validate_name(name)?;
         let response = self
             .client
@@ -842,6 +856,8 @@ pub fn compare_versions(left: &str, right: &str) -> Result<Ordering, RubyGemsErr
 
 #[derive(Debug, Error)]
 pub enum RubyGemsError {
+    #[error("RubyGems upstream concurrency limit failed: {0}")]
+    Budget(#[from] BudgetError),
     #[error("RubyGems upstream request failed: {0}")]
     Upstream(#[from] reqwest::Error),
     #[error("RubyGems upstream body failed validation: {0}")]

@@ -8,10 +8,12 @@ use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
+use crate::runtime::{BudgetError, RuntimeBudgets};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde_json::{Map, Value, json};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -23,10 +25,18 @@ const MAX_NPM_METADATA_BYTES: usize = 32 * 1024 * 1024;
 pub struct NpmRegistryClient {
     registry_url: String,
     client: Client,
+    budgets: Arc<RuntimeBudgets>,
 }
 
 impl NpmRegistryClient {
     pub fn new(registry_url: impl Into<String>) -> Self {
+        Self::with_budgets(
+            registry_url,
+            Arc::new(RuntimeBudgets::new(&Config::default().limits)),
+        )
+    }
+
+    pub fn with_budgets(registry_url: impl Into<String>, budgets: Arc<RuntimeBudgets>) -> Self {
         Self {
             registry_url: registry_url.into().trim_end_matches('/').to_string(),
             client: Client::builder()
@@ -34,6 +44,7 @@ impl NpmRegistryClient {
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("npm HTTP client should build with static timeout configuration"),
+            budgets,
         }
     }
 }
@@ -46,6 +57,7 @@ pub trait NpmMetadataProvider: Send + Sync {
 #[async_trait]
 impl NpmMetadataProvider for NpmRegistryClient {
     async fn fetch_package_metadata(&self, package: &str) -> Result<Value, NpmError> {
+        let _permit = self.budgets.install_egress().await?;
         let url = format!(
             "{}/{}",
             self.registry_url,
@@ -154,6 +166,7 @@ pub fn error_response(error: &NpmError) -> NpmResponse {
         return artifacts::gateway_error_response(error);
     }
     let status = match error {
+        NpmError::Budget(_) => 503,
         NpmError::VersionNotFound(_, _)
         | NpmError::MissingTarballUrl(_, _)
         | NpmError::InvalidTarballName(_)
@@ -434,6 +447,8 @@ fn encode_package_for_registry(package: &str) -> String {
 
 #[derive(Debug, Error)]
 pub enum NpmError {
+    #[error("npm upstream concurrency limit failed: {0}")]
+    Budget(#[from] BudgetError),
     #[error("npm upstream request failed: {0}")]
     Upstream(#[from] reqwest::Error),
     #[error("npm upstream body failed validation: {0}")]

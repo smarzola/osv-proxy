@@ -7,6 +7,7 @@ use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
+use crate::runtime::{BudgetError, RuntimeBudgets};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::{
@@ -17,6 +18,7 @@ use node_semver::Version;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -38,6 +40,8 @@ pub struct GoInfo {
 
 #[derive(Debug, Error)]
 pub enum GoError {
+    #[error("Go upstream concurrency limit failed: {0}")]
+    Budget(#[from] BudgetError),
     #[error("invalid Go module path or version: {0}")]
     InvalidRoute(String),
     #[error("Go upstream request failed: {0}")]
@@ -67,10 +71,18 @@ pub trait GoProxyProvider: Send + Sync {
 pub struct GoProxyClient {
     base_url: String,
     client: Client,
+    budgets: Arc<RuntimeBudgets>,
 }
 
 impl GoProxyClient {
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::with_budgets(
+            base_url,
+            Arc::new(RuntimeBudgets::new(&Config::default().limits)),
+        )
+    }
+
+    pub fn with_budgets(base_url: impl Into<String>, budgets: Arc<RuntimeBudgets>) -> Self {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             client: Client::builder()
@@ -78,6 +90,7 @@ impl GoProxyClient {
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("static Go client configuration"),
+            budgets,
         }
     }
     fn url(&self, module: &str, suffix: &str) -> Result<String, GoError> {
@@ -93,6 +106,7 @@ impl GoProxyClient {
 #[async_trait]
 impl GoProxyProvider for GoProxyClient {
     async fn list(&self, module: &str) -> Result<Vec<String>, GoError> {
+        let _permit = self.budgets.install_egress().await?;
         let response = self.client.get(self.url(module, "@v/list")?).send().await?;
         if !response.status().is_success() {
             return Err(GoError::UpstreamStatus(response.status().as_u16()));
@@ -106,6 +120,7 @@ impl GoProxyProvider for GoProxyClient {
             .collect())
     }
     async fn info(&self, module: &str, version: &str) -> Result<GoInfo, GoError> {
+        let _permit = self.budgets.install_egress().await?;
         let response = self
             .client
             .get(self.resource_url(module, version, "info")?)
@@ -119,6 +134,7 @@ impl GoProxyProvider for GoProxyClient {
             .map_err(GoError::from)
     }
     async fn latest(&self, module: &str) -> Result<GoInfo, GoError> {
+        let _permit = self.budgets.install_egress().await?;
         let response = self.client.get(self.url(module, "@latest")?).send().await?;
         if !response.status().is_success() {
             return Err(GoError::UpstreamStatus(response.status().as_u16()));

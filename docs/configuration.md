@@ -14,6 +14,11 @@ follow `policy.missing_publish_time`.
 server:
   bind: "127.0.0.1:8080"
   public_base_url: "http://127.0.0.1:8080"
+limits:
+  ingress_requests: 128
+  egress_requests: 32
+  background_sync_requests: 4
+  queue_timeout: "2s"
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
@@ -50,6 +55,47 @@ server:
 - `bind`: local socket address for the HTTP server.
 - `public_base_url`: URL used when advertising or rewriting proxy-owned package
   metadata and artifact links.
+
+`bind` accepts numeric IPv4, bracketed IPv6, or an ASCII DNS hostname plus a
+port. `public_base_url`, every upstream URL, and `policy.osv.api_url` must use
+HTTP or HTTPS, include a host, and contain no credentials, query, or fragment.
+Advertised and outbound URLs reject unspecified addresses (`0.0.0.0` and
+`[::]`) and explicit port zero because clients cannot use those destinations.
+Private HTTP mirrors, loopback fixtures on nonzero ports, and intentional base
+paths remain supported.
+
+A resolved non-loopback bind emits a startup warning. For shared deployments,
+put `osv-proxy` behind a trusted gateway or reverse proxy that provides TLS,
+authentication, client rate limiting, and edge access control. Those controls
+are intentionally not implemented in `osv-proxy`.
+
+## Runtime Limits
+
+```yaml
+limits:
+  ingress_requests: 128
+  egress_requests: 32
+  background_sync_requests: 4
+  queue_timeout: "2s"
+```
+
+- `ingress_requests`: maximum active registry and readiness responses,
+  including streamed artifact bodies. Excess requests receive HTTP 503
+  immediately. Dependency-free `/healthz` remains outside admission so a
+  saturated process can still report liveness.
+- `egress_requests`: aggregate install-path outbound request limit shared by
+  registry metadata, live OSV, and artifact delivery. Permits are retained
+  until buffered or streamed response bodies finish.
+- `background_sync_requests`: separate outbound limit for OSV dump sync, so
+  synchronization cannot consume install-path egress capacity.
+- `queue_timeout`: maximum wait for either egress lane. Install-path expiry
+  returns HTTP 503 with `Retry-After: 1`, even when an adapter or fail-open
+  policy would otherwise translate the underlying error. Background-sync
+  expiry records a failed sync attempt and follows the existing bounded retry
+  schedule; it has no client HTTP response.
+
+All limits must be greater than zero. Existing adapter-local fan-out caps remain
+in effect inside the aggregate process budget.
 
 ## Upstreams
 

@@ -71,7 +71,7 @@ impl NugetProvider for NugetClient {
         self.fetch_json(&self.service_index_url).await
     }
     async fn fetch_json(&self, url: &str) -> Result<Value, NugetError> {
-        let response = self
+        let (response, _permit) = self
             .client
             .fetch(Ecosystem::Nuget, url, self.metadata_timeout)
             .await?;
