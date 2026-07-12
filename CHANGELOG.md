@@ -5,6 +5,8 @@ source for GitHub release notes.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-12
+
 ### Changed
 
 - Make synchronized local SQLite OSV evaluation the default request-path
