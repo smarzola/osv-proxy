@@ -600,6 +600,14 @@ pub struct SqliteMaliciousChecker {
     require_full_dataset: bool,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct OsvEcosystemReadiness {
+    pub ecosystem: String,
+    pub ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 impl SqliteMaliciousChecker {
     pub fn new(config: &LocalOsvConfig) -> Self {
         Self::with_vulnerability_policy(config, false)
@@ -621,6 +629,43 @@ impl SqliteMaliciousChecker {
 
     fn open_read_only(&self) -> Result<Connection, OsvError> {
         open_read_only_connection(&self.path)
+    }
+
+    pub async fn readiness(&self) -> Vec<OsvEcosystemReadiness> {
+        let checker = self.clone();
+        match run_sqlite_check(move || {
+            let connection = checker.open_read_only()?;
+            Ok(ALL_OSV_ECOSYSTEMS
+                .iter()
+                .map(|ecosystem| {
+                    let ecosystem = ecosystem.osv_name().to_string();
+                    match ensure_store_healthy(&connection, &ecosystem, &checker) {
+                        Ok(()) => OsvEcosystemReadiness {
+                            ecosystem,
+                            ready: true,
+                            message: None,
+                        },
+                        Err(error) => OsvEcosystemReadiness {
+                            ecosystem,
+                            ready: false,
+                            message: Some(error.to_string()),
+                        },
+                    }
+                })
+                .collect())
+        })
+        .await
+        {
+            Ok(readiness) => readiness,
+            Err(error) => ALL_OSV_ECOSYSTEMS
+                .iter()
+                .map(|ecosystem| OsvEcosystemReadiness {
+                    ecosystem: ecosystem.osv_name().to_string(),
+                    ready: false,
+                    message: Some(error.to_string()),
+                })
+                .collect(),
+        }
     }
 
     fn check_with_connection(

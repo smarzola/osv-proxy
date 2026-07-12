@@ -150,7 +150,7 @@ The goal is complete only when:
 ## Milestones
 
 - [x] Milestone 1: Validated endpoint configuration and process-wide budgets
-- [ ] Milestone 2: Truthful health/readiness, gateway warning, and graceful drain
+- [x] Milestone 2: Truthful health/readiness, gateway warning, and graceful drain
 - [ ] Milestone 3: Immutable CI/release inputs and toolchain provenance
 - [ ] Milestone 4: Operational boundaries, documentation, and audit closure
 
@@ -284,7 +284,27 @@ cargo test --locked server
 cargo test --locked malicious
 ```
 
-Status: Not started.
+Status: Completed 2026-07-12. Explicit health routes precede registry fallback;
+local readiness evaluates all seven active datasets through policy-equivalent
+health and staleness rules. Shared listener startup warns for public binds.
+SIGINT/SIGTERM initiate graceful drain, and forced cancellation reaches both
+pre-response work and active artifact streams after the 30-second opportunity.
+
+Verification:
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked server`: 47 passed, 0 failed.
+- `cargo test --locked malicious`: 75 passed, 0 failed.
+- `git diff --check`: passed.
+- Retained adversarial review: three rounds; no blocking findings remain.
+
+Decision (2026-07-12): liveness is dependency-free. Live OSV mode is ready
+after validated startup because request-time OSV failures still follow the
+configured fail-open/fail-closed policy. Local mode reports all seven ecosystem
+states and is ready only when every ecosystem can be evaluated under the same
+dataset-version, health, and staleness rules as policy checks. Graceful drain is
+bounded at 30 seconds in production and tested through an injectable shutdown
+future.
 
 ## Milestone 3: Immutable CI/Release Inputs And Toolchain Provenance
 

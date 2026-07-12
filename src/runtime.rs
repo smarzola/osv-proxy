@@ -5,6 +5,7 @@ use futures_util::{StreamExt, stream};
 use std::cell::Cell;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -19,6 +20,30 @@ pub struct RuntimeBudgets {
     install_egress: Arc<Semaphore>,
     background_egress: Arc<Semaphore>,
     queue_timeout: Duration,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeControl {
+    forced: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl RuntimeControl {
+    pub fn force_shutdown(&self) {
+        self.forced.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    pub async fn forced(&self) {
+        if self.forced.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.notify.notified();
+        if self.forced.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
 }
 
 impl RuntimeBudgets {
@@ -110,12 +135,20 @@ impl BudgetError {
 pub fn hold_permits(
     response: Response<Body>,
     permits: Vec<OwnedSemaphorePermit>,
+    control: RuntimeControl,
 ) -> Response<Body> {
     let (parts, body) = response.into_parts();
     let stream = stream::unfold(
-        (body.into_data_stream(), permits),
-        |(mut body, permits): (BodyDataStream, Vec<OwnedSemaphorePermit>)| async move {
-            body.next().await.map(|result| (result, (body, permits)))
+        (body.into_data_stream(), permits, control),
+        |(mut body, permits, control): (
+            BodyDataStream,
+            Vec<OwnedSemaphorePermit>,
+            RuntimeControl,
+        )| async move {
+            tokio::select! {
+                item = body.next() => item.map(|result| (result, (body, permits, control))),
+                _ = control.forced() => None,
+            }
         },
     );
     Response::from_parts(parts, Body::from_stream(stream))

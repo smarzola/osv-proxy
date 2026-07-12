@@ -10,22 +10,27 @@ use crate::maven::{self, MavenRepositoryClient, MetadataChecksum};
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
 use crate::nuget::{self, NugetClient};
 use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
+use crate::readiness;
 use crate::response::RegistryResponse;
 use crate::rubygems::{self, CompactIndexProvider, RubyGemsClient};
-use crate::runtime::{BudgetError, RuntimeBudgets, hold_permits, track_request_overload};
+use crate::runtime::{
+    BudgetError, RuntimeBudgets, RuntimeControl, hold_permits, track_request_overload,
+};
 use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::{HeaderMap, Method, Response, Uri, header};
-use axum::routing::any;
+use axum::http::{HeaderMap, Method, Response, StatusCode, Uri, header};
+use axum::routing::{any, get};
 use chrono::{DateTime, Utc};
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 const REQUEST_BODY_LIMIT_BYTES: usize = 8192;
+const GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const BACKGROUND_RETRY_POLICY: BackgroundRetryPolicy = BackgroundRetryPolicy {
     initial: Duration::from_secs(5),
     maximum: Duration::from_secs(5 * 60),
@@ -43,24 +48,114 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     serve_listener(listener, config).await
 }
 
+fn requires_gateway_warning(address: std::net::SocketAddr) -> bool {
+    !address.ip().is_loopback()
+}
+
 pub async fn serve_listener(listener: TcpListener, config: Config) -> anyhow::Result<()> {
+    serve_listener_with_shutdown(listener, config, shutdown_signal(), GRACEFUL_DRAIN_TIMEOUT).await
+}
+
+async fn serve_listener_with_shutdown<F>(
+    listener: TcpListener,
+    config: Config,
+    shutdown: F,
+    drain_timeout: Duration,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if requires_gateway_warning(listener.local_addr()?) {
+        eprintln!(
+            "warning: osv-proxy is bound to a non-loopback address; place it behind a trusted gateway that provides TLS, authentication, client rate limiting, and edge access control"
+        );
+    }
     let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
+    let control = RuntimeControl::default();
     let _background_sync = start_background_osv_sync_if_enabled(&config, Arc::clone(&budgets));
-    axum::serve(listener, router_with_budgets(config, budgets)).await?;
+    let (draining_tx, draining_rx) = tokio::sync::oneshot::channel();
+    let graceful = async move {
+        shutdown.await;
+        let _ = draining_tx.send(());
+    };
+    let server = axum::serve(
+        listener,
+        router_with_runtime(config, budgets, control.clone()),
+    )
+    .with_graceful_shutdown(graceful)
+    .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        _ = async {
+            let _ = draining_rx.await;
+            tokio::time::sleep(drain_timeout).await;
+        } => {
+            eprintln!("graceful shutdown drain timed out after {drain_timeout:?}");
+            control.force_shutdown();
+            let _ = tokio::time::timeout(Duration::from_secs(1), &mut server).await;
+        }
+    }
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                eprintln!("failed to install SIGTERM handler: {error}; waiting for Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 pub fn router(config: Config) -> Router {
     let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
-    router_with_budgets(config, budgets)
+    router_with_runtime(config, budgets, RuntimeControl::default())
 }
 
-fn router_with_budgets(config: Config, budgets: Arc<RuntimeBudgets>) -> Router {
+fn router_with_runtime(
+    config: Config,
+    budgets: Arc<RuntimeBudgets>,
+    control: RuntimeControl,
+) -> Router {
     let checker = configured_malicious_checker_with_budgets(&config, Arc::clone(&budgets));
     Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .fallback(any(registry_handler))
-        .with_state(Arc::new(AppState::new(config, checker, budgets)))
+        .with_state(Arc::new(AppState::new(config, checker, budgets, control)))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
+}
+
+async fn healthz() -> Response<Body> {
+    RegistryResponse::json(200, &serde_json::json!({"live": true}))
+        .expect("static liveness response serializes")
+        .into_http_response()
+}
+
+async fn readyz(State(state): State<Arc<AppState>>) -> Response<Body> {
+    let report = readiness::evaluate(&state.config).await;
+    let status = if report.ready { 200 } else { 503 };
+    RegistryResponse::json(
+        status,
+        &serde_json::to_value(report).expect("readiness report serializes"),
+    )
+    .expect("readiness response serializes")
+    .into_http_response()
 }
 
 struct AppState {
@@ -68,6 +163,7 @@ struct AppState {
     checker: Arc<dyn MaliciousChecker>,
     clients: RegistryClients,
     budgets: Arc<RuntimeBudgets>,
+    control: RuntimeControl,
 }
 
 impl AppState {
@@ -75,6 +171,7 @@ impl AppState {
         config: Config,
         checker: Arc<dyn MaliciousChecker>,
         budgets: Arc<RuntimeBudgets>,
+        control: RuntimeControl,
     ) -> Self {
         let clients = RegistryClients::new(&config, Arc::clone(&budgets));
         Self {
@@ -82,6 +179,7 @@ impl AppState {
             checker,
             clients,
             budgets,
+            control,
         }
     }
 }
@@ -244,7 +342,7 @@ async fn registry_handler(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    let (response, overloaded) = track_request_overload(route_http_request_with_clients(
+    let route = track_request_overload(route_http_request_with_clients(
         &state.config,
         state.checker.as_ref(),
         &state.clients,
@@ -252,12 +350,22 @@ async fn registry_handler(
         &path,
         accept.as_deref(),
         &headers,
-    ))
-    .await;
+    ));
+    let (response, overloaded) = tokio::select! {
+        result = route => result,
+        _ = state.control.forced() => {
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("content-type", "application/json")
+                .header("connection", "close")
+                .body(Body::from("{\"allowed\":false,\"reason\":\"shutting_down\",\"message\":\"server drain deadline elapsed\"}"))
+                .expect("static shutdown response is valid");
+        }
+    };
     if overloaded {
         return BudgetError::EgressSaturated.response();
     }
-    hold_permits(response, vec![ingress])
+    hold_permits(response, vec![ingress], state.control.clone())
 }
 
 pub async fn route_request(config: &Config, method: &str, path: &str) -> RegistryResponse {
@@ -2668,6 +2776,55 @@ INSERT INTO advisories (
         (format!("http://{address}"), accepted, release)
     }
 
+    async fn streaming_artifact_config() -> (Config, Arc<Notify>, Arc<Notify>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let artifact_started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let task_started = Arc::clone(&artifact_started);
+        let task_release = Arc::clone(&release);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 12\r\ncontent-type: application/octet-stream\r\nconnection: close\r\n\r\npartial",
+                )
+                .await
+                .unwrap();
+            task_started.notify_one();
+            task_release.notified().await;
+            let _ = stream.write_all(b"-done").await;
+        });
+        let artifact_url = format!("http://{address}/demo-1.0.0.tgz");
+        let metadata = json!({
+            "name": "demo",
+            "time": { "1.0.0": "2026-06-01T00:00:00Z" },
+            "versions": { "1.0.0": {
+                "name": "demo", "version": "1.0.0",
+                "dist": { "tarball": artifact_url }
+            }}
+        })
+        .to_string();
+        let (registry_url, _request) = serve_http_once(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            metadata.len(),
+            metadata
+        ))
+        .await;
+        let mut config = Config::default();
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
+        config.upstreams.npm.registry_url = registry_url;
+        config
+            .artifacts
+            .trusted_origins
+            .push(format!("http://{address}"));
+        (config, artifact_started, release)
+    }
+
     #[tokio::test]
     async fn app_state_reuses_upstream_connection_across_requests() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2888,6 +3045,239 @@ INSERT INTO advisories (
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn health_and_live_readiness_are_dependency_free() {
+        let app = router(Config::default());
+        for (path, field) in [("/healthz", "live"), ("/readyz", "ready")] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body[field], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_readiness_reports_every_ecosystem_and_staleness() {
+        let dir = tempdir().unwrap();
+        let config = local_malicious_config(dir.path().join("readiness.sqlite"));
+        SqliteMaliciousChecker::initialize(&config.policy.osv.local.sqlite_path).unwrap();
+        for ecosystem in ALL_OSV_ECOSYSTEMS {
+            insert_ready_ecosystem(&config, ecosystem, Utc::now());
+        }
+
+        let response = router(config.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["ecosystems"].as_array().unwrap().len(),
+            ALL_OSV_ECOSYSTEMS.len()
+        );
+
+        insert_ready_ecosystem(
+            &config,
+            Ecosystem::Maven,
+            Utc::now() - ChronoDuration::days(2),
+        );
+        let response = router(config)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let maven = body["ecosystems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["ecosystem"] == "Maven")
+            .unwrap();
+        assert_eq!(maven["ready"], false);
+        assert!(maven["message"].as_str().unwrap().contains("stale"));
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_waits_for_in_flight_registry_request() {
+        let (registry_url, accepted, release) = blocking_npm_upstream().await;
+        let mut config = Config::default();
+        config.upstreams.npm.registry_url = registry_url;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_listener_with_shutdown(
+            listener,
+            config,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_secs(1),
+        ));
+        let request = tokio::spawn(async move {
+            reqwest::get(format!("http://{address}/npm/demo"))
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(1), accepted.notified())
+            .await
+            .unwrap();
+        shutdown_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!server.is_finished());
+
+        release.notify_one();
+        assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_has_a_bounded_drain_period() {
+        let (registry_url, accepted, release) = blocking_npm_upstream().await;
+        let mut config = Config::default();
+        config.upstreams.npm.registry_url = registry_url;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_listener_with_shutdown(
+            listener,
+            config,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_millis(20),
+        ));
+        let request =
+            tokio::spawn(async move { reqwest::get(format!("http://{address}/npm/demo")).await });
+        tokio::time::timeout(Duration::from_secs(1), accepted.notified())
+            .await
+            .unwrap();
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        release.notify_one();
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_allows_artifact_stream_to_finish_before_deadline() {
+        let (config, artifact_started, release) = streaming_artifact_config().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_listener_with_shutdown(
+            listener,
+            config,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_secs(1),
+        ));
+        let response = reqwest::get(format!("http://{address}/npm/demo/-/demo-1.0.0.tgz"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), artifact_started.notified())
+            .await
+            .unwrap();
+        shutdown_tx.send(()).unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!server.is_finished());
+
+        release.notify_one();
+        assert_eq!(response.bytes().await.unwrap(), &b"partial-done"[..]);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_terminates_stalled_artifact_stream() {
+        let (config, artifact_started, release) = streaming_artifact_config().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(serve_listener_with_shutdown(
+            listener,
+            config,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            Duration::from_millis(20),
+        ));
+        let response = reqwest::get(format!("http://{address}/npm/demo/-/demo-1.0.0.tgz"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), artifact_started.notified())
+            .await
+            .unwrap();
+        shutdown_tx.send(()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let body_result = tokio::time::timeout(Duration::from_secs(1), response.bytes())
+            .await
+            .unwrap();
+        assert!(
+            body_result.is_err(),
+            "forced close must truncate the stalled stream"
+        );
+        release.notify_one();
+    }
+
+    #[test]
+    fn gateway_warning_is_based_on_the_resolved_listener_address() {
+        for address in ["127.0.0.1:8080", "[::1]:8080"] {
+            assert!(!requires_gateway_warning(address.parse().unwrap()));
+        }
+        for address in ["0.0.0.0:8080", "192.0.2.1:8080", "[::]:8080"] {
+            assert!(requires_gateway_warning(address.parse().unwrap()));
+        }
     }
 
     #[tokio::test]
@@ -3174,6 +3564,25 @@ INSERT INTO osv_advisories (
                 params![package_id, version],
             )
             .unwrap();
+    }
+
+    fn insert_ready_ecosystem(config: &Config, ecosystem: Ecosystem, timestamp: DateTime<Utc>) {
+        let connection = Connection::open(&config.policy.osv.local.sqlite_path).unwrap();
+        let ecosystem = ecosystem.osv_name();
+        let timestamp = timestamp.to_rfc3339();
+        connection.execute(
+            "UPDATE dataset_generations SET status='superseded' WHERE ecosystem=?1 AND status='active'",
+            [ecosystem],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO dataset_generations (ecosystem,dataset_version,status,staged_at,activated_at) VALUES (?1,1,'active',?2,?2)",
+            params![ecosystem, timestamp],
+        ).unwrap();
+        let generation = connection.last_insert_rowid();
+        connection.execute(
+            "INSERT OR REPLACE INTO sync_state (ecosystem,source,last_success_at,last_attempted_at,status,active_generation_id) VALUES (?1,'test',?2,?2,'healthy',?3)",
+            params![ecosystem, timestamp, generation],
+        ).unwrap();
     }
 
     #[tokio::test]
