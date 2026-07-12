@@ -87,10 +87,47 @@ Manual block:
 
 ## Health Endpoints
 
-Health endpoints are not implemented in the current phase.
+`GET /healthz` is dependency-free liveness:
 
-Future `/healthz` and `/readyz` endpoints should report process health and
-configured dependency readiness.
+```json
+{"live":true}
+```
+
+`GET /readyz` reports whether the configured OSV policy source is ready. Live
+mode is ready after validated startup because request failures still follow
+`policy.osv.on_error`:
+
+```json
+{"ready":true,"osv_source":"live"}
+```
+
+Local mode reports all seven supported ecosystem datasets. Readiness requires
+each active generation to be healthy, complete when vulnerability blocking is
+enabled, and within the configured staleness policy. An unready report returns
+HTTP 503; a ready report returns 200.
+
+```json
+{
+  "ready": false,
+  "osv_source": "local",
+  "ecosystems": [
+    {"ecosystem": "npm", "ready": true},
+    {
+      "ecosystem": "Maven",
+      "ready": false,
+      "message": "local malicious data for ecosystem Maven is stale"
+    }
+  ]
+}
+```
+
+The real response contains one entry for every supported ecosystem; the example
+is shortened for readability.
+
+SIGINT and SIGTERM stop accepting new connections and allow in-flight requests
+and artifact streams 30 seconds to drain. After that opportunity, remaining
+route work and streams are canceled; forced-close coordination may take up to
+one additional second.
 
 ## npm Routes
 

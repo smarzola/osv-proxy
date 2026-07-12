@@ -222,6 +222,13 @@ RubyGems registry, Maven Central repository, and OSV API default to their public
 Set `upstreams` or `policy.osv.api_url` only when using a mirror, fixture, or
 private gateway.
 
+For a shared or non-loopback deployment, place `osv-proxy` behind a trusted
+gateway or reverse proxy that provides TLS, authentication, client rate
+limiting, and edge access control. The process enforces configurable global
+ingress and outbound-request budgets, exposes `/healthz` and `/readyz`, and
+gracefully drains SIGINT/SIGTERM; see [configuration](docs/configuration.md) for
+the runtime limits and readiness contract.
+
 ### OSV Data Source
 
 `policy.osv.source: live` is the default. Live mode calls the OSV API during
@@ -293,25 +300,36 @@ model. The PyPI Simple root is rendered with project links that stay on
 
 ## Development
 
-Run the test suite:
+Run Rust unit tests without external package managers:
 
 ```sh
-cargo test
+cargo test --locked --lib
 ```
+
+This is a partial verification command. The required fully provisioned suite is
+`cargo test --locked`; missing external tools intentionally fail rather than
+skip.
 
 Run only the route-level policy flow tests:
 
 ```sh
-cargo test e2e
+cargo test --locked e2e
 ```
 
 Run only the package-manager end-to-end tests. These start local fixture
-registries and a local proxy, then run npm, uv/pip, Cargo, Go, .NET, and Bundler clients
-against the proxy:
+registries and a local proxy, then run npm, uv/pip, Cargo, Go, .NET, Bundler,
+Maven, and Gradle clients against the proxy:
 
 ```sh
-cargo test --test package_manager_e2e
+cargo test --locked --test package_manager_e2e
 ```
+
+The full local toolchain matches required CI: Rust 1.97.0; Temurin Java
+21.0.7+6, Maven 3.9.11, and Gradle 8.14.3; .NET SDK 8.0.128; Node 24.18.0 and
+npm; Go 1.24.0; Ruby 3.3.8 with `gem` and Bundler 2.5.23; uv 0.11.28; plus
+`zip` and `shasum`. Every corresponding command (`java`, `mvn`, `gradle`,
+`dotnet`, `node`/`npm`, `go`, `ruby`/`gem`/`bundle`, `uv`, `cargo`, `zip`, and
+`shasum`) must be available on `PATH`.
 
 Format check:
 

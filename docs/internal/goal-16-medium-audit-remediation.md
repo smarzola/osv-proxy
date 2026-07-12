@@ -152,7 +152,7 @@ The goal is complete only when:
 - [x] Milestone 1: Validated endpoint configuration and process-wide budgets
 - [x] Milestone 2: Truthful health/readiness, gateway warning, and graceful drain
 - [x] Milestone 3: Immutable CI/release inputs and toolchain provenance
-- [ ] Milestone 4: Operational boundaries, documentation, and audit closure
+- [x] Milestone 4: Operational boundaries, documentation, and audit closure
 
 ### Checkpoint Protocol
 
@@ -426,7 +426,29 @@ cargo run --locked -- config validate --config examples/basic/osv-proxy.yaml
 git diff --check
 ```
 
-Status: Not started.
+Status: Completed 2026-07-12. Public docs now describe the gateway boundary,
+endpoint validation, limits and overload behavior, health/readiness JSON,
+graceful/forced drain, exact local prerequisites, and implemented versus target
+telemetry. Architecture documents focused runtime/readiness ownership. The
+audit closes or reclassifies every original medium item with checkpoint
+evidence while preserving original snapshot sections.
+
+Verification:
+
+- `cargo fmt --check`: passed.
+- `cargo test --locked --test workflow_reproducibility`: 1 passed, 0 failed.
+- `cargo run --locked -- config validate --config examples/basic/osv-proxy.yaml`:
+  configuration is valid.
+- `git diff --check`: passed.
+- Retained adversarial review: two rounds; no blocking findings remain.
+
+Decision (2026-07-12): `runtime.rs` owns admission, overload propagation,
+response-lifetime permits, and forced lifecycle control; `readiness.rs` owns the
+public readiness model; `malicious.rs` exposes one read-only ecosystem readiness
+API that reuses policy health invariants. This is the concrete architecture
+boundary justified by the operational work. A broad router/storage split is no
+longer classified as an active medium defect without a demonstrated drift or
+change target.
 
 ## Final Verification
 

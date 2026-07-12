@@ -1,8 +1,21 @@
 # Observability
 
-Use structured logs and metrics.
+## Implemented Signals
 
-## Metadata Request Logs
+- `/healthz` reports dependency-free process liveness.
+- `/readyz` reports live/local OSV readiness and per-ecosystem local dataset
+  health.
+- Startup warns when the resolved listener is non-loopback.
+- Startup, background sync outcomes, forced-drain timeout, and signal setup
+  failures emit plain-text process messages.
+
+Structured request logs, request IDs, latency/upstream metrics, and a metrics
+exporter are not implemented. The sections below are the target telemetry
+contract, not current emitted behavior.
+
+## Target Structured Logs And Metrics
+
+### Metadata Request Logs
 
 Each metadata request should log:
 
@@ -17,7 +30,7 @@ Each metadata request should log:
 - `versions_blocked`
 - `duration_ms`
 
-## Artifact Request Logs
+### Artifact Request Logs
 
 Each artifact request should log:
 
@@ -33,7 +46,7 @@ Each artifact request should log:
 - `upstream_url`
 - `duration_ms`
 
-## Blocked Decision Logs
+### Blocked Decision Logs
 
 Each blocked decision should log:
 
@@ -46,7 +59,7 @@ Each blocked decision should log:
 - `source`
 - `message`
 
-## Metrics
+### Metrics
 
 - `osv_proxy_metadata_requests_total`
 - `osv_proxy_artifact_requests_total`
