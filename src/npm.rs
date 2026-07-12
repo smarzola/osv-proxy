@@ -211,12 +211,14 @@ async fn filter_metadata(
         })
         .collect::<Vec<_>>();
     let policy = PolicyEngine::new(config);
-    let artifacts_to_check = artifacts
-        .iter()
-        .enumerate()
-        .filter(|(_, artifact)| policy.should_check_osv(artifact))
-        .map(|(index, artifact)| (index, artifact.clone()))
-        .collect::<Vec<_>>();
+    let mut artifacts_to_check = Vec::new();
+    let mut batch_indices = vec![None; artifacts.len()];
+    for (index, artifact) in artifacts.iter().enumerate() {
+        if policy.should_check_osv(artifact) {
+            batch_indices[index] = Some(artifacts_to_check.len());
+            artifacts_to_check.push((index, artifact.clone()));
+        }
+    }
     let checked_artifacts = artifacts_to_check
         .iter()
         .map(|(_, artifact)| artifact.clone())
@@ -250,10 +252,7 @@ async fn filter_metadata(
             .and_then(parse_npm_time);
         let artifact =
             artifact_from_version_metadata(package, version, version_metadata, published_at);
-        let malicious_result = if let Some(batch_index) = artifacts_to_check
-            .iter()
-            .position(|(artifact_index, _)| *artifact_index == index)
-        {
+        let malicious_result = if let Some(batch_index) = batch_indices[index] {
             match &malicious_results {
                 Ok(results) => results.get(batch_index).cloned().map(Ok).or_else(|| {
                     Some(Err(format!(

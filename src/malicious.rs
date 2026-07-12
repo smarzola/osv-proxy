@@ -33,6 +33,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const OSV_DUMP_BASE_URL: &str = "https://storage.googleapis.com/osv-vulnerabilities";
 const OSV_DETAIL_CONCURRENCY: usize = 16;
+// api.osv.dev rejects /v1/querybatch requests containing more than 1,000 queries.
+const OSV_QUERY_BATCH_SIZE: usize = 1_000;
+const OSV_QUERY_BATCH_CONCURRENCY: usize = 4;
 const MAX_OSV_API_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OSV_DOCUMENT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_OSV_ARCHIVE_BYTES: usize = 4 * 1024 * 1024 * 1024;
@@ -286,6 +289,58 @@ impl OsvHttpClient {
         Ok(http_body::collect_json(response, MAX_OSV_API_BYTES, "OSV batch response").await?)
     }
 
+    async fn post_batch_chunks(
+        &self,
+        queries: &[OsvQueryRequest],
+    ) -> Result<Vec<OsvBatchQueryResponse>, OsvError> {
+        let mut pending = FuturesUnordered::new();
+        let mut responses = Vec::with_capacity(queries.len().div_ceil(OSV_QUERY_BATCH_SIZE));
+
+        for (chunk_index, chunk) in queries.chunks(OSV_QUERY_BATCH_SIZE).enumerate() {
+            let client = self.clone();
+            let expected_results = chunk.len();
+            let chunk = chunk.to_vec();
+            pending.push(async move {
+                (
+                    chunk_index,
+                    expected_results,
+                    client.post_batch(chunk).await,
+                )
+            });
+
+            if pending.len() >= OSV_QUERY_BATCH_CONCURRENCY {
+                let (chunk_index, expected_results, response) = pending
+                    .next()
+                    .await
+                    .expect("batch request is pending after reaching the concurrency limit");
+                let response = response?;
+                if response.results.len() != expected_results {
+                    return Err(OsvError::InvalidBatchResponse {
+                        expected: expected_results,
+                        actual: response.results.len(),
+                    });
+                }
+                responses.push((chunk_index, response));
+            }
+        }
+
+        while let Some((chunk_index, expected_results, response)) = pending.next().await {
+            let response = response?;
+            if response.results.len() != expected_results {
+                return Err(OsvError::InvalidBatchResponse {
+                    expected: expected_results,
+                    actual: response.results.len(),
+                });
+            }
+            responses.push((chunk_index, response));
+        }
+        responses.sort_unstable_by_key(|(chunk_index, _)| *chunk_index);
+        Ok(responses
+            .into_iter()
+            .map(|(_, response)| response)
+            .collect())
+    }
+
     async fn hydrate_details(
         &self,
         ids: BTreeSet<String>,
@@ -422,18 +477,22 @@ impl OsvChecker for OsvHttpClient {
                 page_token: None,
             })
             .collect::<Vec<_>>();
-        let response = self.post_batch(base_queries.clone()).await?;
-        if response.results.len() != artifacts.len() {
+        let responses = self.post_batch_chunks(&base_queries).await?;
+        let mut batch_results = Vec::with_capacity(artifacts.len());
+        for response in responses {
+            batch_results.extend(response.results);
+        }
+        if batch_results.len() != artifacts.len() {
             return Err(OsvError::InvalidBatchResponse {
                 expected: artifacts.len(),
-                actual: response.results.len(),
+                actual: batch_results.len(),
             });
         }
 
         let mut stubs = vec![Vec::<OsvVulnerability>::new(); artifacts.len()];
         let mut pending = Vec::new();
         let mut seen_tokens = vec![BTreeSet::new(); artifacts.len()];
-        for (index, result) in response.results.into_iter().enumerate() {
+        for (index, result) in batch_results.into_iter().enumerate() {
             stubs[index].extend(result.vulns);
             if let Some(token) = result.next_page_token.filter(|token| !token.is_empty()) {
                 seen_tokens[index].insert(token.clone());
@@ -2781,9 +2840,20 @@ mod tests {
     struct LiveMockState {
         query_calls: AtomicUsize,
         batch_calls: AtomicUsize,
+        active_batches: AtomicUsize,
+        peak_batches: AtomicUsize,
+        batch_delay_ms: AtomicUsize,
         active_details: AtomicUsize,
         peak_details: AtomicUsize,
         detail_counts: Mutex<BTreeMap<String, usize>>,
+    }
+
+    struct BatchActivityGuard(Arc<LiveMockState>);
+
+    impl Drop for BatchActivityGuard {
+        fn drop(&mut self) {
+            self.0.active_batches.fetch_sub(1, AtomicOrdering::SeqCst);
+        }
     }
 
     async fn mock_query(
@@ -2839,6 +2909,13 @@ mod tests {
         Json(body): Json<serde_json::Value>,
     ) -> Json<serde_json::Value> {
         state.batch_calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let active = state.active_batches.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        state.peak_batches.fetch_max(active, AtomicOrdering::SeqCst);
+        let _activity = BatchActivityGuard(Arc::clone(&state));
+        let delay = state.batch_delay_ms.load(AtomicOrdering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+        }
         let queries = body["queries"].as_array().unwrap();
         if queries.iter().any(|query| {
             query.get("version").and_then(|value| value.as_str()) == Some("batch-cycle")
@@ -2992,6 +3069,39 @@ mod tests {
         assert_eq!(state.batch_calls.load(AtomicOrdering::SeqCst), 2);
         assert!(state.peak_details.load(AtomicOrdering::SeqCst) > 1);
         assert!(state.peak_details.load(AtomicOrdering::SeqCst) <= OSV_DETAIL_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn live_batch_queries_chunk_at_api_limit_and_bound_concurrency() {
+        let (url, state) = live_mock().await;
+        state.batch_delay_ms.store(20, AtomicOrdering::SeqCst);
+        let client = OsvHttpClient::with_vulnerability_policy(url, false);
+        let query_count = OSV_QUERY_BATCH_SIZE * 2 + 1;
+        let artifacts = (0..query_count)
+            .map(|index| {
+                let version = if index % OSV_QUERY_BATCH_SIZE == 0 {
+                    "mal-bad".to_string()
+                } else {
+                    format!("chunk-{index}")
+                };
+                Artifact::package(Ecosystem::Npm, "demo", version, None)
+            })
+            .collect::<Vec<_>>();
+
+        let results = client.check_many(&artifacts).await.unwrap();
+
+        assert_eq!(results.len(), query_count);
+        assert_eq!(state.batch_calls.load(AtomicOrdering::SeqCst), 3);
+        assert!(state.peak_batches.load(AtomicOrdering::SeqCst) >= 2);
+        assert!(state.peak_batches.load(AtomicOrdering::SeqCst) <= OSV_QUERY_BATCH_CONCURRENCY);
+        for (index, findings) in results.iter().enumerate() {
+            if index % OSV_QUERY_BATCH_SIZE == 0 {
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].osv_id, "MAL-2026-known");
+            } else {
+                assert!(findings.is_empty());
+            }
+        }
     }
 
     #[tokio::test]
