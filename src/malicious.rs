@@ -1,6 +1,7 @@
 use crate::artifact::{Artifact, Ecosystem};
 use crate::config::{Config, LocalOsvConfig, LocalOsvStaleBehavior, OsvSource};
 use crate::go;
+use crate::http_body::{self, HttpBodyError};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -13,12 +14,16 @@ use semver::Version as cargo_semver;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Cursor, Read};
+use std::fs::{File, OpenOptions, TryLockError};
+#[cfg(test)]
+use std::io::{Cursor, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use zip::ZipArchive;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -26,6 +31,26 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const OSV_DUMP_BASE_URL: &str = "https://storage.googleapis.com/osv-vulnerabilities";
 const OSV_DETAIL_CONCURRENCY: usize = 16;
+const MAX_OSV_API_BYTES: usize = 64 * 1024 * 1024;
+const MAX_OSV_DOCUMENT_BYTES: usize = 256 * 1024 * 1024;
+const MAX_OSV_ARCHIVE_BYTES: usize = 4 * 1024 * 1024 * 1024;
+const MAX_OSV_ARCHIVE_ENTRIES: usize = 1_000_000;
+const MAX_OSV_ARCHIVE_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_OSV_ARCHIVE_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const SQLITE_CHECK_CONCURRENCY: usize = 8;
+
+static SQLITE_CHECK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static ACTIVE_SYNC_PATHS: OnceLock<StdMutex<BTreeSet<PathBuf>>> = OnceLock::new();
+
+pub(crate) const ALL_OSV_ECOSYSTEMS: [Ecosystem; 7] = [
+    Ecosystem::Npm,
+    Ecosystem::Pypi,
+    Ecosystem::Go,
+    Ecosystem::CratesIo,
+    Ecosystem::Nuget,
+    Ecosystem::RubyGems,
+    Ecosystem::Maven,
+];
 
 #[async_trait]
 pub trait OsvChecker: Send + Sync {
@@ -153,6 +178,8 @@ pub fn effective_osv_severity(
 pub enum OsvError {
     #[error("OSV request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("OSV upstream body failed validation: {0}")]
+    Body(#[from] HttpBodyError),
     #[error("OSV batch response returned {actual} results for {expected} queries")]
     InvalidBatchResponse { expected: usize, actual: usize },
     #[error("local malicious store failed: {0}")]
@@ -199,30 +226,28 @@ impl OsvHttpClient {
     }
 
     async fn post_query(&self, request: &OsvQueryRequest) -> Result<OsvQueryResponse, OsvError> {
-        Ok(self
+        let response = self
             .client
             .post(format!("{}/v1/query", self.api_url))
             .json(request)
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .error_for_status()?;
+        Ok(http_body::collect_json(response, MAX_OSV_API_BYTES, "OSV query response").await?)
     }
 
     async fn post_batch(
         &self,
         queries: Vec<OsvQueryRequest>,
     ) -> Result<OsvBatchQueryResponse, OsvError> {
-        Ok(self
+        let response = self
             .client
             .post(format!("{}/v1/querybatch", self.api_url))
             .json(&OsvBatchQueryRequest { queries })
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .error_for_status()?;
+        Ok(http_body::collect_json(response, MAX_OSV_API_BYTES, "OSV batch response").await?)
     }
 
     async fn hydrate_details(
@@ -244,16 +269,20 @@ impl OsvHttpClient {
                         url.path_segments_mut()
                             .map_err(|_| "OSV API URL cannot be a base URL".to_string())?
                             .extend(["v1", "vulns", id.as_str()]);
-                        let detail = client
+                        let response = client
                             .get(url)
                             .send()
                             .await
                             .map_err(|error| error.to_string())?
                             .error_for_status()
-                            .map_err(|error| error.to_string())?
-                            .json::<OsvVulnerability>()
-                            .await
                             .map_err(|error| error.to_string())?;
+                        let detail = http_body::collect_json::<OsvVulnerability>(
+                            response,
+                            MAX_OSV_API_BYTES,
+                            "OSV vulnerability detail",
+                        )
+                        .await
+                        .map_err(|error| error.to_string())?;
                         if detail.id != id {
                             return Err(OsvError::DetailIdentity {
                                 requested: id.clone(),
@@ -571,6 +600,16 @@ impl SqliteMaliciousChecker {
         connection: &Connection,
         artifacts: &[Artifact],
     ) -> Result<Vec<Vec<OsvFinding>>, OsvError> {
+        let mut range_package_loads = 0;
+        self.check_many_with_connection_tracked(connection, artifacts, &mut range_package_loads)
+    }
+
+    fn check_many_with_connection_tracked(
+        &self,
+        connection: &Connection,
+        artifacts: &[Artifact],
+        range_package_loads: &mut usize,
+    ) -> Result<Vec<Vec<OsvFinding>>, OsvError> {
         let ecosystems = artifacts
             .iter()
             .map(|artifact| artifact.ecosystem.osv_name())
@@ -579,39 +618,41 @@ impl SqliteMaliciousChecker {
             ensure_store_healthy(connection, ecosystem, self)?;
         }
 
-        let mut grouped = BTreeMap::<(String, String, String), Vec<usize>>::new();
+        let mut grouped = BTreeMap::<(String, String), BTreeMap<String, Vec<usize>>>::new();
         for (index, artifact) in artifacts.iter().enumerate() {
             grouped
                 .entry((
                     artifact.ecosystem.osv_name().to_string(),
                     artifact.name.clone(),
-                    artifact.version.clone(),
                 ))
+                .or_default()
+                .entry(artifact.version.clone())
                 .or_default()
                 .push(index);
         }
 
-        let mut range_results = BTreeMap::<(String, String, String), Vec<OsvFinding>>::new();
         let mut results = vec![Vec::new(); artifacts.len()];
-        for (_, indexes) in grouped {
-            let artifact = &artifacts[indexes[0]];
-            let mut hits = exact_hits(connection, artifact)?;
-            let range_key = (
-                artifact.ecosystem.osv_name().to_string(),
-                artifact.name.clone(),
-                artifact.version.clone(),
-            );
-            let range_hits = if let Some(hits) = range_results.get(&range_key) {
-                hits.clone()
-            } else {
-                let hits = range_hits(connection, artifact)?;
-                range_results.insert(range_key, hits.clone());
-                hits
-            };
-            hits.extend(range_hits);
-            let hits = consolidate_local_findings(hits)?;
-            for index in indexes {
-                results[index] = hits.clone();
+        for (_, versions) in grouped {
+            let first_index = versions
+                .values()
+                .next()
+                .and_then(|indexes| indexes.first())
+                .copied()
+                .expect("grouped package has at least one artifact");
+            let ranges = stored_ranges(connection, &artifacts[first_index])?;
+            *range_package_loads += 1;
+            for indexes in versions.into_values() {
+                let artifact = &artifacts[indexes[0]];
+                let mut hits = exact_hits(connection, artifact)?;
+                for range in &ranges {
+                    if range_matches_artifact(range, artifact)? {
+                        hits.push(range.advisory.clone());
+                    }
+                }
+                let hits = consolidate_local_findings(hits)?;
+                for index in indexes {
+                    results[index] = hits.clone();
+                }
             }
         }
         Ok(results)
@@ -621,22 +662,80 @@ impl SqliteMaliciousChecker {
 #[async_trait]
 impl OsvChecker for SqliteMaliciousChecker {
     async fn check(&self, artifact: &Artifact) -> Result<Vec<OsvFinding>, OsvError> {
-        let connection = self.open_read_only()?;
-        self.check_with_connection(&connection, artifact)
+        let checker = self.clone();
+        let artifact = artifact.clone();
+        run_sqlite_check(move || {
+            let connection = checker.open_read_only()?;
+            checker.check_with_connection(&connection, &artifact)
+        })
+        .await
     }
 
     async fn check_many(&self, artifacts: &[Artifact]) -> Result<Vec<Vec<OsvFinding>>, OsvError> {
         if artifacts.is_empty() {
             return Ok(Vec::new());
         }
-        let connection = self.open_read_only()?;
-        self.check_many_with_connection(&connection, artifacts)
+        let checker = self.clone();
+        let artifacts = artifacts.to_vec();
+        run_sqlite_check(move || {
+            let connection = checker.open_read_only()?;
+            checker.check_many_with_connection(&connection, &artifacts)
+        })
+        .await
     }
+}
+
+async fn run_sqlite_check<T, F>(operation: F) -> Result<T, OsvError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, OsvError> + Send + 'static,
+{
+    let semaphore = SQLITE_CHECK_SEMAPHORE
+        .get_or_init(|| Arc::new(Semaphore::new(SQLITE_CHECK_CONCURRENCY)))
+        .clone();
+    let permit = semaphore
+        .acquire_owned()
+        .await
+        .map_err(|error| OsvError::LocalStore(format!("SQLite check queue closed: {error}")))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|error| OsvError::LocalStore(format!("SQLite check task failed: {error}")))?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OsvSyncReport {
     pub ecosystems: Vec<OsvSyncEcosystemReport>,
+    pub failures: Vec<OsvSyncEcosystemFailure>,
+}
+
+impl OsvSyncReport {
+    pub fn is_success(&self) -> bool {
+        self.failures.is_empty()
+    }
+
+    pub fn attempted(&self) -> usize {
+        self.ecosystems.len() + self.failures.len()
+    }
+
+    pub(crate) fn failed_ecosystems(&self) -> Vec<Ecosystem> {
+        ALL_OSV_ECOSYSTEMS
+            .into_iter()
+            .filter(|ecosystem| {
+                self.failures
+                    .iter()
+                    .any(|failure| failure.ecosystem == ecosystem.osv_name())
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OsvSyncEcosystemFailure {
+    pub ecosystem: String,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -657,6 +756,23 @@ pub enum OsvSyncMode {
 #[async_trait]
 pub trait OsvDumpClient: Send + Sync {
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, OsvError>;
+    async fn fetch_archive(&self, url: &str) -> Result<File, OsvError>;
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_archive_file(bytes: &[u8]) -> Result<File, OsvError> {
+    if bytes.len() > MAX_OSV_ARCHIVE_BYTES {
+        return Err(OsvError::Sync(format!(
+            "OSV archive exceeds the {MAX_OSV_ARCHIVE_BYTES}-byte limit"
+        )));
+    }
+    let mut file = tempfile::tempfile()
+        .map_err(|error| OsvError::Sync(format!("failed to create OSV archive file: {error}")))?;
+    file.write_all(bytes)
+        .map_err(|error| OsvError::Sync(format!("failed to write OSV archive file: {error}")))?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| OsvError::Sync(format!("failed to rewind OSV archive file: {error}")))?;
+    Ok(file)
 }
 
 #[derive(Debug, Clone)]
@@ -686,11 +802,15 @@ impl Default for HttpOsvDumpClient {
 impl OsvDumpClient for HttpOsvDumpClient {
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, OsvError> {
         let response = self.client.get(url).send().await?.error_for_status()?;
-        response
-            .bytes()
-            .await
-            .map(|bytes| bytes.to_vec())
-            .map_err(OsvError::Request)
+        Ok(http_body::collect_bytes(response, MAX_OSV_DOCUMENT_BYTES, "OSV dump document").await?)
+    }
+
+    async fn fetch_archive(&self, url: &str) -> Result<File, OsvError> {
+        let response = self.client.get(url).send().await?.error_for_status()?;
+        Ok(
+            http_body::collect_temp_file(response, MAX_OSV_ARCHIVE_BYTES, "OSV all.zip archive")
+                .await?,
+        )
     }
 }
 
@@ -698,29 +818,157 @@ pub async fn sync_osv(
     config: &LocalOsvConfig,
     client: &dyn OsvDumpClient,
 ) -> Result<OsvSyncReport, OsvError> {
+    sync_osv_ecosystems(config, client, &ALL_OSV_ECOSYSTEMS).await
+}
+
+pub(crate) async fn sync_osv_ecosystems(
+    config: &LocalOsvConfig,
+    client: &dyn OsvDumpClient,
+    requested: &[Ecosystem],
+) -> Result<OsvSyncReport, OsvError> {
+    let _run = SyncRunGuard::acquire(&config.sqlite_path)?;
     SqliteMaliciousChecker::initialize(&config.sqlite_path)?;
     let mut connection = open_read_write_connection(&config.sqlite_path)?;
     let mut ecosystems = Vec::new();
-    for ecosystem in [
-        Ecosystem::Npm,
-        Ecosystem::Pypi,
-        Ecosystem::Go,
-        Ecosystem::CratesIo,
-        Ecosystem::Nuget,
-        Ecosystem::RubyGems,
-        Ecosystem::Maven,
-    ] {
-        ecosystems.push(
-            sync_ecosystem(
-                &mut connection,
-                client,
-                ecosystem,
-                config.retain_raw_advisories,
-            )
-            .await?,
-        );
+    let mut failures = Vec::new();
+    for &ecosystem in requested {
+        match sync_ecosystem(
+            &mut connection,
+            client,
+            ecosystem,
+            config.retain_raw_advisories,
+        )
+        .await
+        {
+            Ok(report) => ecosystems.push(report),
+            Err(error) => failures.push(OsvSyncEcosystemFailure {
+                ecosystem: ecosystem.osv_name().to_string(),
+                error: error.to_string(),
+            }),
+        }
     }
-    Ok(OsvSyncReport { ecosystems })
+    Ok(OsvSyncReport {
+        ecosystems,
+        failures,
+    })
+}
+
+#[derive(Debug)]
+struct SyncRunGuard {
+    path: PathBuf,
+    lock_file: File,
+}
+
+impl SyncRunGuard {
+    fn acquire(path: &Path) -> Result<Self, OsvError> {
+        let path = normalized_sync_path(path);
+        let mut active = ACTIVE_SYNC_PATHS
+            .get_or_init(|| StdMutex::new(BTreeSet::new()))
+            .lock()
+            .map_err(|_| OsvError::Sync("OSV sync-run lock was poisoned".to_string()))?;
+        if !active.insert(path.clone()) {
+            return Err(OsvError::Sync(format!(
+                "OSV sync is already in progress for {}",
+                path.display()
+            )));
+        }
+        drop(active);
+
+        let lock_path = sync_lock_path(&path);
+        let lock_file = match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(error) => {
+                remove_active_sync_path(&path);
+                return Err(OsvError::Sync(format!(
+                    "failed to open OSV sync lock {}: {error}",
+                    lock_path.display()
+                )));
+            }
+        };
+        if let Err(error) = lock_file.try_lock() {
+            remove_active_sync_path(&path);
+            let message = match error {
+                TryLockError::WouldBlock => {
+                    format!("OSV sync is already in progress for {}", path.display())
+                }
+                TryLockError::Error(error) => format!(
+                    "failed to lock OSV sync file {}: {error}",
+                    lock_path.display()
+                ),
+            };
+            return Err(OsvError::Sync(message));
+        }
+        Ok(Self { path, lock_file })
+    }
+}
+
+impl Drop for SyncRunGuard {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+        remove_active_sync_path(&self.path);
+    }
+}
+
+fn remove_active_sync_path(path: &Path) {
+    if let Ok(mut active) = ACTIVE_SYNC_PATHS
+        .get_or_init(|| StdMutex::new(BTreeSet::new()))
+        .lock()
+    {
+        active.remove(path);
+    }
+}
+
+fn sync_lock_path(path: &Path) -> PathBuf {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".sync.lock");
+    PathBuf::from(lock_path)
+}
+
+fn normalized_sync_path(path: &Path) -> PathBuf {
+    let mut candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    for _ in 0..16 {
+        if let Ok(path) = candidate.canonicalize() {
+            return path;
+        }
+        let Ok(metadata) = candidate.symlink_metadata() else {
+            return canonicalize_existing_parent(candidate);
+        };
+        if !metadata.file_type().is_symlink() {
+            return canonicalize_existing_parent(candidate);
+        }
+        let Ok(target) = std::fs::read_link(&candidate) else {
+            return canonicalize_existing_parent(candidate);
+        };
+        candidate = if target.is_absolute() {
+            target
+        } else {
+            candidate
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(target)
+        };
+        candidate = canonicalize_existing_parent(candidate);
+    }
+    canonicalize_existing_parent(candidate)
+}
+
+fn canonicalize_existing_parent(path: PathBuf) -> PathBuf {
+    path.parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+        .unwrap_or(path)
 }
 
 pub type MaliciousSyncReport = OsvSyncReport;
@@ -781,10 +1029,10 @@ async fn sync_bootstrap(
     attempted_at: DateTime<Utc>,
     retain_raw_advisories: bool,
 ) -> Result<MaliciousSyncEcosystemReport, OsvError> {
-    let bytes = client.fetch_bytes(&all_zip_url(ecosystem)).await?;
+    let mut archive = client.fetch_archive(&all_zip_url(ecosystem)).await?;
     let modified_csv = client.fetch_bytes(&modified_id_csv_url(ecosystem)).await?;
     let modified_rows = parse_modified_id_csv(&modified_csv, None)?;
-    let archive_modified = archive_modified_by_id(&bytes)?;
+    let archive_modified = archive_modified_by_id(&mut archive)?;
     let mut catch_up = Vec::new();
     for row in &modified_rows {
         if archive_modified
@@ -805,7 +1053,7 @@ async fn sync_bootstrap(
     let stats = import_zip_bootstrap_and_record_success(
         connection,
         ecosystem,
-        &bytes,
+        &mut archive,
         &catch_up,
         attempted_at,
         high_watermark,
@@ -819,10 +1067,17 @@ async fn sync_bootstrap(
     })
 }
 
-fn archive_modified_by_id(bytes: &[u8]) -> Result<BTreeMap<String, DateTime<Utc>>, OsvError> {
-    let mut archive = ZipArchive::new(Cursor::new(bytes))
+fn archive_modified_by_id<R: Read + Seek>(
+    reader: &mut R,
+) -> Result<BTreeMap<String, DateTime<Utc>>, OsvError> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| OsvError::Sync(format!("failed to rewind OSV all.zip: {error}")))?;
+    let mut archive = ZipArchive::new(reader)
         .map_err(|error| OsvError::Sync(format!("invalid OSV all.zip: {error}")))?;
+    validate_archive_bounds(&archive)?;
     let mut modified = BTreeMap::new();
+    let mut expanded = 0_u64;
     for index in 0..archive.len() {
         let mut file = archive
             .by_index(index)
@@ -830,9 +1085,7 @@ fn archive_modified_by_id(bytes: &[u8]) -> Result<BTreeMap<String, DateTime<Utc>
         if !file.name().ends_with(".json") {
             continue;
         }
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw)
-            .map_err(|error| OsvError::Sync(format!("failed to read OSV zip entry: {error}")))?;
+        let raw = read_archive_entry(&mut file, &mut expanded)?;
         let advisory: OsvDumpAdvisory = serde_json::from_slice(&raw)
             .map_err(|err| OsvError::Sync(format!("invalid OSV advisory JSON: {err}")))?;
         let timestamp = advisory
@@ -846,10 +1099,10 @@ fn archive_modified_by_id(bytes: &[u8]) -> Result<BTreeMap<String, DateTime<Utc>
     Ok(modified)
 }
 
-fn import_zip_bootstrap_and_record_success(
+fn import_zip_bootstrap_and_record_success<R: Read + Seek>(
     connection: &mut Connection,
     ecosystem: Ecosystem,
-    bytes: &[u8],
+    reader: &mut R,
     catch_up: &[OsvDumpAdvisory],
     imported_at: DateTime<Utc>,
     high_watermark: Option<String>,
@@ -869,9 +1122,14 @@ fn import_zip_bootstrap_and_record_success(
         )
         .map_err(sqlite_error)?;
     let generation_id = transaction.last_insert_rowid();
-    let mut archive = ZipArchive::new(Cursor::new(bytes))
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| OsvError::Sync(format!("failed to rewind OSV all.zip: {error}")))?;
+    let mut archive = ZipArchive::new(reader)
         .map_err(|error| OsvError::Sync(format!("invalid OSV all.zip: {error}")))?;
+    validate_archive_bounds(&archive)?;
     let mut totals = ImportStats::default();
+    let mut expanded = 0_u64;
     for index in 0..archive.len() {
         let mut file = archive
             .by_index(index)
@@ -879,9 +1137,7 @@ fn import_zip_bootstrap_and_record_success(
         if !file.name().ends_with(".json") {
             continue;
         }
-        let mut raw = Vec::new();
-        file.read_to_end(&mut raw)
-            .map_err(|error| OsvError::Sync(format!("failed to read OSV zip entry: {error}")))?;
+        let raw = read_archive_entry(&mut file, &mut expanded)?;
         let advisory = parse_osv_advisory_bytes(&raw, retain_raw_advisories)?;
         let stats = import_advisories(
             &transaction,
@@ -925,6 +1181,46 @@ fn import_zip_bootstrap_and_record_success(
     )?;
     transaction.commit().map_err(sqlite_error)?;
     Ok(totals)
+}
+
+fn validate_archive_bounds<R: Read + Seek>(archive: &ZipArchive<R>) -> Result<(), OsvError> {
+    if archive.len() > MAX_OSV_ARCHIVE_ENTRIES {
+        return Err(OsvError::Sync(format!(
+            "OSV archive contains more than {MAX_OSV_ARCHIVE_ENTRIES} entries"
+        )));
+    }
+    Ok(())
+}
+
+fn read_archive_entry<R: Read>(
+    file: &mut zip::read::ZipFile<'_, R>,
+    expanded: &mut u64,
+) -> Result<Vec<u8>, OsvError> {
+    let name = file.name().to_string();
+    if file.size() > MAX_OSV_ARCHIVE_ENTRY_BYTES {
+        return Err(OsvError::Sync(format!(
+            "OSV zip entry {} exceeds the {MAX_OSV_ARCHIVE_ENTRY_BYTES}-byte expanded limit",
+            name
+        )));
+    }
+    let mut raw = Vec::with_capacity(file.size() as usize);
+    file.take(MAX_OSV_ARCHIVE_ENTRY_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|error| OsvError::Sync(format!("failed to read OSV zip entry: {error}")))?;
+    if raw.len() as u64 > MAX_OSV_ARCHIVE_ENTRY_BYTES {
+        return Err(OsvError::Sync(format!(
+            "OSV zip entry {name} exceeds the {MAX_OSV_ARCHIVE_ENTRY_BYTES}-byte expanded limit"
+        )));
+    }
+    *expanded = expanded.checked_add(raw.len() as u64).ok_or_else(|| {
+        OsvError::Sync("OSV archive expanded-size accounting overflowed".to_string())
+    })?;
+    if *expanded > MAX_OSV_ARCHIVE_EXPANDED_BYTES {
+        return Err(OsvError::Sync(format!(
+            "OSV archive exceeds the {MAX_OSV_ARCHIVE_EXPANDED_BYTES}-byte cumulative expanded limit"
+        )));
+    }
+    Ok(raw)
 }
 
 async fn sync_incremental(
@@ -1915,16 +2211,18 @@ fn stored_ranges(
         .prepare(
             r#"
 SELECT ar.id, a.osv_id, a.summary, a.source, a.modified, ar.range_type,
-       ap.severity_type, ap.severity_vector, ap.severity_score, ap.severity_error
+       ap.severity_type, ap.severity_vector, ap.severity_score, ap.severity_error,
+       e.event_type, e.version
 FROM sync_state s
 JOIN osv_affected_packages ap ON ap.generation_id = s.active_generation_id
 JOIN osv_affected_ranges ar ON ar.affected_package_id = ap.id
 JOIN osv_advisories a ON a.generation_id = ap.generation_id AND a.osv_id = ap.osv_id
+LEFT JOIN osv_affected_range_events e ON e.range_id = ar.id
 WHERE s.ecosystem = ?1
   AND ap.ecosystem = ?1
   AND ap.name = ?2
   AND a.withdrawn IS NULL
-ORDER BY a.osv_id, ar.id
+ORDER BY a.osv_id, ar.id, e.event_order
 "#,
         )
         .map_err(sqlite_error)?;
@@ -1961,44 +2259,29 @@ ORDER BY a.osv_id, ar.id
                         evaluation_error: row.get(9)?,
                     },
                     row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             },
         )
         .map_err(sqlite_error)?;
 
-    let mut ranges = Vec::new();
+    let mut ranges = BTreeMap::<i64, StoredRange>::new();
     for row in rows {
-        let (range_id, advisory, range_type) = row.map_err(sqlite_error)?;
-        ranges.push(StoredRange {
+        let (range_id, advisory, range_type, event_type, version) = row.map_err(sqlite_error)?;
+        let range = ranges.entry(range_id).or_insert_with(|| StoredRange {
             advisory,
             range_type,
-            events: range_events(connection, range_id)?,
+            events: Vec::new(),
         });
+        if let (Some(event_type), Some(version)) = (event_type, version) {
+            range.events.push(RangeEvent {
+                event_type,
+                version,
+            });
+        }
     }
-    Ok(ranges)
-}
-
-fn range_events(connection: &Connection, range_id: i64) -> Result<Vec<RangeEvent>, OsvError> {
-    let mut statement = connection
-        .prepare(
-            r#"
-SELECT event_type, version
-FROM osv_affected_range_events
-WHERE range_id = ?1
-ORDER BY event_order
-"#,
-        )
-        .map_err(sqlite_error)?;
-    let rows = statement
-        .query_map([range_id], |row| {
-            Ok(RangeEvent {
-                event_type: row.get(0)?,
-                version: row.get(1)?,
-            })
-        })
-        .map_err(sqlite_error)?;
-
-    rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
+    Ok(ranges.into_values().collect())
 }
 
 fn range_matches_artifact(range: &StoredRange, artifact: &Artifact) -> Result<bool, OsvError> {
@@ -3194,6 +3477,102 @@ mod tests {
         assert_eq!(results[4], results[1]);
     }
 
+    #[test]
+    fn sqlite_batch_loads_ranges_once_per_package() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_range_advisory_with_events(
+            &connection,
+            "GHSA-demo-range",
+            "npm",
+            "demo",
+            "SEMVER",
+            &[("introduced", "1.0.0"), ("fixed", "3.0.0")],
+        );
+        insert_range_advisory_with_events(
+            &connection,
+            "GHSA-other-range",
+            "npm",
+            "other",
+            "SEMVER",
+            &[("introduced", "1.0.0"), ("fixed", "3.0.0")],
+        );
+        let artifacts = vec![
+            Artifact::package(Ecosystem::Npm, "demo", "1.1.0", None),
+            Artifact::package(Ecosystem::Npm, "demo", "1.2.0", None),
+            Artifact::package(Ecosystem::Npm, "demo", "2.0.0", None),
+            Artifact::package(Ecosystem::Npm, "other", "2.0.0", None),
+        ];
+        let checker = checker_for(&db);
+        let mut range_package_loads = 0;
+
+        let results = checker
+            .check_many_with_connection_tracked(&connection, &artifacts, &mut range_package_loads)
+            .unwrap();
+
+        assert_eq!(range_package_loads, 2);
+        assert!(results.iter().all(|hits| hits.len() == 1));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_blocking_work_yields_the_runtime_worker() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let blocked = tokio::spawn(async move {
+            run_sqlite_check(move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .await
+        });
+        started_rx.await.unwrap();
+
+        let heartbeat = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            1_u8
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), heartbeat)
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        release_tx.send(()).unwrap();
+        blocked.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_blocking_work_is_concurrency_bounded() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tasks = (0..SQLITE_CHECK_CONCURRENCY + 4)
+            .map(|_| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                tokio::spawn(async move {
+                    run_sqlite_check(move || {
+                        let current = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(10));
+                        active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) > 1);
+        assert!(peak.load(std::sync::atomic::Ordering::SeqCst) <= SQLITE_CHECK_CONCURRENCY);
+    }
+
     #[tokio::test]
     async fn sqlite_checker_unions_exact_and_range_advisories_with_batch_parity() {
         let dir = tempdir().unwrap();
@@ -3810,12 +4189,13 @@ INSERT INTO advisories (
             ("broken.json", b"{".as_slice()),
         ]);
         let now = Utc::now();
+        let mut malformed = Cursor::new(malformed);
 
         assert!(
             import_zip_bootstrap_and_record_success(
                 &mut connection,
                 Ecosystem::Npm,
-                &malformed,
+                &mut malformed,
                 &[],
                 now,
                 Some("2026-07-02T00:00:00.000000000Z".to_string()),
@@ -3846,10 +4226,12 @@ INSERT INTO advisories (
             r#""ranges":[]"#,
             None,
         );
+        let mut replacement_archive =
+            Cursor::new(zip_bytes([("new.json", replacement.as_slice())]));
         import_zip_bootstrap_and_record_success(
             &mut connection,
             Ecosystem::Npm,
-            &zip_bytes([("new.json", replacement.as_slice())]),
+            &mut replacement_archive,
             &[],
             now,
             Some("2026-07-02T00:00:00.000000000Z".to_string()),
@@ -4086,9 +4468,17 @@ INSERT INTO advisories (
             (modified_id_csv_url(Ecosystem::Pypi), Vec::new()),
             (modified_id_csv_url(Ecosystem::CratesIo), Vec::new()),
         ]);
-        let err = sync_malicious(&config, &client).await.unwrap_err();
+        let report = sync_malicious(&config, &client).await.unwrap();
 
-        assert!(err.to_string().contains("missing fixture response"));
+        assert_eq!(report.attempted(), ALL_OSV_ECOSYSTEMS.len());
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].ecosystem, "npm");
+        assert!(
+            report.failures[0]
+                .error
+                .contains("missing fixture response")
+        );
+        assert_eq!(report.ecosystems.len(), 6);
         let checker = checker_for(&db);
         let hits = checker
             .check(&Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None))
@@ -4107,6 +4497,122 @@ INSERT INTO advisories (
         assert!(error_summary.unwrap().contains("missing fixture response"));
     }
 
+    #[tokio::test]
+    async fn overlapping_sync_for_same_store_is_rejected() {
+        struct BlockingClient {
+            first_archive: AtomicUsize,
+            started: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+
+        #[async_trait]
+        impl OsvDumpClient for BlockingClient {
+            async fn fetch_bytes(&self, _url: &str) -> Result<Vec<u8>, OsvError> {
+                Ok(Vec::new())
+            }
+
+            async fn fetch_archive(&self, _url: &str) -> Result<File, OsvError> {
+                if self.first_archive.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                fixture_archive_file(&zip_bytes([]))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let config = local_config_for(&dir.path().join("malicious.sqlite"));
+        let client = Arc::new(BlockingClient {
+            first_archive: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let running = {
+            let config = config.clone();
+            let client = Arc::clone(&client);
+            tokio::spawn(async move { sync_osv(&config, client.as_ref()).await })
+        };
+        client.started.notified().await;
+
+        let overlap = sync_osv(&config, client.as_ref()).await.unwrap_err();
+
+        assert!(overlap.to_string().contains("already in progress"));
+        client.release.notify_one();
+        assert!(running.await.unwrap().unwrap().is_success());
+    }
+
+    #[test]
+    fn sync_lock_is_cross_process_and_released() {
+        const CHILD_PATH: &str = "OSV_PROXY_SYNC_LOCK_TEST_PATH";
+        const CHILD_EXPECT_BLOCKED: &str = "OSV_PROXY_SYNC_LOCK_EXPECT_BLOCKED";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let result = SyncRunGuard::acquire(Path::new(&path));
+            if std::env::var_os(CHILD_EXPECT_BLOCKED).is_some() {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("already in progress")
+                );
+            } else {
+                drop(result.unwrap());
+            }
+            return;
+        }
+
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("malicious.sqlite");
+        let guard = SyncRunGuard::acquire(&db).unwrap();
+        let run_child = |path: &Path, expect_blocked: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("malicious::tests::sync_lock_is_cross_process_and_released")
+                .arg("--nocapture")
+                .env(CHILD_PATH, path);
+            if expect_blocked {
+                command.env(CHILD_EXPECT_BLOCKED, "1");
+            }
+            command.output().unwrap()
+        };
+
+        let blocked = run_child(&db, true);
+        assert!(
+            blocked.status.success(),
+            "blocked child failed:\n{}\n{}",
+            String::from_utf8_lossy(&blocked.stdout),
+            String::from_utf8_lossy(&blocked.stderr)
+        );
+        drop(guard);
+        let acquired = run_child(&db, false);
+        assert!(
+            acquired.status.success(),
+            "released child failed:\n{}\n{}",
+            String::from_utf8_lossy(&acquired.stdout),
+            String::from_utf8_lossy(&acquired.stderr)
+        );
+
+        let alias = dir.path().join("alias.sqlite");
+        std::os::unix::fs::symlink("malicious.sqlite", &alias).unwrap();
+        assert!(!db.exists());
+        let alias_guard = SyncRunGuard::acquire(&alias).unwrap();
+        let alias_blocked = run_child(&db, true);
+        assert!(
+            alias_blocked.status.success(),
+            "dangling-alias child failed:\n{}\n{}",
+            String::from_utf8_lossy(&alias_blocked.stdout),
+            String::from_utf8_lossy(&alias_blocked.stderr)
+        );
+        drop(alias_guard);
+        let alias_released = run_child(&db, false);
+        assert!(
+            alias_released.status.success(),
+            "released dangling-alias child failed:\n{}\n{}",
+            String::from_utf8_lossy(&alias_released.stdout),
+            String::from_utf8_lossy(&alias_released.stderr)
+        );
+    }
+
     #[test]
     fn modified_id_csv_compares_fractional_timestamps_chronologically() {
         let rows = parse_modified_id_csv(
@@ -4121,6 +4627,14 @@ INSERT INTO advisories (
             serialize_high_watermark(rows[0].modified_at),
             "2026-07-07T17:16:49.100000000Z"
         );
+    }
+
+    #[test]
+    fn archive_rejects_oversized_expanded_entry_before_parsing() {
+        let oversized = vec![b'a'; MAX_OSV_ARCHIVE_ENTRY_BYTES as usize + 1];
+        let mut archive = Cursor::new(zip_bytes([("oversized.json", oversized.as_slice())]));
+        let error = archive_modified_by_id(&mut archive).unwrap_err();
+        assert!(error.to_string().contains("expanded limit"));
     }
 
     struct FixtureDumpClient {
@@ -4174,6 +4688,10 @@ INSERT INTO advisories (
             Err(OsvError::Sync(format!(
                 "missing fixture response for {url}"
             )))
+        }
+
+        async fn fetch_archive(&self, url: &str) -> Result<File, OsvError> {
+            fixture_archive_file(&self.fetch_bytes(url).await?)
         }
     }
 

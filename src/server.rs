@@ -3,7 +3,8 @@ use crate::cargo::{self, CargoRegistryClient};
 use crate::config::{Config, LocalOsvConfig, OsvSource};
 use crate::go::{self, GoProxyClient};
 use crate::malicious::{
-    HttpOsvDumpClient, MaliciousChecker, OsvDumpClient, configured_malicious_checker, sync_osv,
+    ALL_OSV_ECOSYSTEMS, HttpOsvDumpClient, MaliciousChecker, OsvDumpClient,
+    configured_malicious_checker, sync_osv_ecosystems,
 };
 use crate::maven::{self, MavenRepositoryClient, MetadataChecksum};
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
@@ -19,10 +20,21 @@ use axum::http::{HeaderMap, Method, Response, Uri, header};
 use axum::routing::any;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 const REQUEST_BODY_LIMIT_BYTES: usize = 8192;
+const BACKGROUND_RETRY_POLICY: BackgroundRetryPolicy = BackgroundRetryPolicy {
+    initial: Duration::from_secs(5),
+    maximum: Duration::from_secs(5 * 60),
+};
+
+#[derive(Clone, Copy)]
+struct BackgroundRetryPolicy {
+    initial: Duration,
+    maximum: Duration,
+}
 
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.server.bind).await?;
@@ -40,13 +52,53 @@ pub fn router(config: Config) -> Router {
     let checker = configured_malicious_checker(&config);
     Router::new()
         .fallback(any(registry_handler))
-        .with_state(Arc::new(AppState { config, checker }))
+        .with_state(Arc::new(AppState::new(config, checker)))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
 }
 
 struct AppState {
     config: Config,
     checker: Arc<dyn MaliciousChecker>,
+    clients: RegistryClients,
+}
+
+impl AppState {
+    fn new(config: Config, checker: Arc<dyn MaliciousChecker>) -> Self {
+        let clients = RegistryClients::new(&config);
+        Self {
+            config,
+            checker,
+            clients,
+        }
+    }
+}
+
+struct RegistryClients {
+    npm: NpmRegistryClient,
+    pypi: PypiSimpleClient,
+    go: GoProxyClient,
+    cargo: CargoRegistryClient,
+    delivery: ArtifactDeliveryClient,
+    nuget: NugetClient,
+    rubygems: RubyGemsClient,
+    maven: MavenRepositoryClient,
+}
+
+impl RegistryClients {
+    fn new(config: &Config) -> Self {
+        let delivery = ArtifactDeliveryClient::for_config(config);
+        let nuget = NugetClient::with_delivery(config, delivery.clone());
+        Self {
+            npm: NpmRegistryClient::new(&config.upstreams.npm.registry_url),
+            pypi: PypiSimpleClient::new(&config.upstreams.pypi.simple_url),
+            go: GoProxyClient::new(&config.upstreams.go.proxy_url),
+            cargo: CargoRegistryClient::new(config),
+            delivery,
+            nuget,
+            rubygems: RubyGemsClient::new(&config.upstreams.rubygems.registry_url),
+            maven: MavenRepositoryClient::new(&config.upstreams.maven.repository_url),
+        }
+    }
 }
 
 struct BackgroundSyncTask {
@@ -73,19 +125,74 @@ fn spawn_background_osv_sync(
     local_config: LocalOsvConfig,
     client: Arc<dyn OsvDumpClient>,
 ) -> BackgroundSyncTask {
+    spawn_background_osv_sync_with_policy(local_config, client, BACKGROUND_RETRY_POLICY)
+}
+
+fn spawn_background_osv_sync_with_policy(
+    local_config: LocalOsvConfig,
+    client: Arc<dyn OsvDumpClient>,
+    retry_policy: BackgroundRetryPolicy,
+) -> BackgroundSyncTask {
     let handle = tokio::spawn(async move {
+        let mut requested = ALL_OSV_ECOSYSTEMS.to_vec();
+        let mut consecutive_failures = 0_u32;
         loop {
-            match sync_osv(&local_config, client.as_ref()).await {
-                Ok(report) => println!(
-                    "local OSV background sync completed for {} ecosystems",
-                    report.ecosystems.len()
-                ),
-                Err(err) => eprintln!("local OSV background sync failed: {err}"),
-            }
-            tokio::time::sleep(local_config.sync_interval).await;
+            let delay = match sync_osv_ecosystems(&local_config, client.as_ref(), &requested).await
+            {
+                Ok(report) if report.is_success() => {
+                    println!(
+                        "local OSV background sync completed for {} ecosystems",
+                        report.ecosystems.len()
+                    );
+                    requested = ALL_OSV_ECOSYSTEMS.to_vec();
+                    consecutive_failures = 0;
+                    local_config.sync_interval
+                }
+                Ok(report) => {
+                    requested = report.failed_ecosystems();
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    eprintln!(
+                        "local OSV background sync completed with {} failures out of {} attempts",
+                        report.failures.len(),
+                        report.attempted()
+                    );
+                    background_retry_delay(
+                        local_config.sync_interval,
+                        consecutive_failures,
+                        retry_policy,
+                    )
+                }
+                Err(err) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    eprintln!("local OSV background sync failed: {err}");
+                    background_retry_delay(
+                        local_config.sync_interval,
+                        consecutive_failures,
+                        retry_policy,
+                    )
+                }
+            };
+            tokio::time::sleep(delay).await;
         }
     });
     BackgroundSyncTask { handle }
+}
+
+fn background_retry_delay(
+    sync_interval: Duration,
+    consecutive_failures: u32,
+    retry_policy: BackgroundRetryPolicy,
+) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(16);
+    let multiplier = 1_u32 << exponent;
+    let exponential = retry_policy
+        .initial
+        .checked_mul(multiplier)
+        .unwrap_or(retry_policy.maximum);
+    let below_normal_interval = sync_interval / 2;
+    exponential
+        .min(retry_policy.maximum)
+        .min(below_normal_interval.max(Duration::from_millis(1)))
 }
 
 async fn registry_handler(
@@ -105,9 +212,10 @@ async fn registry_handler(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    route_http_request_with_accept_and_headers(
+    route_http_request_with_clients(
         &state.config,
         state.checker.as_ref(),
+        &state.clients,
         &method,
         &path,
         accept.as_deref(),
@@ -150,7 +258,7 @@ pub async fn route_request_with_accept(
             .await
             .unwrap_or_else(|error| rubygems::error_response(&error)),
             RubyGemsRoute::Artifact { filename } => {
-                let delivery = ArtifactDeliveryClient::new();
+                let delivery = ArtifactDeliveryClient::for_config(config);
                 match rubygems::artifact_delivery_response(
                     config,
                     &rubygems_upstream,
@@ -168,7 +276,7 @@ pub async fn route_request_with_accept(
         };
     }
     if let Some((module, route)) = go::parse_route(path) {
-        let delivery = ArtifactDeliveryClient::new();
+        let delivery = ArtifactDeliveryClient::for_config(config);
         return go::route_response(
             config,
             &go_upstream,
@@ -226,7 +334,7 @@ pub async fn route_request_with_upstreams(
     pypi_upstream: &dyn PypiSimpleProvider,
 ) -> RegistryResponse {
     if let Some((module, route)) = go::parse_route(path) {
-        let delivery = ArtifactDeliveryClient::new();
+        let delivery = ArtifactDeliveryClient::for_config(config);
         let go_upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
         return go::route_response(
             config,
@@ -282,7 +390,7 @@ async fn route_request_with_dependencies(
                 .unwrap_or_else(|err| cargo::error_response(&err))
         }
         Some(CargoRoute::Artifact { name, version }) => {
-            let delivery = ArtifactDeliveryClient::new();
+            let delivery = ArtifactDeliveryClient::for_config(config);
             match cargo::artifact_delivery_response(
                 config,
                 &cargo_upstream,
@@ -377,14 +485,31 @@ fn nuget_error_response(error: crate::nuget::NugetError) -> RegistryResponse {
         {
             404
         }
+        crate::nuget::NugetError::Egress(
+            crate::artifacts::ArtifactDeliveryError::UpstreamStatus(404 | 410),
+        ) => 404,
         _ => 502,
     };
     RegistryResponse::json(status, &serde_json::json!({"allowed": false, "reason": "nuget_upstream_error", "message": error.to_string()})).expect("static NuGet error response")
 }
 
+#[cfg(test)]
 async fn route_http_request_with_accept_and_headers(
     config: &Config,
     checker: &dyn MaliciousChecker,
+    method: &str,
+    path: &str,
+    accept: Option<&str>,
+    headers: &HeaderMap,
+) -> Response<Body> {
+    let clients = RegistryClients::new(config);
+    route_http_request_with_clients(config, checker, &clients, method, path, accept, headers).await
+}
+
+async fn route_http_request_with_clients(
+    config: &Config,
+    checker: &dyn MaliciousChecker,
+    clients: &RegistryClients,
     method: &str,
     path: &str,
     accept: Option<&str>,
@@ -399,14 +524,14 @@ async fn route_http_request_with_accept_and_headers(
         return simple_response(405, "method not allowed").into_http_response();
     }
 
-    let npm_upstream = NpmRegistryClient::new(&config.upstreams.npm.registry_url);
-    let pypi_upstream = PypiSimpleClient::new(&config.upstreams.pypi.simple_url);
-    let go_upstream = GoProxyClient::new(&config.upstreams.go.proxy_url);
-    let cargo_upstream = CargoRegistryClient::new(config);
-    let delivery = ArtifactDeliveryClient::new();
-    let nuget_upstream = NugetClient::new(&config.upstreams.nuget.service_index_url);
-    let rubygems_upstream = RubyGemsClient::new(&config.upstreams.rubygems.registry_url);
-    let maven_upstream = MavenRepositoryClient::new(&config.upstreams.maven.repository_url);
+    let npm_upstream = clients.npm.clone();
+    let pypi_upstream = clients.pypi.clone();
+    let go_upstream = clients.go.clone();
+    let cargo_upstream = clients.cargo.clone();
+    let delivery = clients.delivery.clone();
+    let nuget_upstream = clients.nuget.clone();
+    let rubygems_upstream = clients.rubygems.clone();
+    let maven_upstream = clients.maven.clone();
     let now = Utc::now();
 
     if let Some((relative_path, checksum)) = parse_maven_metadata_route(path) {
@@ -543,8 +668,13 @@ async fn route_http_request_with_accept_and_headers(
                     .map(|(base, _)| format!("{base}/{package}.nuspec"))
                     .unwrap_or(upstream);
             }
-            Ok(ArtifactDeliveryClient::new()
-                .deliver(config, upstream, Some(headers))
+            Ok(delivery
+                .deliver(
+                    config,
+                    crate::artifact::Ecosystem::Nuget,
+                    upstream,
+                    Some(headers),
+                )
                 .await
                 .map_err(|err| crate::nuget::NugetError::InvalidMetadata(err.to_string()))?
                 .into_http_response())
@@ -959,7 +1089,8 @@ mod tests {
     use super::*;
     use crate::artifact::{Artifact, Ecosystem};
     use crate::config::{
-        AllowlistEntry, ArtifactBehavior, BlocklistEntry, LocalOsvConfig, OsvSource,
+        AllowlistEntry, ArtifactBehavior, BlocklistEntry, LocalOsvConfig, MissingPublishTime,
+        OsvSource,
     };
     use crate::malicious::{MaliciousError, MaliciousHit, OsvDumpClient, SqliteMaliciousChecker};
     use crate::npm::NpmError;
@@ -972,9 +1103,11 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{Cursor, Write};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::Notify;
     use tower::ServiceExt;
     use zip::{ZipWriter, write::SimpleFileOptions};
 
@@ -1109,6 +1242,10 @@ mod tests {
                 .get(url)
                 .cloned()
                 .ok_or_else(|| MaliciousError::Sync(format!("missing fixture response for {url}")))
+        }
+
+        async fn fetch_archive(&self, url: &str) -> Result<std::fs::File, MaliciousError> {
+            crate::malicious::fixture_archive_file(&self.fetch_bytes(url).await?)
         }
     }
 
@@ -2056,6 +2193,98 @@ mod tests {
         assert!(error_summary.contains("missing fixture response"));
     }
 
+    #[test]
+    fn background_retry_delay_is_bounded_and_below_normal_interval() {
+        let interval = Duration::from_secs(60 * 60);
+        assert_eq!(
+            background_retry_delay(interval, 1, BACKGROUND_RETRY_POLICY),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            background_retry_delay(interval, 2, BACKGROUND_RETRY_POLICY),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            background_retry_delay(interval, 3, BACKGROUND_RETRY_POLICY),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            background_retry_delay(interval, 20, BACKGROUND_RETRY_POLICY),
+            BACKGROUND_RETRY_POLICY.maximum
+        );
+        assert!(background_retry_delay(interval, 20, BACKGROUND_RETRY_POLICY) < interval);
+        assert_eq!(
+            background_retry_delay(Duration::from_secs(8), 20, BACKGROUND_RETRY_POLICY),
+            Duration::from_secs(4)
+        );
+    }
+
+    #[tokio::test]
+    async fn background_retry_targets_only_failed_ecosystems() {
+        struct RetryClient {
+            archives: Mutex<BTreeMap<String, usize>>,
+        }
+
+        #[async_trait]
+        impl OsvDumpClient for RetryClient {
+            async fn fetch_bytes(&self, _url: &str) -> Result<Vec<u8>, MaliciousError> {
+                Ok(Vec::new())
+            }
+
+            async fn fetch_archive(&self, url: &str) -> Result<std::fs::File, MaliciousError> {
+                let attempt = {
+                    let mut archives = self.archives.lock().unwrap();
+                    let attempt = archives.entry(url.to_string()).or_default();
+                    *attempt += 1;
+                    *attempt
+                };
+                if url.ends_with("/npm/all.zip") && attempt == 1 {
+                    return Err(MaliciousError::Sync("transient npm failure".to_string()));
+                }
+                crate::malicious::fixture_archive_file(&zip_bytes([]))
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let local_config = LocalOsvConfig {
+            sqlite_path: dir.path().join("malicious.sqlite"),
+            background_sync: true,
+            sync_interval: Duration::from_secs(1),
+            ..LocalOsvConfig::default()
+        };
+        let client = Arc::new(RetryClient {
+            archives: Mutex::new(BTreeMap::new()),
+        });
+        let task = spawn_background_osv_sync_with_policy(
+            local_config,
+            Arc::clone(&client) as Arc<dyn OsvDumpClient>,
+            BackgroundRetryPolicy {
+                initial: Duration::from_millis(10),
+                maximum: Duration::from_millis(20),
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let attempts = client.archives.lock().unwrap().values().sum::<usize>();
+                if attempts > ALL_OSV_ECOSYSTEMS.len() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let archives = client.archives.lock().unwrap();
+        assert_eq!(archives[&all_zip_url("npm")], 2);
+        for ecosystem in ["PyPI", "Go", "crates.io", "NuGet", "RubyGems", "Maven"] {
+            assert_eq!(archives[&all_zip_url(ecosystem)], 1, "{ecosystem}");
+        }
+        drop(archives);
+        drop(task);
+    }
+
     #[tokio::test]
     async fn local_mode_filters_npm_metadata_and_blocks_artifact_without_osv_http() {
         let dir = tempdir().unwrap();
@@ -2278,6 +2507,189 @@ INSERT INTO advisories (
     }
 
     #[tokio::test]
+    async fn app_state_reuses_upstream_connection_across_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(Notify::new());
+        let body = json!({"name":"demo","versions":{},"dist-tags":{},"time":{}}).to_string();
+        let server = {
+            let accepted = Arc::clone(&accepted);
+            let requests = Arc::clone(&requests);
+            let completed = Arc::clone(&completed);
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    accepted.fetch_add(1, AtomicOrdering::SeqCst);
+                    let body = body.clone();
+                    let requests = Arc::clone(&requests);
+                    let completed = Arc::clone(&completed);
+                    tokio::spawn(async move {
+                        loop {
+                            let mut buffer = [0_u8; 4096];
+                            let Ok(bytes) = stream.read(&mut buffer).await else {
+                                return;
+                            };
+                            if bytes == 0 {
+                                return;
+                            }
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            if stream.write_all(response.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            if requests.fetch_add(1, AtomicOrdering::SeqCst) + 1 == 2 {
+                                completed.notify_one();
+                            }
+                        }
+                    });
+                }
+            })
+        };
+        let mut config = Config::default();
+        config.upstreams.npm.registry_url = format!("http://{address}");
+        let app = router(config);
+
+        for _ in 0..2 {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("GET")
+                        .uri("/npm/demo")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), completed.notified())
+            .await
+            .unwrap();
+
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nuget_metadata_and_artifact_share_the_state_client_pool() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(Notify::new());
+        let server = {
+            let accepted = Arc::clone(&accepted);
+            let requests = Arc::clone(&requests);
+            let completed = Arc::clone(&completed);
+            let origin = origin.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    accepted.fetch_add(1, AtomicOrdering::SeqCst);
+                    let origin = origin.clone();
+                    let requests = Arc::clone(&requests);
+                    let completed = Arc::clone(&completed);
+                    tokio::spawn(async move {
+                        loop {
+                            let mut buffer = [0_u8; 4096];
+                            let Ok(bytes) = stream.read(&mut buffer).await else {
+                                return;
+                            };
+                            if bytes == 0 {
+                                return;
+                            }
+                            let request = String::from_utf8_lossy(&buffer[..bytes]);
+                            let path = request
+                                .lines()
+                                .next()
+                                .and_then(|line| line.split_whitespace().nth(1))
+                                .unwrap_or_default();
+                            let (content_type, body) = match path {
+                                "/v3/index.json" => (
+                                    "application/json",
+                                    json!({"resources":[{
+                                        "@type":"RegistrationsBaseUrl/3.6.0",
+                                        "@id":format!("{origin}/registration")
+                                    }]})
+                                    .to_string(),
+                                ),
+                                "/registration/demo/index.json" => (
+                                    "application/json",
+                                    json!({"items":[{"items":[{
+                                        "catalogEntry":{
+                                            "version":"1.0.0",
+                                            "published":"2020-01-01T00:00:00Z"
+                                        },
+                                        "packageContent":format!("{origin}/packages/demo.1.0.0.nupkg")
+                                    }]}]})
+                                    .to_string(),
+                                ),
+                                "/packages/demo.1.0.0.nupkg" => {
+                                    ("application/octet-stream", "nupkg".to_string())
+                                }
+                                _ => return,
+                            };
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: keep-alive\r\n\r\n{body}",
+                                body.len()
+                            );
+                            if stream.write_all(response.as_bytes()).await.is_err() {
+                                return;
+                            }
+                            if requests.fetch_add(1, AtomicOrdering::SeqCst) + 1 == 3 {
+                                completed.notify_one();
+                            }
+                        }
+                    });
+                }
+            })
+        };
+        let mut config = Config::default();
+        config.upstreams.nuget.service_index_url = format!("{origin}/v3/index.json");
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.policy.minimum_age = Duration::ZERO;
+        config.policy.missing_publish_time = MissingPublishTime::Allow;
+        config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
+
+        let response = router(config)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/nuget/v3/flatcontainer/demo/1.0.0/demo.1.0.0.nupkg")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "nupkg"
+        );
+        tokio::time::timeout(Duration::from_secs(1), completed.notified())
+            .await
+            .unwrap();
+
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(accepted.load(AtomicOrdering::SeqCst), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn method_mismatch_returns_405() {
         let response = route_request_with_upstream(
             &Config::default(),
@@ -2351,6 +2763,12 @@ INSERT INTO advisories (
         let mut config = Config::default();
         config.artifacts.behavior = ArtifactBehavior::Proxy;
         config.upstreams.npm.registry_url = registry_url;
+        config.artifacts.trusted_origins.push(
+            reqwest::Url::parse(&artifact_base_url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        );
 
         let response = router(config)
             .oneshot(

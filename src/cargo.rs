@@ -1,6 +1,7 @@
 use crate::artifact::{Artifact, ArtifactHashes, Ecosystem, normalize_cargo_name};
 use crate::artifacts::{ArtifactDeliveryError, ArtifactDeliveryOptions, ArtifactDeliveryResponse};
 use crate::config::Config;
+use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::{Decision, PolicyEngine};
 use crate::response::RegistryResponse;
@@ -13,6 +14,7 @@ use thiserror::Error;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CARGO_INDEX_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CargoRegistryClient {
@@ -47,14 +49,11 @@ pub trait CargoIndexProvider: Send + Sync {
 impl CargoIndexProvider for CargoRegistryClient {
     async fn fetch_index(&self, path: &str) -> Result<String, CargoError> {
         let url = format!("{}/{}", self.sparse_index_url, path);
-        Ok(self
-            .client
-            .get(url)
-            .send()
-            .await?
-            .error_for_status()?
-            .text()
-            .await?)
+        let response = self.client.get(url).send().await?.error_for_status()?;
+        Ok(
+            http_body::collect_text(response, MAX_CARGO_INDEX_BYTES, "Cargo sparse index entry")
+                .await?,
+        )
     }
 }
 
@@ -206,6 +205,7 @@ pub async fn artifact_delivery_response(
         .client
         .deliver(
             config,
+            artifact.ecosystem,
             artifact
                 .upstream_url
                 .clone()
@@ -224,7 +224,7 @@ pub async fn artifact_response(
     version: &str,
     now: DateTime<Utc>,
 ) -> RegistryResponse {
-    let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+    let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(config);
     match artifact_delivery_response(
         config,
         provider,
@@ -367,6 +367,8 @@ pub fn error_response(error: &CargoError) -> RegistryResponse {
 pub enum CargoError {
     #[error("Cargo sparse-index request failed: {0}")]
     Request(#[from] reqwest::Error),
+    #[error("Cargo upstream body failed validation: {0}")]
+    Body(#[from] HttpBodyError),
     #[error("invalid Cargo crate name: {0}")]
     InvalidCrateName(String),
     #[error("invalid Cargo sparse-index record: {0}")]

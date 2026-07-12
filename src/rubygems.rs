@@ -8,6 +8,7 @@ use crate::artifacts::{
     self, ArtifactDeliveryError, ArtifactDeliveryOptions, ArtifactDeliveryResponse,
 };
 use crate::config::Config;
+use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::{Decision, PolicyEngine};
 use crate::response::RegistryResponse;
@@ -27,6 +28,8 @@ use thiserror::Error;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_GEM_VARIANTS: usize = 10_000;
+const MAX_GEM_METADATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_VERSIONS_INDEX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_COMPACT_INFO_BYTES: usize = 16 * 1024 * 1024;
 const MAX_COMPACT_INFO_LINES: usize = 100_000;
 const MAX_ARTIFACT_FILENAME_BYTES: usize = 512;
@@ -73,14 +76,18 @@ pub trait RubyGemsProvider: Send + Sync {
 #[async_trait]
 impl RubyGemsProvider for RubyGemsClient {
     async fn fetch_versions(&self, name: &str) -> Result<Vec<GemVersion>, RubyGemsError> {
-        let mut versions: Vec<GemVersion> = self
+        let response = self
             .client
             .get(self.versions_url(name)?)
             .send()
             .await?
-            .error_for_status()?
-            .json()
-            .await?;
+            .error_for_status()?;
+        let mut versions: Vec<GemVersion> = http_body::collect_json(
+            response,
+            MAX_GEM_METADATA_BYTES,
+            "RubyGems version metadata",
+        )
+        .await?;
         if versions.len() > MAX_GEM_VARIANTS {
             return Err(RubyGemsError::TooManyVariants(versions.len()));
         }
@@ -148,10 +155,16 @@ impl CompactIndexProvider for RubyGemsClient {
                     .map(|value| (name.as_str().to_string(), value.to_string()))
             })
             .collect();
+        let body = http_body::collect_bytes(
+            response,
+            MAX_VERSIONS_INDEX_BYTES,
+            "RubyGems versions index",
+        )
+        .await?;
         Ok(RegistryResponse {
             status,
             headers,
-            body: response.bytes().await?.to_vec(),
+            body,
         })
     }
 
@@ -166,17 +179,9 @@ impl CompactIndexProvider for RubyGemsClient {
         if status >= 400 {
             return Err(RubyGemsError::UpstreamStatus(status));
         }
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_COMPACT_INFO_BYTES as u64)
-        {
-            return Err(RubyGemsError::CompactInfoTooLarge);
-        }
-        let bytes = response.bytes().await?.to_vec();
-        if bytes.len() > MAX_COMPACT_INFO_BYTES {
-            return Err(RubyGemsError::CompactInfoTooLarge);
-        }
-        Ok(bytes)
+        http_body::collect_bytes(response, MAX_COMPACT_INFO_BYTES, "RubyGems compact info")
+            .await
+            .map_err(RubyGemsError::from)
     }
 }
 
@@ -624,7 +629,12 @@ pub async fn artifact_delivery_response(
         .ok_or_else(|| RubyGemsError::InvalidMetadata("resolved gem has no upstream URL".into()))?;
     delivery
         .client
-        .deliver(config, upstream, delivery.request_headers)
+        .deliver(
+            config,
+            Ecosystem::RubyGems,
+            upstream,
+            delivery.request_headers,
+        )
         .await
         .map_err(RubyGemsError::ArtifactDelivery)
 }
@@ -834,6 +844,8 @@ pub fn compare_versions(left: &str, right: &str) -> Result<Ordering, RubyGemsErr
 pub enum RubyGemsError {
     #[error("RubyGems upstream request failed: {0}")]
     Upstream(#[from] reqwest::Error),
+    #[error("RubyGems upstream body failed validation: {0}")]
+    Body(#[from] HttpBodyError),
     #[error("invalid RubyGems name: {0}")]
     InvalidName(String),
     #[error("invalid RubyGems version: {0}")]
@@ -1121,7 +1133,7 @@ mod tests {
         config.policy.minimum_age = Duration::ZERO;
         config.policy.osv.block_malicious = false;
         config.policy.osv.block_vulnerabilities = false;
-        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(&config);
         let allowed = artifact_delivery_response(
             &config,
             &provider,
@@ -1192,14 +1204,20 @@ mod tests {
                 .unwrap();
         });
         let mut metadata = gem("1.0.0", "ruby", false);
-        metadata.gem_uri = url;
+        metadata.gem_uri = url.clone();
         let provider = StaticProvider(HashMap::from([("demo".into(), vec![metadata])]));
         let mut config = Config::default();
         config.artifacts.behavior = crate::config::ArtifactBehavior::Proxy;
+        config.artifacts.trusted_origins.push(
+            reqwest::Url::parse(&url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        );
         config.policy.minimum_age = Duration::ZERO;
         config.policy.osv.block_malicious = false;
         config.policy.osv.block_vulnerabilities = false;
-        let delivery = crate::artifacts::ArtifactDeliveryClient::new();
+        let delivery = crate::artifacts::ArtifactDeliveryClient::for_config(&config);
         let response = artifact_delivery_response(
             &config,
             &provider,

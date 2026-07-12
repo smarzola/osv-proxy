@@ -158,6 +158,9 @@ pub async fn execute(cli: Cli) -> anyhow::Result<()> {
             let client = HttpOsvDumpClient::new();
             let report = sync_malicious(&config.policy.osv.local, &client).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.is_success() {
+                anyhow::bail!("local malicious sync failed for one or more ecosystems");
+            }
             Ok(())
         }
         Command::Osv {
@@ -168,6 +171,9 @@ pub async fn execute(cli: Cli) -> anyhow::Result<()> {
             let client = HttpOsvDumpClient::new();
             let report = sync_osv(&config.policy.osv.local, &client).await?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.is_success() {
+                anyhow::bail!("local OSV sync failed for one or more ecosystems");
+            }
             Ok(())
         }
     }
@@ -247,7 +253,7 @@ async fn registry_check_with_upstreams(
         ],
         Ecosystem::Nuget => vec![
             crate::nuget::lookup_artifact(
-                &NugetClient::new(&config.upstreams.nuget.service_index_url),
+                &NugetClient::for_config(config),
                 &identity.name,
                 &identity.version,
             )

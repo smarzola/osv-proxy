@@ -4,6 +4,7 @@ use crate::artifacts::{
     ArtifactDeliveryResponse,
 };
 use crate::config::Config;
+use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
@@ -21,6 +22,8 @@ const SIMPLE_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 const SIMPLE_HTML_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+html";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_PYPI_ROOT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_PYPI_PROJECT_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct PypiSimpleClient {
@@ -50,19 +53,18 @@ pub trait PypiSimpleProvider: Send + Sync {
 #[async_trait]
 impl PypiSimpleProvider for PypiSimpleClient {
     async fn fetch_simple_root(&self) -> Result<String, PypiError> {
-        Ok(self
+        let response = self
             .client
             .get(&self.simple_url)
             .send()
             .await?
-            .error_for_status()?
-            .text()
-            .await?)
+            .error_for_status()?;
+        Ok(http_body::collect_text(response, MAX_PYPI_ROOT_BYTES, "PyPI Simple root").await?)
     }
 
     async fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, PypiError> {
         let project = normalize_pypi_name(project);
-        Ok(self
+        let response = self
             .client
             .get(format!("{}/{}/", self.simple_url, project))
             .header(
@@ -71,9 +73,13 @@ impl PypiSimpleProvider for PypiSimpleClient {
             )
             .send()
             .await?
-            .error_for_status()?
-            .json::<SimpleProject>()
-            .await?)
+            .error_for_status()?;
+        Ok(http_body::collect_json(
+            response,
+            MAX_PYPI_PROJECT_BYTES,
+            "PyPI Simple project metadata",
+        )
+        .await?)
     }
 }
 
@@ -148,7 +154,7 @@ pub async fn artifact_response(
     filename: &str,
     now: DateTime<Utc>,
 ) -> Result<RegistryResponse, PypiError> {
-    let delivery = ArtifactDeliveryClient::new();
+    let delivery = ArtifactDeliveryClient::for_config(config);
     let response = artifact_delivery_response(
         config,
         upstream,
@@ -211,7 +217,7 @@ pub async fn artifact_delivery_response(
             .ok_or_else(|| PypiError::MissingFileUrl(route.filename.to_string()))?;
         Ok(delivery
             .client
-            .deliver(config, location, delivery.request_headers)
+            .deliver(config, Ecosystem::Pypi, location, delivery.request_headers)
             .await?)
     } else {
         let body = serde_json::to_value(decision)?;
@@ -229,7 +235,7 @@ pub fn error_response(error: &PypiError) -> RegistryResponse {
         PypiError::FileNotFound(_, _, _)
         | PypiError::VersionNotFound(_, _)
         | PypiError::InvalidFilename(_) => 404,
-        PypiError::Upstream(_) | PypiError::ArtifactDelivery(_) => 502,
+        PypiError::Upstream(_) | PypiError::Body(_) | PypiError::ArtifactDelivery(_) => 502,
         PypiError::Json(_) | PypiError::InvalidSimpleJson(_) | PypiError::MissingFileUrl(_) => 500,
     };
     let body = json!({
@@ -653,6 +659,8 @@ pub struct SimpleFile {
 pub enum PypiError {
     #[error("PyPI upstream request failed: {0}")]
     Upstream(#[from] reqwest::Error),
+    #[error("PyPI upstream body failed validation: {0}")]
+    Body(#[from] HttpBodyError),
     #[error("PyPI JSON handling failed: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid PyPI Simple JSON: {0}")]
@@ -1154,12 +1162,18 @@ mod tests {
              pypi-file",
         )
         .await;
+        config.artifacts.trusted_origins.push(
+            reqwest::Url::parse(&file_url)
+                .unwrap()
+                .origin()
+                .ascii_serialization(),
+        );
         let mut simple = simple_fixture();
         simple.files = vec![file("demo-1.0.0.tar.gz", &file_url, Some(old_time()))];
         simple.versions = vec!["1.0.0".to_string()];
         let upstream = StaticSimple::new("demo", simple);
         let checker = CleanChecker::new();
-        let delivery = ArtifactDeliveryClient::new();
+        let delivery = ArtifactDeliveryClient::for_config(&config);
         let mut headers = HeaderMap::new();
         headers.insert(header::RANGE, "bytes=0-8".parse().unwrap());
 

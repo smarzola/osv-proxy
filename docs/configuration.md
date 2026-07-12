@@ -25,6 +25,7 @@ policy:
     on_error: "block"
 artifacts:
   behavior: redirect
+  trusted_origins: []
 ```
 
 Validate it with:
@@ -87,14 +88,28 @@ local configs can omit this section.
 ```yaml
 artifacts:
   behavior: redirect
+  trusted_origins:
+    - "http://packages.internal.example:8081"
 ```
 
 - `behavior`: `redirect` or `proxy`. Defaults to `redirect`.
+- `trusted_origins`: exact HTTP or HTTPS origins that artifact delivery may
+  contact in addition to the configured ecosystem upstreams. Entries must not
+  contain credentials, paths, queries, or fragments. Keep this list minimal;
+  it is shared by all ecosystems and may explicitly permit private addresses.
 - `redirect`: after the second policy check, allowed artifact requests return
   `302 Location` to the upstream tarball or file URL.
 - `proxy`: after the second policy check, allowed artifact requests fetch the
   verified upstream artifact URL and stream the upstream response through
   `osv-proxy`.
+
+Artifact destinations are restricted before any proxy connection. Public HTTPS
+origins are allowed so registries can use their public CDNs. Plain HTTP and
+private, loopback, link-local, or otherwise non-public addresses require an
+exact origin configured for that ecosystem under `upstreams` or listed in
+`trusted_origins`. Artifact requests do not use system HTTP proxies, and
+upstream redirects are rejected instead of followed. NuGet registration URLs
+discovered through service-index and page metadata use the same boundary.
 
 `proxy_cache_s3` is reserved for future S3-compatible artifact caching and is
 rejected as unsupported.
@@ -177,8 +192,9 @@ policy:
   advisory JSON in SQLite. Defaults to false so the local DB keeps only compact
   normalized lookup data plus advisory metadata needed for policy decisions.
 - `local.background_sync`: when true, `serve` starts a background sync task.
-  The first sync runs immediately on startup, then repeats after
-  `sync_interval`.
+  The first full sync runs immediately on startup. Successful cycles repeat
+  after `sync_interval`; failed ecosystems retry independently with exponential
+  backoff starting at 5 seconds and capped at 5 minutes.
 - `local.sync_interval`: background sync interval. It must be between `60s` and
   `7d`; defaults to `6h`.
 
@@ -189,7 +205,10 @@ osv-proxy osv sync --config /path/to/osv-proxy.yaml
 ```
 
 The sync command downloads npm, PyPI, Go, crates.io, NuGet, RubyGems, and Maven OSV GCS dumps,
-stores all advisories locally, and updates generation-scoped health state.
+attempts each ecosystem independently, stores successful advisory generations,
+and reports per-ecosystem successes and failures. Concurrent sync commands for
+the same SQLite store are rejected across processes through an advisory lock on
+the adjacent `<sqlite_path>.sync.lock` file.
 `malicious sync` is a compatibility alias. Full advisory storage is materially
 larger than the former malicious-only database. Missing, corrupt,
 unhealthy, or stale local data fails closed by default through `on_error:
