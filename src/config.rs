@@ -2,6 +2,7 @@ use crate::artifact::Ecosystem;
 use chrono::Duration as ChronoDuration;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -13,6 +14,7 @@ const LOCAL_OSV_SYNC_INTERVAL_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
+    pub limits: LimitsConfig,
     pub upstreams: UpstreamsConfig,
     pub policy: PolicyConfig,
     pub artifacts: ArtifactsConfig,
@@ -29,6 +31,35 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        validate_bind(&self.server.bind)?;
+        validate_http_url("server.public_base_url", &self.server.public_base_url)?;
+        self.limits.validate()?;
+        validate_http_url(
+            "upstreams.npm.registry_url",
+            &self.upstreams.npm.registry_url,
+        )?;
+        validate_http_url("upstreams.pypi.simple_url", &self.upstreams.pypi.simple_url)?;
+        validate_http_url("upstreams.go.proxy_url", &self.upstreams.go.proxy_url)?;
+        validate_http_url(
+            "upstreams.cargo.sparse_index_url",
+            &self.upstreams.cargo.sparse_index_url,
+        )?;
+        validate_http_url(
+            "upstreams.cargo.download_url",
+            &self.upstreams.cargo.download_url,
+        )?;
+        validate_http_url(
+            "upstreams.nuget.service_index_url",
+            &self.upstreams.nuget.service_index_url,
+        )?;
+        validate_http_url(
+            "upstreams.rubygems.registry_url",
+            &self.upstreams.rubygems.registry_url,
+        )?;
+        validate_http_url(
+            "upstreams.maven.repository_url",
+            &self.upstreams.maven.repository_url,
+        )?;
         ChronoDuration::from_std(self.policy.minimum_age).map_err(|_| {
             ConfigError::Invalid(
                 "policy.minimum_age is too large for policy evaluation".to_string(),
@@ -78,6 +109,52 @@ impl Config {
 pub struct ServerConfig {
     pub bind: String,
     pub public_base_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    pub ingress_requests: usize,
+    pub egress_requests: usize,
+    pub background_sync_requests: usize,
+    #[serde(with = "duration_format")]
+    pub queue_timeout: Duration,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            ingress_requests: 128,
+            egress_requests: 32,
+            background_sync_requests: 4,
+            queue_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+impl LimitsConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (field, value) in [
+            ("limits.ingress_requests", self.ingress_requests),
+            ("limits.egress_requests", self.egress_requests),
+            (
+                "limits.background_sync_requests",
+                self.background_sync_requests,
+            ),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "{field} must be greater than zero"
+                )));
+            }
+        }
+        if self.queue_timeout.is_zero() {
+            return Err(ConfigError::Invalid(
+                "limits.queue_timeout must be greater than zero".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Default for ServerConfig {
@@ -254,6 +331,7 @@ impl Default for OsvConfig {
 
 impl OsvConfig {
     fn validate(&self) -> Result<(), ConfigError> {
+        validate_http_url("policy.osv.api_url", &self.api_url)?;
         if !self.minimum_cvss_score.is_finite() || !(0.0..=10.0).contains(&self.minimum_cvss_score)
         {
             return Err(ConfigError::Invalid(
@@ -444,6 +522,69 @@ fn validate_trusted_origin(value: &str) -> Result<(), ConfigError> {
     {
         return Err(ConfigError::Invalid(format!(
             "artifacts.trusted_origins entry {value:?} must be an http(s) origin without credentials, path, query, or fragment"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_bind(value: &str) -> Result<(), ConfigError> {
+    if value.parse::<SocketAddr>().is_ok() {
+        return Ok(());
+    }
+    let (host, port) = value.rsplit_once(':').ok_or_else(|| {
+        ConfigError::Invalid(format!(
+            "server.bind {value:?} must contain a host and port"
+        ))
+    })?;
+    if !is_valid_dns_hostname(host) || port.parse::<u16>().is_err() {
+        return Err(ConfigError::Invalid(format!(
+            "server.bind {value:?} is not a valid host and port"
+        )));
+    }
+    Ok(())
+}
+
+fn is_valid_dns_hostname(host: &str) -> bool {
+    if host.is_empty()
+        || host.len() > 253
+        || host.contains([':', '/', '[', ']'])
+        || !host.is_ascii()
+    {
+        return false;
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+fn validate_http_url(field: &str, value: &str) -> Result<(), ConfigError> {
+    let url = reqwest::Url::parse(value).map_err(|error| {
+        ConfigError::Invalid(format!("{field} {value:?} is not a valid URL: {error}"))
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must use http or https"
+        )));
+    }
+    if url.host_str().is_none() {
+        return Err(ConfigError::Invalid(format!("{field} must include a host")));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not include credentials"
+        )));
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not include a query or fragment"
         )));
     }
     Ok(())
@@ -1027,5 +1168,139 @@ policy:
         )
         .unwrap_err();
         assert!(err.to_string().contains("policy.minimum_age is too large"));
+    }
+
+    #[test]
+    fn validates_network_endpoints_before_runtime() {
+        for (raw, field) in [
+            ("server:\n  bind: missing-port\n", "server.bind"),
+            (
+                "server:\n  public_base_url: ftp://proxy.example\n",
+                "server.public_base_url",
+            ),
+            (
+                "upstreams:\n  npm:\n    registry_url: https://user:secret@registry.example\n",
+                "upstreams.npm.registry_url",
+            ),
+            (
+                "upstreams:\n  pypi:\n    simple_url: https://pypi.example/simple?format=json\n",
+                "upstreams.pypi.simple_url",
+            ),
+            (
+                "policy:\n  osv:\n    api_url: https://api.example/#fragment\n",
+                "policy.osv.api_url",
+            ),
+        ] {
+            let error = load(raw).unwrap_err();
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn every_configured_http_endpoint_rejects_unsafe_url_components() {
+        type Endpoint = (&'static str, fn(&mut Config) -> &mut String);
+        let endpoints: [Endpoint; 10] = [
+            ("server.public_base_url", |c| &mut c.server.public_base_url),
+            ("upstreams.npm.registry_url", |c| {
+                &mut c.upstreams.npm.registry_url
+            }),
+            ("upstreams.pypi.simple_url", |c| {
+                &mut c.upstreams.pypi.simple_url
+            }),
+            ("upstreams.go.proxy_url", |c| &mut c.upstreams.go.proxy_url),
+            ("upstreams.cargo.sparse_index_url", |c| {
+                &mut c.upstreams.cargo.sparse_index_url
+            }),
+            ("upstreams.cargo.download_url", |c| {
+                &mut c.upstreams.cargo.download_url
+            }),
+            ("upstreams.nuget.service_index_url", |c| {
+                &mut c.upstreams.nuget.service_index_url
+            }),
+            ("upstreams.rubygems.registry_url", |c| {
+                &mut c.upstreams.rubygems.registry_url
+            }),
+            ("upstreams.maven.repository_url", |c| {
+                &mut c.upstreams.maven.repository_url
+            }),
+            ("policy.osv.api_url", |c| &mut c.policy.osv.api_url),
+        ];
+        for (field, endpoint) in endpoints {
+            for invalid in [
+                "ftp://packages.example",
+                "https://",
+                "https://user:secret@packages.example",
+                "https://packages.example/path?token=secret",
+                "https://packages.example/path#fragment",
+            ] {
+                let mut config = Config::default();
+                *endpoint(&mut config) = invalid.to_string();
+                let error = config
+                    .validate()
+                    .expect_err(&format!("{field} accepted {invalid}"));
+                assert!(error.to_string().contains(field), "{field}: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn accepts_private_http_mirrors_and_base_paths() {
+        let config = load(
+            r#"
+server:
+  bind: "0.0.0.0:8080"
+  public_base_url: "http://proxy.internal/tools/osv"
+upstreams:
+  npm:
+    registry_url: "http://127.0.0.1:4873/npm"
+  pypi:
+    simple_url: "http://packages.internal/pypi/simple"
+policy:
+  osv:
+    api_url: "http://osv.internal/api"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.server.bind, "0.0.0.0:8080");
+
+        for bind in ["localhost:8080", "[::1]:8080", "proxy.internal:443"] {
+            let config = load(&format!("server:\n  bind: {bind:?}\n")).unwrap();
+            assert_eq!(config.server.bind, bind);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_hostname_bind_forms() {
+        for bind in [
+            "http://localhost:8080",
+            "localhost::8080",
+            "[::1:8080",
+            "bad/host:8080",
+            "-bad.example:8080",
+            "bad-.example:8080",
+            "bad..example:8080",
+            "bad_host.example:8080",
+            "example:70000",
+        ] {
+            let error = load(&format!("server:\n  bind: {bind:?}\n")).unwrap_err();
+            assert!(error.to_string().contains("server.bind"), "{bind}: {error}");
+        }
+    }
+
+    #[test]
+    fn limits_are_nonzero_and_strict() {
+        for field in [
+            "ingress_requests",
+            "egress_requests",
+            "background_sync_requests",
+        ] {
+            let error = load(&format!("limits:\n  {field}: 0\n")).unwrap_err();
+            assert!(error.to_string().contains(&format!("limits.{field}")));
+        }
+        let error = load("limits:\n  queue_timeout: 0s\n").unwrap_err();
+        assert!(error.to_string().contains("limits.queue_timeout"));
+
+        let error = load("limits:\n  typo: 1\n").unwrap_err();
+        assert!(error.to_string().contains("unknown field `typo`"));
     }
 }

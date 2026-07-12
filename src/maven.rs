@@ -7,6 +7,7 @@ use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::{Decision, PolicyEngine};
 use crate::response::RegistryResponse;
+use crate::runtime::{BudgetError, RuntimeBudgets};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::{Stream, StreamExt};
@@ -62,10 +63,18 @@ where
 pub struct MavenRepositoryClient {
     repository_url: String,
     client: Client,
+    budgets: Arc<RuntimeBudgets>,
 }
 
 impl MavenRepositoryClient {
     pub fn new(repository_url: &str) -> Self {
+        Self::with_budgets(
+            repository_url,
+            Arc::new(RuntimeBudgets::new(&Config::default().limits)),
+        )
+    }
+
+    pub fn with_budgets(repository_url: &str, budgets: Arc<RuntimeBudgets>) -> Self {
         Self {
             repository_url: repository_url.trim_end_matches('/').to_string(),
             client: Client::builder()
@@ -73,6 +82,7 @@ impl MavenRepositoryClient {
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("Maven HTTP client should build with static timeout configuration"),
+            budgets,
         }
     }
 }
@@ -132,6 +142,7 @@ impl MavenMetadataProvider for MavenRepositoryClient {
         artifact_id: &str,
         version: &str,
     ) -> Result<MavenPomMetadata, MavenError> {
+        let _permit = self.budgets.install_egress().await?;
         validate_coordinate(group_id, artifact_id, version)?;
         let url = pom_url(&self.repository_url, group_id, artifact_id, version);
         let response = self.client.get(&url).send().await?;
@@ -164,6 +175,7 @@ impl MavenMetadataProvider for MavenRepositoryClient {
     }
 
     async fn fetch_metadata(&self, relative_path: &str) -> Result<MavenRawMetadata, MavenError> {
+        let _permit = self.budgets.install_egress().await?;
         if relative_path.is_empty()
             || relative_path.starts_with('/')
             || relative_path
@@ -196,6 +208,7 @@ impl MavenMetadataProvider for MavenRepositoryClient {
         artifact_id: &str,
         version: &str,
     ) -> Result<MavenPomHead, MavenError> {
+        let _permit = self.budgets.install_egress().await?;
         validate_coordinate(group_id, artifact_id, version)?;
         let url = pom_url(&self.repository_url, group_id, artifact_id, version);
         let response = self.client.head(&url).send().await?;
@@ -221,6 +234,7 @@ impl MavenMetadataProvider for MavenRepositoryClient {
     }
 
     async fn validate_artifact(&self, relative_path: &str) -> Result<(), MavenError> {
+        let _permit = self.budgets.install_egress().await?;
         validate_relative_path(relative_path)?;
         let response = self
             .client
@@ -1186,6 +1200,8 @@ fn qualifier_cmp(left: &str, right: &str) -> Ordering {
 
 #[derive(Debug, Error)]
 pub enum MavenError {
+    #[error("Maven upstream concurrency limit failed: {0}")]
+    Budget(#[from] BudgetError),
     #[error("invalid Maven package name: {0}")]
     InvalidPackageName(String),
     #[error("invalid Maven coordinate: {0}")]

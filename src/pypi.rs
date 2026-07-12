@@ -8,6 +8,7 @@ use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::PolicyEngine;
 use crate::response::RegistryResponse;
+use crate::runtime::{BudgetError, RuntimeBudgets};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
@@ -15,6 +16,7 @@ use reqwest::header::ACCEPT;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -29,10 +31,18 @@ const MAX_PYPI_PROJECT_BYTES: usize = 32 * 1024 * 1024;
 pub struct PypiSimpleClient {
     simple_url: String,
     client: Client,
+    budgets: Arc<RuntimeBudgets>,
 }
 
 impl PypiSimpleClient {
     pub fn new(simple_url: impl Into<String>) -> Self {
+        Self::with_budgets(
+            simple_url,
+            Arc::new(RuntimeBudgets::new(&Config::default().limits)),
+        )
+    }
+
+    pub fn with_budgets(simple_url: impl Into<String>, budgets: Arc<RuntimeBudgets>) -> Self {
         Self {
             simple_url: simple_url.into().trim_end_matches('/').to_string(),
             client: Client::builder()
@@ -40,6 +50,7 @@ impl PypiSimpleClient {
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("PyPI HTTP client should build with static timeout configuration"),
+            budgets,
         }
     }
 }
@@ -53,6 +64,7 @@ pub trait PypiSimpleProvider: Send + Sync {
 #[async_trait]
 impl PypiSimpleProvider for PypiSimpleClient {
     async fn fetch_simple_root(&self) -> Result<String, PypiError> {
+        let _permit = self.budgets.install_egress().await?;
         let response = self
             .client
             .get(&self.simple_url)
@@ -63,6 +75,7 @@ impl PypiSimpleProvider for PypiSimpleClient {
     }
 
     async fn fetch_project_json(&self, project: &str) -> Result<SimpleProject, PypiError> {
+        let _permit = self.budgets.install_egress().await?;
         let project = normalize_pypi_name(project);
         let response = self
             .client
@@ -232,6 +245,7 @@ pub fn error_response(error: &PypiError) -> RegistryResponse {
         return artifacts::gateway_error_response(error);
     }
     let status = match error {
+        PypiError::Budget(_) => 503,
         PypiError::FileNotFound(_, _, _)
         | PypiError::VersionNotFound(_, _)
         | PypiError::InvalidFilename(_) => 404,
@@ -657,6 +671,8 @@ pub struct SimpleFile {
 
 #[derive(Debug, Error)]
 pub enum PypiError {
+    #[error("PyPI upstream concurrency limit failed: {0}")]
+    Budget(#[from] BudgetError),
     #[error("PyPI upstream request failed: {0}")]
     Upstream(#[from] reqwest::Error),
     #[error("PyPI upstream body failed validation: {0}")]

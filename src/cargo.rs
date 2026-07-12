@@ -5,10 +5,12 @@ use crate::http_body::{self, HttpBodyError};
 use crate::malicious::MaliciousChecker;
 use crate::policy::{Decision, PolicyEngine};
 use crate::response::RegistryResponse;
+use crate::runtime::{BudgetError, RuntimeBudgets};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -20,10 +22,15 @@ const MAX_CARGO_INDEX_BYTES: usize = 16 * 1024 * 1024;
 pub struct CargoRegistryClient {
     sparse_index_url: String,
     client: Client,
+    budgets: Arc<RuntimeBudgets>,
 }
 
 impl CargoRegistryClient {
     pub fn new(config: &Config) -> Self {
+        Self::with_budgets(config, Arc::new(RuntimeBudgets::new(&config.limits)))
+    }
+
+    pub fn with_budgets(config: &Config, budgets: Arc<RuntimeBudgets>) -> Self {
         Self {
             sparse_index_url: config
                 .upstreams
@@ -36,6 +43,7 @@ impl CargoRegistryClient {
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("Cargo HTTP client should build with static timeout configuration"),
+            budgets,
         }
     }
 }
@@ -48,6 +56,7 @@ pub trait CargoIndexProvider: Send + Sync {
 #[async_trait]
 impl CargoIndexProvider for CargoRegistryClient {
     async fn fetch_index(&self, path: &str) -> Result<String, CargoError> {
+        let _permit = self.budgets.install_egress().await?;
         let url = format!("{}/{}", self.sparse_index_url, path);
         let response = self.client.get(url).send().await?.error_for_status()?;
         Ok(
@@ -365,6 +374,8 @@ pub fn error_response(error: &CargoError) -> RegistryResponse {
 
 #[derive(Debug, Error)]
 pub enum CargoError {
+    #[error("Cargo upstream concurrency limit failed: {0}")]
+    Budget(#[from] BudgetError),
     #[error("Cargo sparse-index request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("Cargo upstream body failed validation: {0}")]

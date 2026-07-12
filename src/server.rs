@@ -4,7 +4,7 @@ use crate::config::{Config, LocalOsvConfig, OsvSource};
 use crate::go::{self, GoProxyClient};
 use crate::malicious::{
     ALL_OSV_ECOSYSTEMS, HttpOsvDumpClient, MaliciousChecker, OsvDumpClient,
-    configured_malicious_checker, sync_osv_ecosystems,
+    configured_malicious_checker, configured_malicious_checker_with_budgets, sync_osv_ecosystems,
 };
 use crate::maven::{self, MavenRepositoryClient, MetadataChecksum};
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
@@ -12,6 +12,7 @@ use crate::nuget::{self, NugetClient};
 use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
 use crate::response::RegistryResponse;
 use crate::rubygems::{self, CompactIndexProvider, RubyGemsClient};
+use crate::runtime::{BudgetError, RuntimeBudgets, hold_permits, track_request_overload};
 use async_trait::async_trait;
 use axum::Router;
 use axum::body::Body;
@@ -43,16 +44,22 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 }
 
 pub async fn serve_listener(listener: TcpListener, config: Config) -> anyhow::Result<()> {
-    let _background_sync = start_background_osv_sync_if_enabled(&config);
-    axum::serve(listener, router(config)).await?;
+    let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
+    let _background_sync = start_background_osv_sync_if_enabled(&config, Arc::clone(&budgets));
+    axum::serve(listener, router_with_budgets(config, budgets)).await?;
     Ok(())
 }
 
 pub fn router(config: Config) -> Router {
-    let checker = configured_malicious_checker(&config);
+    let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
+    router_with_budgets(config, budgets)
+}
+
+fn router_with_budgets(config: Config, budgets: Arc<RuntimeBudgets>) -> Router {
+    let checker = configured_malicious_checker_with_budgets(&config, Arc::clone(&budgets));
     Router::new()
         .fallback(any(registry_handler))
-        .with_state(Arc::new(AppState::new(config, checker)))
+        .with_state(Arc::new(AppState::new(config, checker, budgets)))
         .layer(DefaultBodyLimit::max(REQUEST_BODY_LIMIT_BYTES))
 }
 
@@ -60,15 +67,21 @@ struct AppState {
     config: Config,
     checker: Arc<dyn MaliciousChecker>,
     clients: RegistryClients,
+    budgets: Arc<RuntimeBudgets>,
 }
 
 impl AppState {
-    fn new(config: Config, checker: Arc<dyn MaliciousChecker>) -> Self {
-        let clients = RegistryClients::new(&config);
+    fn new(
+        config: Config,
+        checker: Arc<dyn MaliciousChecker>,
+        budgets: Arc<RuntimeBudgets>,
+    ) -> Self {
+        let clients = RegistryClients::new(&config, Arc::clone(&budgets));
         Self {
             config,
             checker,
             clients,
+            budgets,
         }
     }
 }
@@ -85,18 +98,30 @@ struct RegistryClients {
 }
 
 impl RegistryClients {
-    fn new(config: &Config) -> Self {
-        let delivery = ArtifactDeliveryClient::for_config(config);
+    fn new(config: &Config, budgets: Arc<RuntimeBudgets>) -> Self {
+        let delivery = ArtifactDeliveryClient::with_budgets(config, Arc::clone(&budgets));
         let nuget = NugetClient::with_delivery(config, delivery.clone());
         Self {
-            npm: NpmRegistryClient::new(&config.upstreams.npm.registry_url),
-            pypi: PypiSimpleClient::new(&config.upstreams.pypi.simple_url),
-            go: GoProxyClient::new(&config.upstreams.go.proxy_url),
-            cargo: CargoRegistryClient::new(config),
+            npm: NpmRegistryClient::with_budgets(
+                &config.upstreams.npm.registry_url,
+                Arc::clone(&budgets),
+            ),
+            pypi: PypiSimpleClient::with_budgets(
+                &config.upstreams.pypi.simple_url,
+                Arc::clone(&budgets),
+            ),
+            go: GoProxyClient::with_budgets(&config.upstreams.go.proxy_url, Arc::clone(&budgets)),
+            cargo: CargoRegistryClient::with_budgets(config, Arc::clone(&budgets)),
             delivery,
             nuget,
-            rubygems: RubyGemsClient::new(&config.upstreams.rubygems.registry_url),
-            maven: MavenRepositoryClient::new(&config.upstreams.maven.repository_url),
+            rubygems: RubyGemsClient::with_budgets(
+                &config.upstreams.rubygems.registry_url,
+                Arc::clone(&budgets),
+            ),
+            maven: MavenRepositoryClient::with_budgets(
+                &config.upstreams.maven.repository_url,
+                budgets,
+            ),
         }
     }
 }
@@ -111,13 +136,16 @@ impl Drop for BackgroundSyncTask {
     }
 }
 
-fn start_background_osv_sync_if_enabled(config: &Config) -> Option<BackgroundSyncTask> {
+fn start_background_osv_sync_if_enabled(
+    config: &Config,
+    budgets: Arc<RuntimeBudgets>,
+) -> Option<BackgroundSyncTask> {
     if config.policy.osv.source != OsvSource::Local || !config.policy.osv.local.background_sync {
         return None;
     }
     Some(spawn_background_osv_sync(
         config.policy.osv.local.clone(),
-        Arc::new(HttpOsvDumpClient::new()),
+        Arc::new(HttpOsvDumpClient::with_budgets(budgets)),
     ))
 }
 
@@ -137,8 +165,8 @@ fn spawn_background_osv_sync_with_policy(
         let mut requested = ALL_OSV_ECOSYSTEMS.to_vec();
         let mut consecutive_failures = 0_u32;
         loop {
-            let delay = match sync_osv_ecosystems(&local_config, client.as_ref(), &requested).await
-            {
+            let sync_result = sync_osv_ecosystems(&local_config, client.as_ref(), &requested).await;
+            let delay = match sync_result {
                 Ok(report) if report.is_success() => {
                     println!(
                         "local OSV background sync completed for {} ecosystems",
@@ -201,6 +229,10 @@ async fn registry_handler(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response<Body> {
+    let ingress = match state.budgets.try_ingress() {
+        Ok(permit) => permit,
+        Err(error) => return error.response(),
+    };
     let method = method.as_str().to_string();
     let path = uri
         .path_and_query()
@@ -212,7 +244,7 @@ async fn registry_handler(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    route_http_request_with_clients(
+    let (response, overloaded) = track_request_overload(route_http_request_with_clients(
         &state.config,
         state.checker.as_ref(),
         &state.clients,
@@ -220,8 +252,12 @@ async fn registry_handler(
         &path,
         accept.as_deref(),
         &headers,
-    )
-    .await
+    ))
+    .await;
+    if overloaded {
+        return BudgetError::EgressSaturated.response();
+    }
+    hold_permits(response, vec![ingress])
 }
 
 pub async fn route_request(config: &Config, method: &str, path: &str) -> RegistryResponse {
@@ -502,7 +538,7 @@ async fn route_http_request_with_accept_and_headers(
     accept: Option<&str>,
     headers: &HeaderMap,
 ) -> Response<Body> {
-    let clients = RegistryClients::new(config);
+    let clients = RegistryClients::new(config, Arc::new(RuntimeBudgets::new(&config.limits)));
     route_http_request_with_clients(config, checker, &clients, method, path, accept, headers).await
 }
 
@@ -1090,10 +1126,13 @@ mod tests {
     use crate::artifact::{Artifact, Ecosystem};
     use crate::config::{
         AllowlistEntry, ArtifactBehavior, BlocklistEntry, LocalOsvConfig, MissingPublishTime,
-        OsvSource,
+        OsvErrorBehavior, OsvSource,
     };
-    use crate::malicious::{MaliciousError, MaliciousHit, OsvDumpClient, SqliteMaliciousChecker};
+    use crate::malicious::{
+        MaliciousError, MaliciousHit, OsvDumpClient, OsvHttpClient, SqliteMaliciousChecker,
+    };
     use crate::npm::NpmError;
+    use crate::policy::PolicyEngine;
     use crate::pypi::{SimpleFile, SimpleProject};
     use axum::http::StatusCode;
     use chrono::Duration as ChronoDuration;
@@ -2504,6 +2543,129 @@ INSERT INTO advisories (
                 .unwrap()
                 .contains_key("1.0.1")
         );
+    }
+
+    #[tokio::test]
+    async fn router_rejects_saturated_ingress_without_contacting_upstream() {
+        let (registry_url, accepted, release) = blocking_npm_upstream().await;
+        let mut config = Config::default();
+        config.upstreams.npm.registry_url = registry_url;
+        config.limits.ingress_requests = 1;
+        config.limits.egress_requests = 2;
+        let app = router(config);
+
+        let active = tokio::spawn(app.clone().oneshot(registry_request()));
+        tokio::time::timeout(Duration::from_secs(1), accepted.notified())
+            .await
+            .unwrap();
+        let overloaded = app.clone().oneshot(registry_request()).await.unwrap();
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()["retry-after"], "1");
+
+        release.notify_one();
+        assert_eq!(active.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn router_times_out_saturated_egress_independently_of_ingress() {
+        let (registry_url, accepted, release) = blocking_npm_upstream().await;
+        let mut config = Config::default();
+        config.upstreams.npm.registry_url = registry_url;
+        config.limits.ingress_requests = 2;
+        config.limits.egress_requests = 1;
+        config.limits.queue_timeout = Duration::from_millis(20);
+        let app = router(config);
+
+        let active = tokio::spawn(app.clone().oneshot(registry_request()));
+        tokio::time::timeout(Duration::from_secs(1), accepted.notified())
+            .await
+            .unwrap();
+        let overloaded = app.clone().oneshot(registry_request()).await.unwrap();
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()["retry-after"], "1");
+        let body = axum::body::to_bytes(overloaded.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("upstream concurrency"));
+
+        let artifact_overload = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/npm/demo/-/demo-1.0.0.tgz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(artifact_overload.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(artifact_overload.headers()["retry-after"], "1");
+
+        release.notify_one();
+        assert_eq!(active.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn live_osv_overload_is_tracked_even_when_policy_is_fail_open() {
+        let mut config = Config::default();
+        config.policy.osv.on_error = OsvErrorBehavior::Allow;
+        config.limits.egress_requests = 1;
+        config.limits.queue_timeout = Duration::from_millis(10);
+        let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
+        let _held = budgets.install_egress().await.unwrap();
+        let checker = OsvHttpClient::with_vulnerability_policy_and_budgets(
+            "http://127.0.0.1:9",
+            true,
+            Arc::clone(&budgets),
+        );
+        let artifact = Artifact::package(
+            Ecosystem::Npm,
+            "demo",
+            "1.0.0",
+            Some(Utc::now() - ChronoDuration::days(10)),
+        );
+
+        let (decision, overloaded) = track_request_overload(PolicyEngine::new(&config).evaluate(
+            &artifact,
+            Utc::now(),
+            &checker,
+        ))
+        .await;
+
+        assert!(decision.allowed, "fixture must exercise fail-open handling");
+        assert!(overloaded, "HTTP boundary must override fail-open overload");
+    }
+
+    fn registry_request() -> axum::http::Request<Body> {
+        axum::http::Request::builder()
+            .method("GET")
+            .uri("/npm/demo")
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn blocking_npm_upstream() -> (String, Arc<Notify>, Arc<Notify>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let task_accepted = Arc::clone(&accepted);
+        let task_release = Arc::clone(&release);
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            stream.read(&mut request).await.unwrap();
+            task_accepted.notify_one();
+            task_release.notified().await;
+            let body = json!({"name":"demo","versions":{},"dist-tags":{},"time":{}}).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), accepted, release)
     }
 
     #[tokio::test]

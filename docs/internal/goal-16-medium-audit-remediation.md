@@ -149,7 +149,7 @@ The goal is complete only when:
 
 ## Milestones
 
-- [ ] Milestone 1: Validated endpoint configuration and process-wide budgets
+- [x] Milestone 1: Validated endpoint configuration and process-wide budgets
 - [ ] Milestone 2: Truthful health/readiness, gateway warning, and graceful drain
 - [ ] Milestone 3: Immutable CI/release inputs and toolchain provenance
 - [ ] Milestone 4: Operational boundaries, documentation, and audit closure
@@ -212,7 +212,37 @@ cargo test --locked artifacts
 cargo run --locked -- config validate --config examples/basic/osv-proxy.yaml
 ```
 
-Status: Not started.
+Status: Completed 2026-07-12. Network endpoint validation now covers every
+configured HTTP field plus compatible numeric/hostname bind syntax. Runtime
+budgets enforce immediate ingress admission, actual-operation install egress,
+and independent background egress; streamed bodies retain permits and all HTTP
+overload paths return `503` with `Retry-After`.
+
+Verification:
+
+- `cargo test --locked config`: 45 passed, 0 failed.
+- `cargo test --locked server`: 40 passed, 0 failed.
+- `cargo test --locked artifacts`: 19 passed, 0 failed.
+- `cargo run --locked -- config validate --config examples/basic/osv-proxy.yaml`:
+  configuration is valid.
+- `git diff --check`: passed.
+- Retained adversarial review: three rounds; no blocking findings remain.
+
+Decision (2026-07-12): use one aggregate install-path egress budget shared by
+all registry, artifact, and live OSV clients, plus a separate background-sync
+egress budget. Existing adapter-local fan-out caps remain the per-upstream
+ceilings. Do not add independently configurable per-upstream quotas without
+workload evidence because fixed partitions can strand capacity; residual
+cross-ecosystem starvation risk remains documented for future measurement.
+
+Review notes (2026-07-12): the first review rejected request-level egress
+admission because it did not bound actual fan-out and found numeric-only bind
+validation incompatible. The repair moved permits to every outbound operation,
+retained artifact permits through stream lifetime, separated background dump
+requests, and restored hostname binds. The second review required strict DNS
+hostname syntax and one overload contract across adapter and live-policy error
+mapping; the repair added central request-task overload tracking and stable
+`503` plus `Retry-After` behavior.
 
 ## Milestone 2: Truthful Health, Readiness, Gateway Warning, And Graceful Drain
 

@@ -1,8 +1,10 @@
 use crate::artifact::Ecosystem;
 use crate::config::{ArtifactBehavior, Config};
 use crate::response::RegistryResponse;
+use crate::runtime::{BudgetError, RuntimeBudgets};
 use axum::body::Body;
 use axum::http::{HeaderMap, Response, StatusCode};
+use futures_util::{StreamExt, stream};
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::{Client, Url, redirect};
 use serde_json::json;
@@ -39,6 +41,7 @@ const FORWARDED_RESPONSE_HEADERS: &[&str] = &[
 pub struct ArtifactDeliveryClient {
     client: Client,
     egress: Arc<ArtifactEgressPolicy>,
+    budgets: Arc<RuntimeBudgets>,
 }
 
 impl ArtifactDeliveryClient {
@@ -47,10 +50,18 @@ impl ArtifactDeliveryClient {
     }
 
     pub fn for_config(config: &Config) -> Self {
-        Self::build(config, HashMap::new())
+        Self::with_budgets(config, Arc::new(RuntimeBudgets::new(&config.limits)))
     }
 
-    fn build(config: &Config, dns_overrides: HashMap<String, Vec<SocketAddr>>) -> Self {
+    pub fn with_budgets(config: &Config, budgets: Arc<RuntimeBudgets>) -> Self {
+        Self::build(config, HashMap::new(), budgets)
+    }
+
+    fn build(
+        config: &Config,
+        dns_overrides: HashMap<String, Vec<SocketAddr>>,
+        budgets: Arc<RuntimeBudgets>,
+    ) -> Self {
         let egress = Arc::new(ArtifactEgressPolicy::from_config(config));
         let resolver = Arc::new(SafeResolver {
             egress: Arc::clone(&egress),
@@ -66,6 +77,7 @@ impl ArtifactDeliveryClient {
                 .build()
                 .expect("artifact HTTP client should build with static timeout configuration"),
             egress,
+            budgets,
         }
     }
 
@@ -74,7 +86,11 @@ impl ArtifactDeliveryClient {
         config: &Config,
         dns_overrides: HashMap<String, Vec<SocketAddr>>,
     ) -> Self {
-        Self::build(config, dns_overrides)
+        Self::build(
+            config,
+            dns_overrides,
+            Arc::new(RuntimeBudgets::new(&config.limits)),
+        )
     }
 
     fn validated_url(
@@ -104,6 +120,7 @@ impl ArtifactDeliveryClient {
                 RegistryResponse::redirect(upstream_url.to_string()),
             )),
             ArtifactBehavior::Proxy => {
+                let permit = self.budgets.install_egress().await?;
                 let mut request = self.client.get(upstream_url);
                 if let Some(headers) = request_headers {
                     for name in FORWARDED_REQUEST_HEADERS {
@@ -123,7 +140,7 @@ impl ArtifactDeliveryClient {
                         response.status().as_u16(),
                     ));
                 }
-                Ok(ArtifactDeliveryResponse::Streaming(response))
+                Ok(ArtifactDeliveryResponse::Streaming(response, permit))
             }
             ArtifactBehavior::ProxyCacheS3 => Err(ArtifactDeliveryError::Unsupported(
                 "artifacts.behavior=proxy_cache_s3 is not supported yet".to_string(),
@@ -144,6 +161,7 @@ impl ArtifactDeliveryClient {
                 RegistryResponse::redirect(upstream_url.to_string()),
             )),
             ArtifactBehavior::Proxy => {
+                let permit = self.budgets.install_egress().await?;
                 let mut request = self.client.head(upstream_url);
                 if let Some(headers) = request_headers {
                     for name in FORWARDED_REQUEST_HEADERS {
@@ -163,7 +181,7 @@ impl ArtifactDeliveryClient {
                         response.status().as_u16(),
                     ));
                 }
-                Ok(ArtifactDeliveryResponse::Streaming(response))
+                Ok(ArtifactDeliveryResponse::Streaming(response, permit))
             }
             ArtifactBehavior::ProxyCacheS3 => Err(ArtifactDeliveryError::Unsupported(
                 "artifacts.behavior=proxy_cache_s3 is not supported yet".to_string(),
@@ -192,7 +210,8 @@ impl ArtifactDeliveryClient {
         ecosystem: Ecosystem,
         upstream_url: &str,
         total_timeout: Duration,
-    ) -> Result<reqwest::Response, ArtifactDeliveryError> {
+    ) -> Result<(reqwest::Response, tokio::sync::OwnedSemaphorePermit), ArtifactDeliveryError> {
+        let permit = self.budgets.install_egress().await?;
         let upstream_url = self.validated_url(ecosystem, upstream_url)?;
         let response = self
             .client
@@ -210,7 +229,7 @@ impl ArtifactDeliveryClient {
                 response.status().as_u16(),
             ));
         }
-        Ok(response)
+        Ok((response, permit))
     }
 }
 
@@ -261,14 +280,14 @@ impl<'a> ArtifactDeliveryOptions<'a> {
 
 pub enum ArtifactDeliveryResponse {
     Buffered(RegistryResponse),
-    Streaming(reqwest::Response),
+    Streaming(reqwest::Response, tokio::sync::OwnedSemaphorePermit),
 }
 
 impl ArtifactDeliveryResponse {
     pub async fn into_registry_response(self) -> RegistryResponse {
         match self {
             Self::Buffered(response) => response,
-            Self::Streaming(response) => match buffered_proxy_response(response).await {
+            Self::Streaming(response, _permit) => match buffered_proxy_response(response).await {
                 Ok(response) => response,
                 Err(error) => gateway_error_response(&error),
             },
@@ -278,13 +297,15 @@ impl ArtifactDeliveryResponse {
     pub fn into_http_response(self) -> Response<Body> {
         match self {
             Self::Buffered(response) => response.into_http_response(),
-            Self::Streaming(response) => streaming_proxy_response(response),
+            Self::Streaming(response, permit) => streaming_proxy_response(response, permit),
         }
     }
 }
 
 #[derive(Debug, Error)]
 pub enum ArtifactDeliveryError {
+    #[error("upstream artifact concurrency limit failed: {0}")]
+    Budget(#[from] BudgetError),
     #[error("unsupported artifact delivery behavior: {0}")]
     Unsupported(String),
     #[error("invalid upstream artifact URL: {0}")]
@@ -533,7 +554,10 @@ async fn buffered_proxy_response(
     })
 }
 
-fn streaming_proxy_response(response: reqwest::Response) -> Response<Body> {
+fn streaming_proxy_response(
+    response: reqwest::Response,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response<Body> {
     let status = StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::OK);
     let mut builder = Response::builder().status(status);
     let headers = builder
@@ -544,8 +568,12 @@ fn streaming_proxy_response(response: reqwest::Response) -> Response<Body> {
             headers.insert(name, value.clone());
         }
     }
+    let stream = stream::unfold(
+        (response.bytes_stream(), permit),
+        |(mut body, permit)| async move { body.next().await.map(|result| (result, (body, permit))) },
+    );
     builder
-        .body(Body::from_stream(response.bytes_stream()))
+        .body(Body::from_stream(stream))
         .expect("artifact response should convert to HTTP response")
 }
 
@@ -647,6 +675,34 @@ mod tests {
         assert!(upstream_request.contains("range: bytes=0-7"));
         assert!(upstream_request.contains("if-none-match: \"old\""));
         assert!(!upstream_request.contains("connection: keep-alive"));
+    }
+
+    #[tokio::test]
+    async fn streaming_response_holds_egress_permit_until_body_is_dropped() {
+        let mut config = Config::default();
+        config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.limits.egress_requests = 1;
+        config.limits.queue_timeout = TokioDuration::from_millis(10);
+        let (url, request) =
+            serve_once("HTTP/1.1 200 OK\r\ncontent-length: 8\r\nconnection: close\r\n\r\nartifact")
+                .await;
+        trust_url(&mut config, &url);
+        let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
+        let client = ArtifactDeliveryClient::with_budgets(&config, Arc::clone(&budgets));
+
+        let response = client
+            .deliver(&config, Ecosystem::Npm, url, None)
+            .await
+            .unwrap()
+            .into_http_response();
+        request.await.unwrap();
+        assert_eq!(
+            budgets.install_egress().await.unwrap_err(),
+            BudgetError::EgressSaturated
+        );
+
+        drop(response);
+        assert!(budgets.install_egress().await.is_ok());
     }
 
     #[tokio::test]

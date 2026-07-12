@@ -2,6 +2,7 @@ use crate::artifact::{Artifact, Ecosystem};
 use crate::config::{Config, LocalOsvConfig, LocalOsvStaleBehavior, OsvSource};
 use crate::go;
 use crate::http_body::{self, HttpBodyError};
+use crate::runtime::{BudgetError, RuntimeBudgets};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -68,10 +69,18 @@ pub trait OsvChecker: Send + Sync {
 pub use OsvChecker as MaliciousChecker;
 
 pub fn configured_osv_checker(config: &Config) -> Arc<dyn OsvChecker> {
+    configured_osv_checker_with_budgets(config, Arc::new(RuntimeBudgets::new(&config.limits)))
+}
+
+pub fn configured_osv_checker_with_budgets(
+    config: &Config,
+    budgets: Arc<RuntimeBudgets>,
+) -> Arc<dyn OsvChecker> {
     match config.policy.osv.source {
-        OsvSource::Live => Arc::new(OsvHttpClient::with_vulnerability_policy(
+        OsvSource::Live => Arc::new(OsvHttpClient::with_vulnerability_policy_and_budgets(
             &config.policy.osv.api_url,
             config.policy.osv.block_vulnerabilities,
+            budgets,
         )),
         OsvSource::Local => Arc::new(SqliteMaliciousChecker::with_vulnerability_policy(
             &config.policy.osv.local,
@@ -82,6 +91,13 @@ pub fn configured_osv_checker(config: &Config) -> Arc<dyn OsvChecker> {
 
 pub fn configured_malicious_checker(config: &Config) -> Arc<dyn MaliciousChecker> {
     configured_osv_checker(config)
+}
+
+pub fn configured_malicious_checker_with_budgets(
+    config: &Config,
+    budgets: Arc<RuntimeBudgets>,
+) -> Arc<dyn MaliciousChecker> {
+    configured_osv_checker_with_budgets(config, budgets)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -176,6 +192,8 @@ pub fn effective_osv_severity(
 
 #[derive(Debug, Error)]
 pub enum OsvError {
+    #[error("OSV concurrency limit failed: {0}")]
+    Budget(#[from] BudgetError),
     #[error("OSV request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("OSV upstream body failed validation: {0}")]
@@ -203,6 +221,7 @@ pub struct OsvHttpClient {
     api_url: String,
     client: Client,
     block_vulnerabilities: bool,
+    budgets: Arc<RuntimeBudgets>,
 }
 
 impl OsvHttpClient {
@@ -214,6 +233,18 @@ impl OsvHttpClient {
         api_url: impl Into<String>,
         block_vulnerabilities: bool,
     ) -> Self {
+        Self::with_vulnerability_policy_and_budgets(
+            api_url,
+            block_vulnerabilities,
+            Arc::new(RuntimeBudgets::new(&Config::default().limits)),
+        )
+    }
+
+    pub fn with_vulnerability_policy_and_budgets(
+        api_url: impl Into<String>,
+        block_vulnerabilities: bool,
+        budgets: Arc<RuntimeBudgets>,
+    ) -> Self {
         Self {
             api_url: api_url.into().trim_end_matches('/').to_string(),
             client: Client::builder()
@@ -222,10 +253,12 @@ impl OsvHttpClient {
                 .build()
                 .expect("OSV HTTP client should build with static timeout configuration"),
             block_vulnerabilities,
+            budgets,
         }
     }
 
     async fn post_query(&self, request: &OsvQueryRequest) -> Result<OsvQueryResponse, OsvError> {
+        let _permit = self.budgets.install_egress().await?;
         let response = self
             .client
             .post(format!("{}/v1/query", self.api_url))
@@ -240,6 +273,7 @@ impl OsvHttpClient {
         &self,
         queries: Vec<OsvQueryRequest>,
     ) -> Result<OsvBatchQueryResponse, OsvError> {
+        let _permit = self.budgets.install_egress().await?;
         let response = self
             .client
             .post(format!("{}/v1/querybatch", self.api_url))
@@ -262,8 +296,13 @@ impl OsvHttpClient {
                 let Some(id) = pending.next() else { break };
                 let client = self.client.clone();
                 let base = self.api_url.clone();
+                let budgets = Arc::clone(&self.budgets);
                 in_flight.push(async move {
                     let result = async {
+                        let _permit = budgets
+                            .install_egress()
+                            .await
+                            .map_err(|error| error.to_string())?;
                         let mut url =
                             reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
                         url.path_segments_mut()
@@ -778,16 +817,22 @@ pub(crate) fn fixture_archive_file(bytes: &[u8]) -> Result<File, OsvError> {
 #[derive(Debug, Clone)]
 pub struct HttpOsvDumpClient {
     client: Client,
+    budgets: Arc<RuntimeBudgets>,
 }
 
 impl HttpOsvDumpClient {
     pub fn new() -> Self {
+        Self::with_budgets(Arc::new(RuntimeBudgets::new(&Config::default().limits)))
+    }
+
+    pub fn with_budgets(budgets: Arc<RuntimeBudgets>) -> Self {
         Self {
             client: Client::builder()
                 .connect_timeout(CONNECT_TIMEOUT)
                 .timeout(REQUEST_TIMEOUT)
                 .build()
                 .expect("OSV dump HTTP client should build with static timeout configuration"),
+            budgets,
         }
     }
 }
@@ -801,11 +846,13 @@ impl Default for HttpOsvDumpClient {
 #[async_trait]
 impl OsvDumpClient for HttpOsvDumpClient {
     async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>, OsvError> {
+        let _permit = self.budgets.background_egress().await?;
         let response = self.client.get(url).send().await?.error_for_status()?;
         Ok(http_body::collect_bytes(response, MAX_OSV_DOCUMENT_BYTES, "OSV dump document").await?)
     }
 
     async fn fetch_archive(&self, url: &str) -> Result<File, OsvError> {
+        let _permit = self.budgets.background_egress().await?;
         let response = self.client.get(url).send().await?.error_for_status()?;
         Ok(
             http_body::collect_temp_file(response, MAX_OSV_ARCHIVE_BYTES, "OSV all.zip archive")
@@ -2797,6 +2844,28 @@ mod tests {
         assert_eq!(state.batch_calls.load(AtomicOrdering::SeqCst), 2);
         assert!(state.peak_details.load(AtomicOrdering::SeqCst) > 1);
         assert!(state.peak_details.load(AtomicOrdering::SeqCst) <= OSV_DETAIL_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn global_egress_budget_bounds_osv_detail_fanout() {
+        let (url, state) = live_mock().await;
+        let mut config = Config::default();
+        config.limits.egress_requests = 1;
+        config.limits.queue_timeout = Duration::from_secs(1);
+        let client = OsvHttpClient::with_vulnerability_policy_and_budgets(
+            url,
+            true,
+            Arc::new(RuntimeBudgets::new(&config.limits)),
+        );
+        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None);
+
+        client
+            .check_many(&[artifact.clone(), artifact])
+            .await
+            .unwrap();
+
+        assert_eq!(state.peak_details.load(AtomicOrdering::SeqCst), 1);
+        assert!(state.detail_counts.lock().unwrap().len() > 1);
     }
 
     #[tokio::test]
