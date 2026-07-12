@@ -277,8 +277,8 @@ proxy:
 
 ```sh
 mkdir -p /var/lib/osv-proxy
-osv-proxy osv sync --config /etc/osv-proxy/osv-proxy.yaml
 osv-proxy config validate --config /etc/osv-proxy/osv-proxy.yaml
+osv-proxy osv sync --config /etc/osv-proxy/osv-proxy.yaml
 osv-proxy serve --config /etc/osv-proxy/osv-proxy.yaml
 ```
 

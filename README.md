@@ -378,5 +378,6 @@ cargo fmt --check
 - [Registry behavior](docs/registry-behavior.md)
 - [Client configuration](docs/client-configuration.md)
 - [OSV advisory data](docs/osv-data.md)
+- [Performance and fast boot](docs/performance.md)
 - [Architecture notes](docs/architecture.md)
 - [Milestones](docs/milestones.md)

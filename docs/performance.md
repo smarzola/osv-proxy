@@ -85,8 +85,8 @@ A simple deployment sequence is:
 mkdir -p /var/lib/osv-proxy
 
 # Run this in CI, an image-build job, or a deployment/init job.
-osv-proxy osv sync --config /etc/osv-proxy/osv-proxy.yaml
 osv-proxy config validate --config /etc/osv-proxy/osv-proxy.yaml
+osv-proxy osv sync --config /etc/osv-proxy/osv-proxy.yaml
 
 # Only start the serving process after the preseed step succeeds.
 exec osv-proxy serve --config /etc/osv-proxy/osv-proxy.yaml
