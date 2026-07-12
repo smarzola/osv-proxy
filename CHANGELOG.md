@@ -5,6 +5,28 @@ source for GitHub release notes.
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-07-12
+
+### Added
+
+- Add configurable process-wide ingress and outbound concurrency budgets, with
+  a separate lane for background OSV synchronization and deterministic
+  overload responses.
+- Add dependency-free `/healthz`, policy-aware `/readyz`, non-loopback gateway
+  warnings, and graceful shutdown with bounded forced stream cancellation.
+
+### Changed
+
+- Validate bind addresses and every configured HTTP destination before serving,
+  including rejection of unusable wildcard destinations and port zero while
+  preserving private mirrors and loopback fixtures.
+- Pin CI and release actions, Rust, and moving language-tool inputs to exact
+  revisions or versions, and include effective toolchain provenance in release
+  archives.
+- Document the trusted gateway boundary for TLS, authentication, client rate
+  limiting, and edge access control, plus the current audit dispositions and
+  remaining telemetry and capacity-tuning non-goals.
+
 ## [0.7.2] - 2026-07-12
 
 ### Added
