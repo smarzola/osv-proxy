@@ -2762,7 +2762,7 @@ INSERT INTO advisories (
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 4096];
-            stream.read(&mut request).await.unwrap();
+            let _ = stream.read(&mut request).await.unwrap();
             task_accepted.notify_one();
             task_release.notified().await;
             let body = json!({"name":"demo","versions":{},"dist-tags":{},"time":{}}).to_string();
@@ -2786,7 +2786,7 @@ INSERT INTO advisories (
         tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0_u8; 4096];
-            stream.read(&mut request).await.unwrap();
+            let _ = stream.read(&mut request).await.unwrap();
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\ncontent-length: 12\r\ncontent-type: application/octet-stream\r\nconnection: close\r\n\r\npartial",

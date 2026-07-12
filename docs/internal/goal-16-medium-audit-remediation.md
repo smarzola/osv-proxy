@@ -151,7 +151,7 @@ The goal is complete only when:
 
 - [x] Milestone 1: Validated endpoint configuration and process-wide budgets
 - [x] Milestone 2: Truthful health/readiness, gateway warning, and graceful drain
-- [ ] Milestone 3: Immutable CI/release inputs and toolchain provenance
+- [x] Milestone 3: Immutable CI/release inputs and toolchain provenance
 - [ ] Milestone 4: Operational boundaries, documentation, and audit closure
 
 ### Checkpoint Protocol
@@ -343,7 +343,45 @@ cargo test --locked
 git diff --check
 ```
 
-Status: Not started.
+Status: Completed 2026-07-12. All action references are immutable SHAs; Rust,
+Node, uv, and existing package-manager inputs are exact. CI/release share the
+committed Rust 1.97.0 toolchain, locked Clippy, RustSec, and test gates. Release
+archives ship `TOOLCHAIN.txt`, and an integration regression rejects moving
+workflow inputs.
+
+Verification:
+
+- Rust 1.97.0 `cargo fmt --check`: passed.
+- Rust 1.97.0 `cargo clippy --all-targets --all-features --locked -- -D
+  warnings`: passed.
+- Rust 1.97.0 `cargo test --locked --lib`: 301 passed, 0 failed.
+- Rust 1.97.0 `cargo test --locked --test workflow_reproducibility`: 1 passed.
+- Normal-host package-manager E2Es: 12 passed; Maven and Gradle stopped only at
+  their explicit missing local CLI prerequisites, which required CI provisions.
+- `git diff --check`: passed.
+- Retained adversarial review: two rounds plus final-diff check; no blocking
+  findings remain.
+
+Evidence note (2026-07-12): action revisions were resolved read-only from each
+authoritative GitHub repository. Rust `1.97.0` was selected from the official
+stable manifest dated 2026-07-09; Node `24.18.0` is the current pinned LTS line;
+uv `0.11.28` came from the authoritative latest-release API. Because the host
+Homebrew toolchain has no `rustup`, the official Rust 1.97.0 standalone archive
+was downloaded to a temporary prefix, verified against its published SHA-256,
+and used directly for the exact format, Clippy, and test gates without changing
+the machine-global toolchain. Archive:
+`https://static.rust-lang.org/dist/rust-1.97.0-aarch64-apple-darwin.tar.xz`;
+SHA-256: `44f35089605c8ab8cafb7d21e3497a57c24ae48e789729b5924fd2719dae0388`.
+The temporary prefix was created by the archive's `install.sh --prefix ...
+--disable-ldconfig`; verification prepended that prefix's `bin` directory to
+`PATH` for each Cargo command.
+
+Verification note (2026-07-12): under Rust 1.97.0, format, strict Clippy, 301
+unit tests, and the workflow reproducibility integration test pass. With normal
+host access, 12 of 14 package-manager E2Es also pass. The remaining Maven and
+Gradle E2Es stop at their existing explicit
+prerequisite assertions because this host has no functional Java, `mvn`, or
+`gradle`; required CI provisions the exact Temurin/Maven/Gradle versions.
 
 ## Milestone 4: Operational Boundaries, Documentation, And Audit Closure
 
