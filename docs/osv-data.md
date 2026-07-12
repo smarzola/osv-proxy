@@ -31,11 +31,9 @@ vector, base score, or evaluation error. Raw source JSON is retained only when
 `retain_raw_advisories: true`. Repeated `affected[]` entries remain independent.
 Exact and range findings are unioned and withdrawn advisories are excluded.
 
-Full advisory storage is materially larger than the former `MAL-*`-only store.
-The 2026-07-11 pre-Maven measurement was 168,296,448 bytes without raw
-JSON, versus a 92,114,944-byte npm-plus-PyPI malicious-only baseline. Plan disk
-capacity for the additional Maven dataset, ongoing dataset growth, and SQLite
-WAL activity during sync.
+Full advisory storage is materially larger than a malicious-only dataset. The
+current reference database is about 195 MiB without raw advisory JSON. Plan
+disk capacity for dataset growth and SQLite WAL activity during sync.
 
 Missing, corrupt, unhealthy, incomplete, or stale data follows `on_error` and
 `local.on_stale`; both block by default. A failed staging import rolls back and

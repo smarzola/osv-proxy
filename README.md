@@ -278,19 +278,20 @@ policy:
 
 `on_error: block` and `on_stale: block` fail closed by default. Missing,
 corrupt, incomplete, unhealthy, or stale local data blocks OSV checks instead of
-silently allowing installs. `background_sync: true` makes `serve` run one sync
-immediately on startup and then repeat after `sync_interval`; failed background
-syncs record health state and keep serving against the last usable snapshot.
+silently allowing installs. `background_sync: true` runs an immediate sync in
+the background and repeats it after `sync_interval`; a valid non-stale database
+remains available while it refreshes. Missing or stale data keeps readiness and
+default fail-closed policy checks unavailable until synchronization succeeds.
+With `background_sync: false`, no automatic OSV sync runs at boot.
 `retain_raw_advisories` defaults to false so the SQLite database stores compact
 normalized lookup data by default; set it to true only when you need raw OSV
 advisory JSON for audit or debugging.
 
 For fast boot, run `osv sync` in CI or an init/deployment step and ship the
-completed SQLite file with the service. `background_sync: true` is useful when
-the process must start before synchronization completes, but readiness remains
-false and fail-closed requests remain unavailable until a healthy local dataset
-exists. Do not place a live, actively-updated SQLite file in an image layer;
-preseed a complete file, then refresh it outside the serving process.
+completed SQLite file with the service. A preseeded, non-stale database is ready
+immediately; enable `background_sync` when automatic refresh at process start
+is desired. Do not place a live, actively-updated SQLite file in an image
+layer; preseed a complete file, then refresh it outside the serving process.
 
 ## Performance
 
@@ -301,7 +302,7 @@ adding more. A full local database is about 195 MiB and a fresh sync takes
 about 21 seconds with roughly 221 MiB peak RSS on the reference machine.
 
 Live mode is substantially slower because it waits on remote OSV batch queries;
-large metadata requests can take several seconds even after bounded batching.
+large metadata requests can take several seconds.
 For the complete matrix, resource measurements, and fast-boot deployment
 patterns, see [Performance and fast boot](docs/performance.md).
 

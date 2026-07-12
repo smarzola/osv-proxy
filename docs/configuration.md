@@ -249,10 +249,12 @@ use local SQLite, but keeping it explicit makes deployment intent clearer.
 - `local.retain_raw_advisories`: when true, sync stores the full source OSV
   advisory JSON in SQLite. Defaults to false so the local DB keeps only compact
   normalized lookup data plus advisory metadata needed for policy decisions.
-- `local.background_sync`: when true, `serve` starts a background sync task.
-  The first full sync runs immediately on startup. Successful cycles repeat
-  after `sync_interval`; failed ecosystems retry independently with exponential
-  backoff starting at 5 seconds and capped at 5 minutes.
+- `local.background_sync`: when true, `serve` starts a background sync task and
+  runs an immediate update without waiting for it before serving. A complete
+  database is updated incrementally; missing or incomplete data is bootstrapped
+  from the full OSV archive. Successful cycles repeat after `sync_interval`;
+  failed ecosystems retry independently with exponential backoff starting at 5
+  seconds and capped at 5 minutes.
 - `local.sync_interval`: background sync interval. It must be between `60s` and
   `7d`; defaults to `6h`.
 
@@ -285,11 +287,12 @@ osv-proxy serve --config /etc/osv-proxy/osv-proxy.yaml
 The sync command should run in a CI job, image-build step, init job, or other
 deployment step that owns the database before the serving process starts. For
 an image-based deployment, bake the completed SQLite file into the image or
-mount it from a prepared persistent volume. `background_sync: true` allows the
-process to start before the first sync finishes, but `/readyz` stays unhealthy
-and the default fail-closed policy does not serve installs until local data is
-healthy. See [performance and fast boot](performance.md) for measured startup,
-request-path, and synchronization costs.
+mount it from a prepared persistent volume. A complete, non-stale database is
+ready immediately. With `background_sync: true`, it remains usable while an
+incremental refresh runs; with the default `on_stale: block`, missing or stale
+data remains unready and fail-closed until synchronization succeeds. See
+[performance and fast boot](performance.md) for measured startup, request-path,
+and synchronization costs.
 
 ## Allowlist
 
