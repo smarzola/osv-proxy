@@ -95,8 +95,16 @@ osv-proxy config validate --config examples/basic/osv-proxy.yaml
 Start the proxy:
 
 ```sh
+mkdir -p data
+osv-proxy osv sync --config examples/basic/osv-proxy.yaml
 osv-proxy serve --config examples/basic/osv-proxy.yaml
 ```
+
+The example uses the local SQLite OSV source by default. Preseeding the
+database before `serve` keeps startup independent of the OSV network and makes
+the first request follow the same fast path as steady-state requests. See
+[Performance and fast boot](docs/performance.md) for CI, image, and deployment
+patterns.
 
 Point npm at the proxy:
 
@@ -211,8 +219,13 @@ policy:
     block_malicious: true
     block_vulnerabilities: true
     minimum_cvss_score: 0
-    source: live
+    source: local
     on_error: "block"
+    local:
+      sqlite_path: "./data/osv-malicious.sqlite"
+      max_staleness: "24h"
+      on_stale: block
+      background_sync: false
 artifacts:
   behavior: redirect
 ```
@@ -231,12 +244,13 @@ the runtime limits and readiness contract.
 
 ### OSV Data Source
 
-`policy.osv.source: live` is the default. Live mode calls the OSV API during
-metadata filtering, artifact serving, `check`, and `eval`.
+`policy.osv.source: local` is the default. Local mode reads synchronized SQLite
+advisory data during metadata filtering, artifact serving, `check`, and `eval`;
+it makes no OSV network request on the install path.
 
-`policy.osv.source: local` reads synchronized OSV advisory data from
-SQLite instead. In local mode, install request handling performs indexed SQLite
-reads plus in-memory exact-version and range evaluation; it does not call OSV.
+`policy.osv.source: live` is an explicit opt-in for deployments that prefer
+fresh remote OSV queries over a preseeded local dataset. Live mode calls the OSV
+API during policy evaluation and remains bounded by the process egress budget.
 Populate or refresh the local database with:
 
 ```sh
@@ -254,11 +268,11 @@ policy:
     source: local
     on_error: block
     local:
-      sqlite_path: "./osv-malicious.sqlite"
+      sqlite_path: "./data/osv-malicious.sqlite"
       max_staleness: "24h"
       on_stale: block
       retain_raw_advisories: false
-      background_sync: true
+      background_sync: false
       sync_interval: "6h"
 ```
 
@@ -270,6 +284,26 @@ syncs record health state and keep serving against the last usable snapshot.
 `retain_raw_advisories` defaults to false so the SQLite database stores compact
 normalized lookup data by default; set it to true only when you need raw OSV
 advisory JSON for audit or debugging.
+
+For fast boot, run `osv sync` in CI or an init/deployment step and ship the
+completed SQLite file with the service. `background_sync: true` is useful when
+the process must start before synchronization completes, but readiness remains
+false and fail-closed requests remain unavailable until a healthy local dataset
+exists. Do not place a live, actively-updated SQLite file in an image layer;
+preseed a complete file, then refresh it outside the serving process.
+
+## Performance
+
+Local OSV evaluation is designed to stay close to the policy-disabled path:
+the measured p50 overhead was about 2–7 ms for representative npm, Go, and
+Cargo routes, with higher-cardinality NuGet, RubyGems, PyPI, and Maven routes
+adding more. A full local database is about 195 MiB and a fresh sync takes
+about 21 seconds with roughly 221 MiB peak RSS on the reference machine.
+
+Live mode is substantially slower because it waits on remote OSV batch queries;
+large metadata requests can take several seconds even after bounded batching.
+For the complete matrix, resource measurements, and fast-boot deployment
+patterns, see [Performance and fast boot](docs/performance.md).
 
 ## Policy Behavior
 

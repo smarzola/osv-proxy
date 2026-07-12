@@ -3099,7 +3099,9 @@ INSERT INTO advisories (
 
     #[tokio::test]
     async fn health_and_live_readiness_are_dependency_free() {
-        let app = router(Config::default());
+        let mut config = Config::default();
+        config.policy.osv.source = OsvSource::Live;
+        let app = router(config);
         for (path, field) in [("/healthz", "live"), ("/readyz", "ready")] {
             let response = app
                 .clone()
@@ -3363,6 +3365,7 @@ INSERT INTO advisories (
         ))
         .await;
         let mut config = Config::default();
+        config.policy.osv.source = OsvSource::Live;
         config.artifacts.behavior = ArtifactBehavior::Proxy;
         config.upstreams.npm.registry_url = registry_url;
         config.artifacts.trusted_origins.push(

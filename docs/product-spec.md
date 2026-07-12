@@ -25,7 +25,8 @@ The implemented product provides:
 - exact-version and whole-package manual blocklists;
 - a second policy check on direct artifact routes;
 - HTTP redirect and plain streaming proxy artifact behavior;
-- live OSV API evaluation with bounded, deduplicated detail hydration;
+- live OSV API evaluation with bounded, deduplicated detail hydration as an
+  explicit opt-in;
 - generation-scoped local SQLite OSV evaluation with no OSV request on the
   install path;
 - strict YAML configuration and structured JSON decisions.
@@ -40,8 +41,13 @@ policy:
     block_malicious: true
     block_vulnerabilities: true
     minimum_cvss_score: 0
-    source: live
+    source: local
     on_error: block
+    local:
+      sqlite_path: "./data/osv-malicious.sqlite"
+      max_staleness: "24h"
+      on_stale: block
+      background_sync: false
 artifacts:
   behavior: redirect
 ```

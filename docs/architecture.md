@@ -73,7 +73,8 @@ bounded JSON bodies because those URLs are also metadata-derived.
 ## OSV Boundary
 
 The policy engine consumes OSV findings and does not depend on whether they came
-from live HTTP or local SQLite. Live batch checks preserve input cardinality,
+from local SQLite or live HTTP. Local SQLite is the default request-path source;
+live batch checks preserve input cardinality,
 deduplicate advisory IDs, paginate, and hydrate at most 16 details concurrently.
 Local request handling performs indexed reads only and makes no OSV network
 call.

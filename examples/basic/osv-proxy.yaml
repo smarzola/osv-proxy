@@ -25,4 +25,12 @@ policy:
     block_malicious: true
     block_vulnerabilities: true
     minimum_cvss_score: 0.0
+    source: local
     on_error: "block"
+    local:
+      sqlite_path: "./data/osv-malicious.sqlite"
+      max_staleness: "24h"
+      on_stale: block
+      retain_raw_advisories: false
+      background_sync: false
+      sync_interval: "6h"

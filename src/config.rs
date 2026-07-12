@@ -321,7 +321,7 @@ impl Default for OsvConfig {
             block_malicious: true,
             block_vulnerabilities: true,
             minimum_cvss_score: 0.0,
-            source: OsvSource::Live,
+            source: OsvSource::Local,
             api_url: "https://api.osv.dev".to_string(),
             on_error: OsvErrorBehavior::Block,
             local: LocalOsvConfig::default(),
@@ -347,8 +347,8 @@ impl OsvConfig {
 #[serde(rename_all = "snake_case")]
 pub enum OsvSource {
     #[default]
-    Live,
     Local,
+    Live,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -654,7 +654,7 @@ mod tests {
         assert!(config.policy.osv.block_malicious);
         assert!(config.policy.osv.block_vulnerabilities);
         assert_eq!(config.policy.osv.minimum_cvss_score, 0.0);
-        assert_eq!(config.policy.osv.source, OsvSource::Live);
+        assert_eq!(config.policy.osv.source, OsvSource::Local);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         assert_eq!(
@@ -703,7 +703,7 @@ policy:
         assert!(!config.policy.osv.block_malicious);
         assert!(config.policy.osv.block_vulnerabilities);
         assert_eq!(config.policy.osv.minimum_cvss_score, 0.0);
-        assert_eq!(config.policy.osv.source, OsvSource::Live);
+        assert_eq!(config.policy.osv.source, OsvSource::Local);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
         assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);

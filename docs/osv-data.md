@@ -4,13 +4,8 @@
 RubyGems, and Maven. `MAL-*` records are classified as known malicious packages. Other IDs
 are vulnerabilities and are evaluated against `policy.osv.minimum_cvss_score`.
 
-Live mode queries OSV during metadata filtering and repeats the check before an
-artifact redirect or proxy fetch. Batch metadata queries hydrate advisory
-details with at most 16 concurrent requests, deduplicate repeated IDs, and
-preserve one result per requested version.
-
-Local mode performs no OSV network request on the install path. Populate it
-with the canonical command:
+Local mode is the default and performs no OSV network request on the install
+path. Populate it with the canonical command:
 
 ```sh
 osv-proxy osv sync --config /path/to/osv-proxy.yaml
@@ -46,3 +41,13 @@ Missing, corrupt, unhealthy, incomplete, or stale data follows `on_error` and
 `local.on_stale`; both block by default. A failed staging import rolls back and
 does not expose partial data. Exact allowlist entries with `bypass_osv: true`
 skip both malicious and vulnerability checks.
+
+Live mode is an explicit opt-in through `policy.osv.source: live`. It queries
+OSV during metadata filtering and repeats the check before an artifact redirect
+or proxy fetch. Batch metadata queries respect the OSV API's 1,000-query batch
+limit, use bounded concurrent chunks, hydrate advisory details with at most 16
+concurrent requests, deduplicate repeated IDs, and preserve one result per
+requested version.
+
+For request-path performance measurements, resource numbers, and fast-boot
+deployment patterns, see [performance and fast boot](performance.md).

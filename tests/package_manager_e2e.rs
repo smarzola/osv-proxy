@@ -1,5 +1,5 @@
 use osv_proxy::artifact::Ecosystem;
-use osv_proxy::config::{AllowlistEntry, ArtifactBehavior, Config};
+use osv_proxy::config::{AllowlistEntry, ArtifactBehavior, Config, OsvSource};
 use osv_proxy::response::RegistryResponse;
 use osv_proxy::server;
 use serde_json::json;
@@ -199,6 +199,7 @@ fn maven_e2e_config(
     let mut config = Config::default();
     config.upstreams.maven.repository_url = upstream.base_url();
     config.policy.osv.api_url = upstream.base_url();
+    config.policy.osv.source = OsvSource::Live;
     config.policy.minimum_age = Duration::ZERO;
     config.artifacts.behavior = behavior;
     if !enforce_vulnerability_policy {
@@ -432,6 +433,7 @@ fn rubygems_e2e_config(
     let mut config = Config::default();
     config.upstreams.rubygems.registry_url = upstream.base_url();
     config.policy.osv.api_url = upstream.base_url();
+    config.policy.osv.source = OsvSource::Live;
     config.policy.minimum_age = Duration::from_secs(0);
     config.artifacts.behavior = behavior;
     if !block {
@@ -605,6 +607,7 @@ fn nuget_e2e_config(
     let mut config = Config::default();
     config.upstreams.nuget.service_index_url = format!("{}/v3/index.json", upstream.base_url());
     config.policy.osv.api_url = upstream.base_url();
+    config.policy.osv.source = OsvSource::Live;
     config.policy.osv.block_malicious = false;
     config.policy.minimum_age = Duration::from_secs(0);
     config.artifacts.behavior = behavior;
@@ -1005,6 +1008,7 @@ fn start_go_proxy(
             config.upstreams.cargo.sparse_index_url = upstream_base_url.clone();
             config.upstreams.cargo.download_url = format!("{upstream_base_url}/cargo-files");
             config.policy.osv.api_url = upstream_base_url.clone();
+            config.policy.osv.source = OsvSource::Live;
             config.artifacts.behavior = behavior;
             if !block_go {
                 config.allowlist.push(AllowlistEntry {
