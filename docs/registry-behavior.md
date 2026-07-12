@@ -93,6 +93,8 @@ Manual block:
 {"live":true}
 ```
 
+Liveness remains available when the ingress budget is saturated.
+
 `GET /readyz` reports whether the configured OSV policy source is ready. Live
 mode is ready after validated startup because request failures still follow
 `policy.osv.on_error`:
@@ -105,6 +107,9 @@ Local mode reports all seven supported ecosystem datasets. Readiness requires
 each active generation to be healthy, complete when vulnerability blocking is
 enabled, and within the configured staleness policy. An unready report returns
 HTTP 503; a ready report returns 200.
+Readiness consumes the shared ingress budget, so saturation returns the same
+immediate HTTP 503 and `Retry-After: 1` as registry admission without entering
+local SQLite evaluation.
 
 ```json
 {

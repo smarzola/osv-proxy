@@ -2,9 +2,10 @@
 
 ## Implemented Signals
 
-- `/healthz` reports dependency-free process liveness.
+- `/healthz` reports dependency-free process liveness and remains outside the
+  ingress admission budget.
 - `/readyz` reports live/local OSV readiness and per-ecosystem local dataset
-  health.
+  health; it is bounded by ingress admission.
 - Startup warns when the resolved listener is non-loopback.
 - Startup, background sync outcomes, forced-drain timeout, and signal setup
   failures emit plain-text process messages.

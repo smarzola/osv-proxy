@@ -467,6 +467,36 @@ Inspect every failure and repair in-scope regressions rather than weakening
 tests. An unrelated pre-existing failure must be recorded with the command,
 result summary, and evidence that this branch did not cause it.
 
+## Completion Record
+
+Achieved 2026-07-12. All target-state requirements and success criteria are
+implemented. The fresh independent final audit initially found two integrated
+medium gaps: `/readyz` bypassed ingress admission, and advertised/outbound HTTP
+URLs accepted unspecified addresses and explicit port zero. The repair placed
+readiness behind immediate ingress admission while deliberately preserving
+dependency-free liveness, and extended shared destination validation across
+all HTTP URL fields and trusted origins. The same final auditor re-inspected
+the repairs and returned `CLEAN`, with no remaining findings at any severity.
+
+Final verification used the committed exact Rust 1.97.0 toolchain:
+
+- `cargo fmt --check`: passed.
+- `cargo clippy --all-targets --all-features --locked -- -D warnings`: passed.
+- `cargo test --locked --lib`: 303 passed, 0 failed.
+- `cargo test --locked --test workflow_reproducibility`: 1 passed, 0 failed.
+- `cargo run --locked -- config validate --config examples/basic/osv-proxy.yaml`:
+  configuration is valid.
+- `cargo audit --file Cargo.lock`: freshly loaded 1,160 RustSec advisories and
+  scanned 223 locked dependencies with no vulnerabilities. The read-only home
+  Cargo cache prevented the separate crates.io yanked-index refresh.
+- `git diff --check`: passed.
+
+The normal-host package-manager run remains 12 passed out of 14. Maven and
+Gradle stop at their intentional missing-prerequisite assertions on this host;
+required CI provisions their exact versions. No push, pull request, merge, or
+release was performed because those external delivery steps were not
+authorized.
+
 ## Resume Protocol
 
 On resume, first read this file, `AGENTS.md`, `git status`, milestone notes, and

@@ -2,7 +2,7 @@ use crate::artifact::Ecosystem;
 use chrono::Duration as ChronoDuration;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
@@ -524,6 +524,7 @@ fn validate_trusted_origin(value: &str) -> Result<(), ConfigError> {
             "artifacts.trusted_origins entry {value:?} must be an http(s) origin without credentials, path, query, or fragment"
         )));
     }
+    validate_http_destination("artifacts.trusted_origins entry", &url)?;
     Ok(())
 }
 
@@ -574,9 +575,7 @@ fn validate_http_url(field: &str, value: &str) -> Result<(), ConfigError> {
             "{field} must use http or https"
         )));
     }
-    if url.host_str().is_none() {
-        return Err(ConfigError::Invalid(format!("{field} must include a host")));
-    }
+    validate_http_destination(field, &url)?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err(ConfigError::Invalid(format!(
             "{field} must not include credentials"
@@ -585,6 +584,30 @@ fn validate_http_url(field: &str, value: &str) -> Result<(), ConfigError> {
     if url.query().is_some() || url.fragment().is_some() {
         return Err(ConfigError::Invalid(format!(
             "{field} must not include a query or fragment"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_http_destination(field: &str, url: &reqwest::Url) -> Result<(), ConfigError> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| ConfigError::Invalid(format!("{field} must include a host")))?;
+    let address_host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    if address_host
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_unspecified())
+    {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not use an unspecified address"
+        )));
+    }
+    if url.port() == Some(0) {
+        return Err(ConfigError::Invalid(format!(
+            "{field} must not use port zero"
         )));
     }
     Ok(())
@@ -923,6 +946,9 @@ artifacts:
             "https://user@cdn.example",
             "https://cdn.example/path",
             "https://cdn.example?query=yes",
+            "http://0.0.0.0:8080",
+            "http://[::]:8080",
+            "http://127.0.0.1:0",
             "not-a-url",
         ] {
             let error = load(&format!(
@@ -1232,6 +1258,9 @@ policy:
                 "https://user:secret@packages.example",
                 "https://packages.example/path?token=secret",
                 "https://packages.example/path#fragment",
+                "http://0.0.0.0:8080",
+                "http://[::]:8080",
+                "http://127.0.0.1:0",
             ] {
                 let mut config = Config::default();
                 *endpoint(&mut config) = invalid.to_string();
@@ -1267,6 +1296,41 @@ policy:
             let config = load(&format!("server:\n  bind: {bind:?}\n")).unwrap();
             assert_eq!(config.server.bind, bind);
         }
+    }
+
+    #[test]
+    fn rejects_unusable_http_destinations() {
+        type Endpoint = (&'static str, fn(&mut Config) -> &mut String);
+        let endpoints: [Endpoint; 3] = [
+            ("server.public_base_url", |c| &mut c.server.public_base_url),
+            ("upstreams.npm.registry_url", |c| {
+                &mut c.upstreams.npm.registry_url
+            }),
+            ("policy.osv.api_url", |c| &mut c.policy.osv.api_url),
+        ];
+        for (field, endpoint) in endpoints {
+            for invalid in [
+                "http://0.0.0.0:8080",
+                "http://[::]:8080",
+                "http://127.0.0.1:0",
+            ] {
+                let mut config = Config::default();
+                *endpoint(&mut config) = invalid.to_string();
+                let error = config
+                    .validate()
+                    .expect_err(&format!("{field} accepted {invalid}"));
+                assert!(error.to_string().contains(field), "{field}: {error}");
+            }
+        }
+
+        let config = load(
+            "server:\n  public_base_url: http://127.0.0.1:8080\nupstreams:\n  npm:\n    registry_url: http://10.0.0.8:4873/npm\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.upstreams.npm.registry_url,
+            "http://10.0.0.8:4873/npm"
+        );
     }
 
     #[test]

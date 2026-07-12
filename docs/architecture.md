@@ -51,10 +51,11 @@ traffic, so request routing reuses connection pools instead of constructing
 clients on the install path. NuGet metadata and artifact delivery share the
 same guarded client pool.
 
-The runtime boundary owns process-wide ingress admission, aggregate install
+The runtime boundary owns process-wide registry/readiness ingress admission, aggregate install
 egress, separate background-sync egress, overload propagation, and forced
 shutdown cancellation. Permits live through response bodies, including
-streamed artifacts. The readiness boundary maps the configured live/local OSV
+streamed artifacts. Dependency-free liveness remains deliberately outside
+admission. The readiness boundary maps the configured live/local OSV
 source into `/readyz`; local state comes from one read-only OSV-store API that
 reuses the same generation, health, dataset-version, and staleness checks as
 policy evaluation. These boundaries do not create alternate routing or

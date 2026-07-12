@@ -148,14 +148,29 @@ async fn healthz() -> Response<Body> {
 }
 
 async fn readyz(State(state): State<Arc<AppState>>) -> Response<Body> {
-    let report = readiness::evaluate(&state.config).await;
+    let ingress = match state.budgets.try_ingress() {
+        Ok(permit) => permit,
+        Err(error) => return error.response(),
+    };
+    let report = tokio::select! {
+        report = readiness::evaluate(&state.config) => report,
+        _ = state.control.forced() => {
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("content-type", "application/json")
+                .header("connection", "close")
+                .body(Body::from("{\"ready\":false,\"reason\":\"shutting_down\",\"message\":\"server drain deadline elapsed\"}"))
+                .expect("static shutdown response is valid");
+        }
+    };
     let status = if report.ready { 200 } else { 503 };
-    RegistryResponse::json(
+    let response = RegistryResponse::json(
         status,
         &serde_json::to_value(report).expect("readiness report serializes"),
     )
     .expect("readiness response serializes")
-    .into_http_response()
+    .into_http_response();
+    hold_permits(response, vec![ingress], state.control.clone())
 }
 
 struct AppState {
@@ -2672,6 +2687,41 @@ INSERT INTO advisories (
 
         release.notify_one();
         assert_eq!(active.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn readiness_obeys_ingress_admission_while_health_remains_available() {
+        let mut config = Config::default();
+        config.limits.ingress_requests = 1;
+        let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
+        let held = budgets.try_ingress().unwrap();
+        let app = router_with_runtime(config, budgets, RuntimeControl::default());
+
+        let overloaded = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(overloaded.headers()["retry-after"], "1");
+
+        let health = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+
+        drop(held);
     }
 
     #[tokio::test]

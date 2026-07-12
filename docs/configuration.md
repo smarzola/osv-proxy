@@ -59,7 +59,10 @@ server:
 `bind` accepts numeric IPv4, bracketed IPv6, or an ASCII DNS hostname plus a
 port. `public_base_url`, every upstream URL, and `policy.osv.api_url` must use
 HTTP or HTTPS, include a host, and contain no credentials, query, or fragment.
-Private HTTP mirrors and intentional base paths remain supported.
+Advertised and outbound URLs reject unspecified addresses (`0.0.0.0` and
+`[::]`) and explicit port zero because clients cannot use those destinations.
+Private HTTP mirrors, loopback fixtures on nonzero ports, and intentional base
+paths remain supported.
 
 A resolved non-loopback bind emits a startup warning. For shared deployments,
 put `osv-proxy` behind a trusted gateway or reverse proxy that provides TLS,
@@ -76,8 +79,10 @@ limits:
   queue_timeout: "2s"
 ```
 
-- `ingress_requests`: maximum active registry responses, including streamed
-  artifact bodies. Excess requests receive HTTP 503 immediately.
+- `ingress_requests`: maximum active registry and readiness responses,
+  including streamed artifact bodies. Excess requests receive HTTP 503
+  immediately. Dependency-free `/healthz` remains outside admission so a
+  saturated process can still report liveness.
 - `egress_requests`: aggregate install-path outbound request limit shared by
   registry metadata, live OSV, and artifact delivery. Permits are retained
   until buffered or streamed response bodies finish.
