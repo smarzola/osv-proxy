@@ -165,9 +165,11 @@ an OSV error decision; with `allow`, that error does not itself block. This is
 separate from a valid OSV finding: a matching finding is evaluated by its
 classification and threshold even when other advisory lookups fail.
 
-OSV is checked during policy evaluation. The default OSV API URL is
-`https://api.osv.dev`; override `policy.osv.api_url` only when routing through a
-mirror, fixture, or private gateway.
+OSV is checked during policy evaluation. Local SQLite data is the default
+source and makes no OSV network request on the install path. Set
+`policy.osv.source: live` to query the remote API instead. The default live API
+URL is `https://api.osv.dev`; override `policy.osv.api_url` only when routing
+through a mirror, fixture, or private gateway.
 
 ## Manual Blocklist
 

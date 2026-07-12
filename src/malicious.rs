@@ -10,7 +10,8 @@ use node_semver as npm_semver;
 use pep440_rs as pep440;
 use polycvss::{Vector as CvssVector, Version as CvssVersion};
 use reqwest::Client;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::types::ToSql;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use semver::Version as cargo_semver;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -32,6 +33,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const OSV_DUMP_BASE_URL: &str = "https://storage.googleapis.com/osv-vulnerabilities";
 const OSV_DETAIL_CONCURRENCY: usize = 16;
+// api.osv.dev rejects /v1/querybatch requests containing more than 1,000 queries.
+const OSV_QUERY_BATCH_SIZE: usize = 1_000;
+const OSV_QUERY_BATCH_CONCURRENCY: usize = 4;
 const MAX_OSV_API_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OSV_DOCUMENT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_OSV_ARCHIVE_BYTES: usize = 4 * 1024 * 1024 * 1024;
@@ -39,6 +43,7 @@ const MAX_OSV_ARCHIVE_ENTRIES: usize = 1_000_000;
 const MAX_OSV_ARCHIVE_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_OSV_ARCHIVE_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const SQLITE_CHECK_CONCURRENCY: usize = 8;
+const SQLITE_EXACT_VERSION_BATCH_SIZE: usize = 512;
 
 static SQLITE_CHECK_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static ACTIVE_SYNC_PATHS: OnceLock<StdMutex<BTreeSet<PathBuf>>> = OnceLock::new();
@@ -284,6 +289,58 @@ impl OsvHttpClient {
         Ok(http_body::collect_json(response, MAX_OSV_API_BYTES, "OSV batch response").await?)
     }
 
+    async fn post_batch_chunks(
+        &self,
+        queries: &[OsvQueryRequest],
+    ) -> Result<Vec<OsvBatchQueryResponse>, OsvError> {
+        let mut pending = FuturesUnordered::new();
+        let mut responses = Vec::with_capacity(queries.len().div_ceil(OSV_QUERY_BATCH_SIZE));
+
+        for (chunk_index, chunk) in queries.chunks(OSV_QUERY_BATCH_SIZE).enumerate() {
+            let client = self.clone();
+            let expected_results = chunk.len();
+            let chunk = chunk.to_vec();
+            pending.push(async move {
+                (
+                    chunk_index,
+                    expected_results,
+                    client.post_batch(chunk).await,
+                )
+            });
+
+            if pending.len() >= OSV_QUERY_BATCH_CONCURRENCY {
+                let (chunk_index, expected_results, response) = pending
+                    .next()
+                    .await
+                    .expect("batch request is pending after reaching the concurrency limit");
+                let response = response?;
+                if response.results.len() != expected_results {
+                    return Err(OsvError::InvalidBatchResponse {
+                        expected: expected_results,
+                        actual: response.results.len(),
+                    });
+                }
+                responses.push((chunk_index, response));
+            }
+        }
+
+        while let Some((chunk_index, expected_results, response)) = pending.next().await {
+            let response = response?;
+            if response.results.len() != expected_results {
+                return Err(OsvError::InvalidBatchResponse {
+                    expected: expected_results,
+                    actual: response.results.len(),
+                });
+            }
+            responses.push((chunk_index, response));
+        }
+        responses.sort_unstable_by_key(|(chunk_index, _)| *chunk_index);
+        Ok(responses
+            .into_iter()
+            .map(|(_, response)| response)
+            .collect())
+    }
+
     async fn hydrate_details(
         &self,
         ids: BTreeSet<String>,
@@ -420,18 +477,22 @@ impl OsvChecker for OsvHttpClient {
                 page_token: None,
             })
             .collect::<Vec<_>>();
-        let response = self.post_batch(base_queries.clone()).await?;
-        if response.results.len() != artifacts.len() {
+        let responses = self.post_batch_chunks(&base_queries).await?;
+        let mut batch_results = Vec::with_capacity(artifacts.len());
+        for response in responses {
+            batch_results.extend(response.results);
+        }
+        if batch_results.len() != artifacts.len() {
             return Err(OsvError::InvalidBatchResponse {
                 expected: artifacts.len(),
-                actual: response.results.len(),
+                actual: batch_results.len(),
             });
         }
 
         let mut stubs = vec![Vec::<OsvVulnerability>::new(); artifacts.len()];
         let mut pending = Vec::new();
         let mut seen_tokens = vec![BTreeSet::new(); artifacts.len()];
-        for (index, result) in response.results.into_iter().enumerate() {
+        for (index, result) in batch_results.into_iter().enumerate() {
             stubs[index].extend(result.vulns);
             if let Some(token) = result.next_page_token.filter(|token| !token.is_empty()) {
                 seen_tokens[index].insert(token.clone());
@@ -725,9 +786,12 @@ impl SqliteMaliciousChecker {
                 .expect("grouped package has at least one artifact");
             let ranges = stored_ranges(connection, &artifacts[first_index])?;
             *range_package_loads += 1;
-            for indexes in versions.into_values() {
+            let version_names = versions.keys().cloned().collect::<Vec<_>>();
+            let exact_hits =
+                exact_hits_for_versions(connection, &artifacts[first_index], &version_names)?;
+            for (version, indexes) in versions {
                 let artifact = &artifacts[indexes[0]];
-                let mut hits = exact_hits(connection, artifact)?;
+                let mut hits = exact_hits.get(&version).cloned().unwrap_or_default();
                 for range in &ranges {
                     if range_matches_artifact(range, artifact)? {
                         hits.push(range.advisory.clone());
@@ -1271,6 +1335,7 @@ fn import_zip_bootstrap_and_record_success<R: Read + Seek>(
         high_watermark,
         generation_id,
     )?;
+    refresh_lookup_statistics(&transaction)?;
     transaction.commit().map_err(sqlite_error)?;
     Ok(totals)
 }
@@ -1576,8 +1641,20 @@ fn import_advisories_and_record_success(
             params![generation_id, high_watermark],
         )
         .map_err(sqlite_error)?;
+    if bootstrap || !advisories.is_empty() {
+        refresh_lookup_statistics(&transaction)?;
+    }
     transaction.commit().map_err(sqlite_error)?;
     Ok(stats)
+}
+
+fn refresh_lookup_statistics(transaction: &rusqlite::Transaction<'_>) -> Result<(), OsvError> {
+    transaction
+        .execute_batch(
+            "ANALYZE osv_advisories;
+             ANALYZE osv_affected_packages;",
+        )
+        .map_err(sqlite_error)
 }
 
 fn import_advisories(
@@ -2210,38 +2287,119 @@ ORDER BY a.osv_id
                 artifact.name,
                 osv_query_version(artifact)
             ],
-            |row| {
-                let modified = row
-                    .get::<_, Option<String>>(3)?
-                    .map(|value| parse_timestamp(&value))
-                    .transpose()
-                    .map_err(|err| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(err),
-                        )
-                    })?;
-                Ok(OsvFinding {
-                    osv_id: row.get(0)?,
-                    summary: row.get(1)?,
-                    source: row.get(2)?,
-                    modified,
-                    effective_severity: match row.get::<_, Option<f64>>(6)? {
-                        Some(base_score) => Some(OsvEffectiveSeverity {
-                            severity_type: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                            vector: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
-                            base_score,
-                        }),
-                        None => None,
-                    },
-                    evaluation_error: row.get(7)?,
-                })
-            },
+            |row| osv_finding_from_row(row, 0),
         )
         .map_err(sqlite_error)?;
 
     consolidate_local_findings(rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?)
+}
+
+fn exact_hits_for_versions(
+    connection: &Connection,
+    artifact: &Artifact,
+    versions: &[String],
+) -> Result<BTreeMap<String, Vec<OsvFinding>>, OsvError> {
+    let mut query_to_input_versions = BTreeMap::<String, Vec<String>>::new();
+    for version in versions {
+        query_to_input_versions
+            .entry(osv_query_version_for(artifact.ecosystem, version))
+            .or_default()
+            .push(version.clone());
+    }
+
+    let query_versions = query_to_input_versions.keys().collect::<Vec<_>>();
+    let mut hits_by_query_version = BTreeMap::<String, Vec<OsvFinding>>::new();
+    for chunk in query_versions.chunks(SQLITE_EXACT_VERSION_BATCH_SIZE) {
+        let placeholders = (3..3 + chunk.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            r#"
+SELECT av.version, a.osv_id, a.summary, a.source, a.modified,
+       ap.severity_type, ap.severity_vector, ap.severity_score, ap.severity_error
+FROM sync_state s
+JOIN osv_affected_packages ap ON ap.generation_id = s.active_generation_id
+JOIN osv_affected_versions av ON av.affected_package_id = ap.id
+JOIN osv_advisories a ON a.generation_id = ap.generation_id AND a.osv_id = ap.osv_id
+WHERE s.ecosystem = ?1
+  AND ap.ecosystem = ?1
+  AND ap.name = ?2
+  AND av.version IN ({placeholders})
+  AND a.withdrawn IS NULL
+ORDER BY av.version, a.osv_id
+"#
+        );
+        let mut statement = connection.prepare(&sql).map_err(sqlite_error)?;
+        let ecosystem = artifact.ecosystem.osv_name();
+        let name = artifact.name.as_str();
+        let mut parameter_values: Vec<&dyn ToSql> = Vec::with_capacity(2 + chunk.len());
+        parameter_values.push(&ecosystem);
+        parameter_values.push(&name);
+        parameter_values.extend(chunk.iter().map(|version| version as &dyn ToSql));
+        let rows = statement
+            .query_map(params_from_iter(parameter_values), |row| {
+                Ok((row.get::<_, String>(0)?, osv_finding_from_row(row, 1)?))
+            })
+            .map_err(sqlite_error)?;
+        for row in rows {
+            let (version, finding) = row.map_err(sqlite_error)?;
+            hits_by_query_version
+                .entry(version)
+                .or_default()
+                .push(finding);
+        }
+    }
+
+    let mut hits_by_input_version = BTreeMap::new();
+    for (query_version, input_versions) in query_to_input_versions {
+        let hits = hits_by_query_version
+            .remove(&query_version)
+            .map(consolidate_local_findings)
+            .transpose()?
+            .unwrap_or_default();
+        for input_version in input_versions {
+            hits_by_input_version.insert(input_version, hits.clone());
+        }
+    }
+    Ok(hits_by_input_version)
+}
+
+fn osv_finding_from_row(
+    row: &rusqlite::Row<'_>,
+    column_offset: usize,
+) -> rusqlite::Result<OsvFinding> {
+    let modified_column = column_offset + 3;
+    let modified = row
+        .get::<_, Option<String>>(modified_column)?
+        .map(|value| parse_timestamp(&value))
+        .transpose()
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                modified_column,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        })?;
+    Ok(OsvFinding {
+        osv_id: row.get(column_offset)?,
+        summary: row.get(column_offset + 1)?,
+        source: row.get(column_offset + 2)?,
+        modified,
+        effective_severity: match row.get::<_, Option<f64>>(column_offset + 6)? {
+            Some(base_score) => Some(OsvEffectiveSeverity {
+                severity_type: row
+                    .get::<_, Option<String>>(column_offset + 4)?
+                    .unwrap_or_default(),
+                vector: row
+                    .get::<_, Option<String>>(column_offset + 5)?
+                    .unwrap_or_default(),
+                base_score,
+            }),
+            None => None,
+        },
+        evaluation_error: row.get(column_offset + 7)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -2494,10 +2652,14 @@ fn compare_nuget_prerelease(left: &str, right: &str) -> Ordering {
 }
 
 fn osv_query_version(artifact: &Artifact) -> String {
-    if artifact.ecosystem == Ecosystem::Go {
-        go::osv_version(&artifact.version).unwrap_or_else(|_| artifact.version.clone())
+    osv_query_version_for(artifact.ecosystem, &artifact.version)
+}
+
+fn osv_query_version_for(ecosystem: Ecosystem, version: &str) -> String {
+    if ecosystem == Ecosystem::Go {
+        go::osv_version(version).unwrap_or_else(|_| version.to_string())
     } else {
-        artifact.version.clone()
+        version.to_string()
     }
 }
 
@@ -2678,9 +2840,20 @@ mod tests {
     struct LiveMockState {
         query_calls: AtomicUsize,
         batch_calls: AtomicUsize,
+        active_batches: AtomicUsize,
+        peak_batches: AtomicUsize,
+        batch_delay_ms: AtomicUsize,
         active_details: AtomicUsize,
         peak_details: AtomicUsize,
         detail_counts: Mutex<BTreeMap<String, usize>>,
+    }
+
+    struct BatchActivityGuard(Arc<LiveMockState>);
+
+    impl Drop for BatchActivityGuard {
+        fn drop(&mut self) {
+            self.0.active_batches.fetch_sub(1, AtomicOrdering::SeqCst);
+        }
     }
 
     async fn mock_query(
@@ -2736,6 +2909,13 @@ mod tests {
         Json(body): Json<serde_json::Value>,
     ) -> Json<serde_json::Value> {
         state.batch_calls.fetch_add(1, AtomicOrdering::SeqCst);
+        let active = state.active_batches.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        state.peak_batches.fetch_max(active, AtomicOrdering::SeqCst);
+        let _activity = BatchActivityGuard(Arc::clone(&state));
+        let delay = state.batch_delay_ms.load(AtomicOrdering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+        }
         let queries = body["queries"].as_array().unwrap();
         if queries.iter().any(|query| {
             query.get("version").and_then(|value| value.as_str()) == Some("batch-cycle")
@@ -2889,6 +3069,39 @@ mod tests {
         assert_eq!(state.batch_calls.load(AtomicOrdering::SeqCst), 2);
         assert!(state.peak_details.load(AtomicOrdering::SeqCst) > 1);
         assert!(state.peak_details.load(AtomicOrdering::SeqCst) <= OSV_DETAIL_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn live_batch_queries_chunk_at_api_limit_and_bound_concurrency() {
+        let (url, state) = live_mock().await;
+        state.batch_delay_ms.store(20, AtomicOrdering::SeqCst);
+        let client = OsvHttpClient::with_vulnerability_policy(url, false);
+        let query_count = OSV_QUERY_BATCH_SIZE * 2 + 1;
+        let artifacts = (0..query_count)
+            .map(|index| {
+                let version = if index % OSV_QUERY_BATCH_SIZE == 0 {
+                    "mal-bad".to_string()
+                } else {
+                    format!("chunk-{index}")
+                };
+                Artifact::package(Ecosystem::Npm, "demo", version, None)
+            })
+            .collect::<Vec<_>>();
+
+        let results = client.check_many(&artifacts).await.unwrap();
+
+        assert_eq!(results.len(), query_count);
+        assert_eq!(state.batch_calls.load(AtomicOrdering::SeqCst), 3);
+        assert!(state.peak_batches.load(AtomicOrdering::SeqCst) >= 2);
+        assert!(state.peak_batches.load(AtomicOrdering::SeqCst) <= OSV_QUERY_BATCH_CONCURRENCY);
+        for (index, findings) in results.iter().enumerate() {
+            if index % OSV_QUERY_BATCH_SIZE == 0 {
+                assert_eq!(findings.len(), 1);
+                assert_eq!(findings[0].osv_id, "MAL-2026-known");
+            } else {
+                assert!(findings.is_empty());
+            }
+        }
     }
 
     #[tokio::test]
@@ -3591,6 +3804,39 @@ mod tests {
         assert_eq!(results[4], results[1]);
     }
 
+    #[tokio::test]
+    async fn sqlite_checker_batches_exact_version_lookups_across_chunks() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        insert_exact_advisory(
+            &connection,
+            "MAL-2026-000003",
+            "npm",
+            "demo",
+            "1.512.0",
+            Some("chunk boundary hit"),
+        );
+        let artifacts = (0..SQLITE_EXACT_VERSION_BATCH_SIZE + 1)
+            .map(|index| Artifact::package(Ecosystem::Npm, "demo", format!("1.{index}.0"), None))
+            .collect::<Vec<_>>();
+        let checker = checker_for(&db);
+
+        let results = checker.check_many(&artifacts).await.unwrap();
+
+        assert_eq!(results.len(), SQLITE_EXACT_VERSION_BATCH_SIZE + 1);
+        assert!(
+            results[..SQLITE_EXACT_VERSION_BATCH_SIZE]
+                .iter()
+                .all(Vec::is_empty)
+        );
+        assert_eq!(
+            results[SQLITE_EXACT_VERSION_BATCH_SIZE][0].osv_id,
+            "MAL-2026-000003"
+        );
+    }
+
     #[test]
     fn sqlite_batch_loads_ranges_once_per_package() {
         let dir = tempdir().unwrap();
@@ -4185,6 +4431,14 @@ INSERT INTO advisories (
             .collect::<Result<Vec<_>,_>>()
             .unwrap();
         assert_eq!(statuses.last(), Some(&(1, "active".to_string())));
+        let lookup_statistics = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl IN ('osv_advisories', 'osv_affected_packages')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(lookup_statistics, 3);
     }
 
     #[tokio::test]

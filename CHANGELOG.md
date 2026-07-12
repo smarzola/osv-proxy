@@ -5,6 +5,15 @@ source for GitHub release notes.
 
 ## [Unreleased]
 
+### Changed
+
+- Make synchronized local SQLite OSV evaluation the default request-path
+  strategy; live OSV remains an explicit opt-in.
+- Batch local exact-version lookups and live OSV query batches across all
+  supported ecosystem adapters, with bounded live chunk concurrency.
+- Document cross-ecosystem performance, database preseed, and fast-boot
+  deployment patterns.
+
 ## [0.7.3] - 2026-07-12
 
 ### Added

@@ -26,8 +26,14 @@ policy:
     block_malicious: true
     block_vulnerabilities: true
     minimum_cvss_score: 0
-    source: live
+    source: local
     on_error: "block"
+    local:
+      sqlite_path: "./data/osv-malicious.sqlite"
+      max_staleness: "24h"
+      on_stale: block
+      retain_raw_advisories: false
+      background_sync: false
 artifacts:
   behavior: redirect
   trusted_origins: []
@@ -168,7 +174,7 @@ policy:
   missing_publish_time: "block"
   osv:
     block_malicious: true
-    source: live
+    source: local
     on_error: "block"
 ```
 
@@ -184,7 +190,9 @@ policy:
   advisory blocks when its highest applicable base score is greater than or
   equal to this value. At the default zero, matching advisories without a score
   also block; at a positive threshold they do not.
-- `osv.source`: `live` or `local`. Defaults to `live`.
+- `osv.source`: `local` or `live`. Defaults to `local`. Local mode uses the
+  synchronized SQLite dataset and makes no OSV request during install-path
+  policy evaluation. Live mode is an explicit remote-query opt-in.
 - `osv.on_error`: `block` fails closed; `allow` fails open when the OSV check
   fails or a required OSV result is missing.
 - `osv.api_url`: optional OSV API base URL override. Omit it to use
@@ -196,7 +204,8 @@ vectors follow `osv.on_error`; unknown severity types are unscored.
 
 ### Live OSV Mode
 
-Live mode is the default and calls the OSV API while handling install requests:
+Live mode is an explicit opt-in and calls the OSV API while handling install
+requests:
 
 ```yaml
 policy:
@@ -227,6 +236,9 @@ policy:
       background_sync: false
       sync_interval: "6h"
 ```
+
+The local source is the default. A configuration may omit `source` and still
+use local SQLite, but keeping it explicit makes deployment intent clearer.
 
 - `local.sqlite_path`: SQLite database path for synchronized OSV advisory
   records. Defaults to `osv-malicious.sqlite` for compatibility.
@@ -259,6 +271,25 @@ the adjacent `<sqlite_path>.sync.lock` file.
 larger than the former malicious-only database. Missing, corrupt,
 unhealthy, or stale local data fails closed by default through `on_error:
 block` and `local.on_stale: block`.
+
+For startup-sensitive deployments, preseed the database before launching the
+proxy:
+
+```sh
+mkdir -p /var/lib/osv-proxy
+osv-proxy config validate --config /etc/osv-proxy/osv-proxy.yaml
+osv-proxy osv sync --config /etc/osv-proxy/osv-proxy.yaml
+osv-proxy serve --config /etc/osv-proxy/osv-proxy.yaml
+```
+
+The sync command should run in a CI job, image-build step, init job, or other
+deployment step that owns the database before the serving process starts. For
+an image-based deployment, bake the completed SQLite file into the image or
+mount it from a prepared persistent volume. `background_sync: true` allows the
+process to start before the first sync finishes, but `/readyz` stays unhealthy
+and the default fail-closed policy does not serve installs until local data is
+healthy. See [performance and fast boot](performance.md) for measured startup,
+request-path, and synchronization costs.
 
 ## Allowlist
 
