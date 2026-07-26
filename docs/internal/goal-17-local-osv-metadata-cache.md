@@ -167,9 +167,9 @@ The goal is complete only when:
 
 ## Milestones
 
-- [ ] Milestone 1: Local-only OSV synchronization and transactional revisions
-- [ ] Milestone 2: Bounded revision-aware filtered metadata cache
-- [ ] Milestone 3: Integration coverage, operator documentation, and regression
+- [x] Milestone 1: Local-only OSV synchronization and transactional revisions
+- [x] Milestone 2: Bounded revision-aware filtered metadata cache
+- [x] Milestone 3: Integration coverage, operator documentation, and regression
   closure
 
 ### Checkpoint Protocol
@@ -299,12 +299,19 @@ policy output, and revision-failure bypass of fill bounds; re-review returned
 checker failures are refetched after recovery, while revision failures still
 coalesce and respect unique-fill concurrency without retention.
 
-Verification passed with `cargo test --locked metadata_cache` (9 tests),
+Verification passed with `cargo test --locked metadata_cache` (10 tests),
 `cargo test --locked server` (52 tests), and the exact npm, PyPI, Cargo, Go,
 NuGet, RubyGems, and Maven command set above. The production-path cache test
 proves a hit skips both upstream fetch and policy filtering, and a 20,000-entry
 scale test guards against linear cache-hit scans. `cargo fmt --check` and
 `git diff --check` also pass.
+
+A later independent final audit found a cancellation lost-wakeup race in the
+same-key fill path. The repair replaced edge-triggered notification with a
+retained `Pending`/`Finished` state, so waiters observe abandonment even when
+they subscribe after the leader drops and can retry the fill. A focused
+leader-abort regression test passes, and the persistent adversarial reviewer
+returned `CLEAN` on the repair.
 
 ## Milestone 3: Integration Coverage, Documentation, And Regression Closure
 
@@ -379,6 +386,13 @@ cargo test --locked
 cargo run --locked -- config validate --config examples/basic/osv-proxy.yaml
 git diff --check
 ```
+
+Status: Passed on 2026-07-26. Formatting and all-target/all-feature locked
+clippy with warnings denied passed. The full locked suite passed with 310
+library tests, 14 package-manager E2Es, one workflow reproducibility test, and
+doc tests. Example configuration validation and `git diff --check` passed.
+The first sandboxed full-suite attempt could not bind loopback sockets; the
+same suite was rerun with normal local test permissions and passed.
 
 Inspect every failure. Fix in-scope regressions rather than weakening tests. An
 unrelated pre-existing failure may be reported only with the exact command,

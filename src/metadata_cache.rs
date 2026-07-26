@@ -10,7 +10,7 @@ use std::future::Future;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{Semaphore, watch};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct MetadataCacheKey {
@@ -76,10 +76,40 @@ struct CacheEntry {
     next: Option<usize>,
 }
 
-#[derive(Default)]
 struct Inflight {
-    result: Mutex<Option<Arc<CachedResponse>>>,
-    notify: Notify,
+    state: watch::Sender<InflightState>,
+}
+
+#[derive(Clone)]
+enum InflightState {
+    Pending,
+    Finished(Option<Arc<CachedResponse>>),
+}
+
+impl Default for Inflight {
+    fn default() -> Self {
+        let (state, _) = watch::channel(InflightState::Pending);
+        Self { state }
+    }
+}
+
+impl Inflight {
+    async fn wait(&self) -> Option<Arc<CachedResponse>> {
+        let mut state = self.state.subscribe();
+        loop {
+            match state.borrow_and_update().clone() {
+                InflightState::Pending => {}
+                InflightState::Finished(response) => return response,
+            }
+            if state.changed().await.is_err() {
+                return None;
+            }
+        }
+    }
+
+    fn finish(&self, response: Option<Arc<CachedResponse>>) {
+        self.state.send_replace(InflightState::Finished(response));
+    }
 }
 
 struct CachedResponse {
@@ -172,12 +202,7 @@ impl MetadataCache {
                     return (response.to_http_response(), response.overloaded);
                 }
                 Lookup::Wait(inflight) => {
-                    let notified = inflight.notify.notified();
-                    if let Some(response) = lock(&inflight.result).clone() {
-                        return (response.to_http_response(), response.overloaded);
-                    }
-                    notified.await;
-                    if let Some(response) = lock(&inflight.result).clone() {
+                    if let Some(response) = inflight.wait().await {
                         return (response.to_http_response(), response.overloaded);
                     }
                 }
@@ -253,7 +278,7 @@ impl MetadataCache {
         expires_at: Option<Instant>,
     ) {
         let mut state = lock(&self.state);
-        *lock(&inflight.result) = response.clone();
+        inflight.finish(response.clone());
         if let (Some(response), Some(expires_at)) = (response.as_ref(), expires_at) {
             let weight = key.weight().saturating_add(response.weight());
             if weight <= self.capacity_bytes {
@@ -273,12 +298,11 @@ impl MetadataCache {
         {
             state.inflight.remove(key);
         }
-        drop(state);
-        inflight.notify.notify_waiters();
     }
 
     fn abandon(&self, key: &MetadataCacheKey, inflight: &Arc<Inflight>) {
         let mut state = lock(&self.state);
+        inflight.finish(None);
         if state
             .inflight
             .get(key)
@@ -286,8 +310,6 @@ impl MetadataCache {
         {
             state.inflight.remove(key);
         }
-        drop(state);
-        inflight.notify.notify_waiters();
     }
 
     #[cfg(test)]
@@ -452,6 +474,7 @@ mod tests {
     use crate::response::RegistryResponse;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+    use tokio::sync::Notify;
 
     fn config() -> MetadataCacheConfig {
         MetadataCacheConfig {
@@ -565,6 +588,49 @@ mod tests {
             assert_eq!(body(task.await.unwrap()).await, &b"filtered"[..]);
         }
         assert_eq!(fills.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_fill_leader_cannot_strand_a_waiter() {
+        let cache = MetadataCache::new(&config());
+        let fill_started = Arc::new(Notify::new());
+        let never_release = Arc::new(Notify::new());
+        let leader = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let fill_started = Arc::clone(&fill_started);
+            let never_release = Arc::clone(&never_release);
+            async move {
+                cache
+                    .execute(key("/npm/cancelled", 1), move || async move {
+                        fill_started.notify_one();
+                        never_release.notified().await;
+                        fill_response(200, "abandoned")
+                    })
+                    .await
+            }
+        });
+        fill_started.notified().await;
+
+        let waiter = match cache.lookup(&key("/npm/cancelled", 1)) {
+            Lookup::Wait(inflight) => inflight,
+            _ => panic!("the blocked fill must own the in-flight key"),
+        };
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+
+        tokio::time::timeout(Duration::from_secs(1), waiter.wait())
+            .await
+            .expect("abandoned fill state must remain observable to late waiters");
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            cache.execute(key("/npm/cancelled", 1), || async {
+                fill_response(200, "refilled")
+            }),
+        )
+        .await
+        .expect("a waiter must be able to retry the abandoned fill")
+        .0;
+        assert_eq!(body(response).await, &b"refilled"[..]);
     }
 
     #[tokio::test]
