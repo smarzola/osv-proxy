@@ -1,69 +1,85 @@
-# Client Configuration
+# Configure package-manager clients
 
-These examples assume `osv-proxy` is listening at `http://127.0.0.1:8080`.
+This guide configures supported clients to use an `osv-proxy` server at
+`http://127.0.0.1:8080`. Replace that URL with your deployment URL.
 
-## Cargo / crates.io
+When the proxy is a mandatory policy gate, configure it as the only public
+package source. Client fallbacks and existing local package caches can bypass
+new policy decisions.
+
+## Configure Cargo
+
+Add the following source replacement to `.cargo/config.toml`:
 
 ```toml
 [source.crates-io]
 replace-with = "osv-proxy"
+
 [source.osv-proxy]
 registry = "sparse+http://127.0.0.1:8080/cargo/"
 ```
 
-This is read-only sparse source replacement, not publishing or a private registry.
+This configuration provides read-only crates.io sparse-source replacement. It
+does not provide publishing or private registry hosting.
 
-## npm
+## Configure npm
 
 ```sh
 npm config set registry http://127.0.0.1:8080/npm/
 ```
 
-## pnpm
+## Configure pnpm
 
 ```sh
 pnpm config set registry http://127.0.0.1:8080/npm/
 ```
 
-## pip
+## Configure pip
 
 ```sh
 pip config set global.index-url http://127.0.0.1:8080/pypi/simple/
 ```
 
-## uv
+## Configure uv
 
 ```sh
-uv pip install --index-url http://127.0.0.1:8080/pypi/simple/ requests
+uv pip install \
+  --index-url http://127.0.0.1:8080/pypi/simple/ \
+  requests
 ```
 
-## poetry
+## Configure Poetry
 
 ```sh
 poetry source add osv-proxy http://127.0.0.1:8080/pypi/simple/
 ```
 
-## Go modules
+## Configure Go modules
 
 ```sh
 export GOPROXY=http://127.0.0.1:8080/go
 export GONOSUMDB='*'
 ```
 
-Use one proxy URL when this is a mandatory policy control. Appending `,direct`
-or another proxy allows fallback after `404`/`410` and can bypass the gate.
-Policy denials are `403`, deliberately terminal for Go proxy fallback.
+Do not append `,direct` or another public proxy when `osv-proxy` must enforce
+policy. Go can use a fallback after an upstream `404` or `410`. The proxy
+returns `403` for policy denials so that Go treats the denial as terminal.
 
-## .NET / NuGet
+Keep mandatory-gate modules out of `GONOPROXY` and `GOPRIVATE`.
+
+## Configure NuGet
+
+Use the proxy service index as the only restore source:
 
 ```sh
-dotnet restore --source http://127.0.0.1:8080/nuget/v3/index.json
+dotnet restore \
+  --source http://127.0.0.1:8080/nuget/v3/index.json
 ```
 
-NuGet support is restore-scoped; search, publishing, symbols, and
-authentication are unsupported.
+NuGet support covers restore. It does not cover search, publishing, deletion,
+symbols, authentication, or private registry hosting.
 
-## Ruby / Bundler
+## Configure Bundler
 
 Use the proxy as the only source in `Gemfile`:
 
@@ -71,15 +87,16 @@ Use the proxy as the only source in `Gemfile`:
 source "http://127.0.0.1:8080/rubygems/"
 ```
 
-Then run `bundle install` normally. Do not configure a fallback mirror or an
-additional public source when the proxy is a mandatory policy gate. Support is
-limited to modern Bundler Compact Index restore; legacy RubyGems Marshal
-indexes, standalone `gem install`, search, publishing, yanking, authentication,
-and private registry hosting are unsupported.
+Then run `bundle install`. Do not configure a public fallback source when the
+proxy must enforce policy.
 
-## Java / Maven
+RubyGems support targets modern Bundler Compact Index restore. It does not
+support legacy Marshal indexes, standalone `gem install`, search, publishing,
+yanking, authentication, or private gem hosting.
 
-Configure a mirror in Maven `settings.xml`:
+## Configure Maven
+
+Add a mirror to Maven `settings.xml`:
 
 ```xml
 <mirrors>
@@ -91,27 +108,32 @@ Configure a mirror in Maven `settings.xml`:
 </mirrors>
 ```
 
-`mirrorOf` must cover every repository when the proxy is a mandatory gate.
-Maven can otherwise resolve through repositories declared by projects or
-plugins. Existing files in the local Maven cache are not revalidated; use a
-clean repository or force refresh when testing a new denial.
+Use `mirrorOf` value `*` when the proxy must cover every repository. Maven can
+otherwise resolve through repositories declared by projects or plugins.
 
-## Java / Gradle
+Existing files in the local Maven repository do not return through the proxy.
+Use a clean repository or force a refresh when you test a new denial.
 
-Use the proxy as the sole Maven repository and centralize repository policy in
-`settings.gradle`:
+## Configure Gradle
+
+Declare the proxy as the only Maven repository and enforce repository policy
+in `settings.gradle`:
 
 ```groovy
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-    repositories { maven { url = uri("http://127.0.0.1:8080/maven/") } }
+    repositories {
+        maven {
+            url = uri("http://127.0.0.1:8080/maven/")
+        }
+    }
 }
 ```
 
-Do not also declare Maven Central or another public repository: Gradle can fall
-back to it after a miss. Existing Gradle cache entries cannot be revoked by the
-proxy, so refresh or isolate the cache when validating policy changes.
+Do not also declare Maven Central or another public repository. Gradle can use
+that repository after a miss. Refresh or isolate the Gradle cache when you
+test policy changes.
 
-Maven support is read-only and release-only. Snapshots, private-repository
-authentication, publishing, search, and multi-repository aggregation are not
-supported.
+Maven support is read-only and release-only. It does not support snapshots,
+private-repository authentication, publishing, search, or aggregation across
+multiple repositories.

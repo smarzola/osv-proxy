@@ -1,24 +1,34 @@
-# Configuration
+# Configure osv-proxy
 
-`osv-proxy` uses YAML configuration. Unknown keys fail validation so policy
-typos do not silently change install behavior.
+`osv-proxy` reads YAML configuration. Every section has secure defaults, and
+unknown keys fail validation. Validate a file before you use it:
 
-Cargo defaults to `https://index.crates.io` for `upstreams.cargo.sparse_index_url`
-and `https://static.crates.io/crates` for `upstreams.cargo.download_url`.
-Optional sparse-record `pubtime` uses the existing age policy; missing values
-follow `policy.missing_publish_time`.
+```sh
+osv-proxy config validate --config /path/to/osv-proxy.yaml
+```
 
-## Example
+## Start with the example
+
+The following configuration shows the default operating posture:
 
 ```yaml
 server:
   bind: "127.0.0.1:8080"
   public_base_url: "http://127.0.0.1:8080"
+
 limits:
   ingress_requests: 128
   egress_requests: 32
   background_sync_requests: 4
   queue_timeout: "2s"
+
+metadata_cache:
+  enabled: true
+  capacity_bytes: 134217728
+  max_entry_bytes: 16777216
+  ttl: "5m"
+  fill_concurrency: 8
+
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
@@ -26,31 +36,24 @@ policy:
     block_malicious: true
     block_vulnerabilities: true
     minimum_cvss_score: 0
-    source: local
     on_error: "block"
     local:
       sqlite_path: "./data/osv-malicious.sqlite"
       max_staleness: "24h"
-      on_stale: block
+      on_stale: "block"
       retain_raw_advisories: false
-      background_sync: false
+      background_sync: true
+      sync_interval: "1h"
+
 artifacts:
-  behavior: redirect
+  behavior: "redirect"
   trusted_origins: []
 ```
 
-Validate it with:
+Public registry URLs are defaults. Add `upstreams` only when you use a mirror,
+test fixture, or private gateway.
 
-```sh
-cargo run -- config validate --config examples/basic/osv-proxy.yaml
-```
-
-The npm registry, PyPI Simple API, Go module proxy, NuGet service index,
-RubyGems registry, and OSV API default to their public URLs.
-Maven defaults to Maven Central at `https://repo.maven.apache.org/maven2`.
-Configure them only when routing through a mirror, fixture, or private gateway.
-
-## Server
+## Configure the server
 
 ```yaml
 server:
@@ -58,24 +61,21 @@ server:
   public_base_url: "http://127.0.0.1:8080"
 ```
 
-- `bind`: local socket address for the HTTP server.
-- `public_base_url`: URL used when advertising or rewriting proxy-owned package
-  metadata and artifact links.
+| Field | Default | Description |
+| --- | --- | --- |
+| `bind` | `127.0.0.1:8080` | Listener address as numeric IPv4, bracketed IPv6, or an ASCII DNS hostname with a port |
+| `public_base_url` | `http://127.0.0.1:8080` | Base URL used in proxy-owned metadata and package-file links |
 
-`bind` accepts numeric IPv4, bracketed IPv6, or an ASCII DNS hostname plus a
-port. `public_base_url`, every upstream URL, and `policy.osv.api_url` must use
-HTTP or HTTPS, include a host, and contain no credentials, query, or fragment.
-Advertised and outbound URLs reject unspecified addresses (`0.0.0.0` and
-`[::]`) and explicit port zero because clients cannot use those destinations.
-Private HTTP mirrors, loopback fixtures on nonzero ports, and intentional base
-paths remain supported.
+HTTP URLs must include a host, use HTTP or HTTPS, and omit credentials, a
+query, and a fragment. Advertised and outbound URLs cannot use an unspecified
+address or port zero. Intentional base paths and private HTTP mirrors remain
+valid.
 
-A resolved non-loopback bind emits a startup warning. For shared deployments,
-put `osv-proxy` behind a trusted gateway or reverse proxy that provides TLS,
-authentication, client rate limiting, and edge access control. Those controls
-are intentionally not implemented in `osv-proxy`.
+A non-loopback listener produces a startup warning. Put a shared deployment
+behind a trusted gateway or reverse proxy that provides TLS, authentication,
+client rate limiting, and edge access control.
 
-## Runtime Limits
+## Configure request limits
 
 ```yaml
 limits:
@@ -85,88 +85,120 @@ limits:
   queue_timeout: "2s"
 ```
 
-- `ingress_requests`: maximum active registry and readiness responses,
-  including streamed artifact bodies. Excess requests receive HTTP 503
-  immediately. Dependency-free `/healthz` remains outside admission so a
-  saturated process can still report liveness.
-- `egress_requests`: aggregate install-path outbound request limit shared by
-  registry metadata, live OSV, and artifact delivery. Permits are retained
-  until buffered or streamed response bodies finish.
-- `background_sync_requests`: separate outbound limit for OSV dump sync, so
-  synchronization cannot consume install-path egress capacity.
-- `queue_timeout`: maximum wait for either egress lane. Install-path expiry
-  returns HTTP 503 with `Retry-After: 1`, even when an adapter or fail-open
-  policy would otherwise translate the underlying error. Background-sync
-  expiry records a failed sync attempt and follows the existing bounded retry
-  schedule; it has no client HTTP response.
+| Field | Default | Description |
+| --- | ---: | --- |
+| `ingress_requests` | 128 | Maximum active registry and readiness responses, including streamed bodies |
+| `egress_requests` | 32 | Maximum aggregate registry and package-file upstream requests |
+| `background_sync_requests` | 4 | Separate outbound limit for OSV synchronization |
+| `queue_timeout` | `2s` | Maximum wait for an outbound permit |
 
-All limits must be greater than zero. Existing adapter-local fan-out caps remain
-in effect inside the aggregate process budget.
+All values must be greater than zero. An ingress overflow returns HTTP `503`
+immediately. An install-path queue timeout returns HTTP `503` with
+`Retry-After: 1`. `/healthz` remains outside ingress admission.
 
-## Upstreams
+A background-sync timeout records a failed attempt and enters the bounded
+retry schedule. It does not consume install-path egress capacity.
+
+## Configure the metadata cache
+
+```yaml
+metadata_cache:
+  enabled: true
+  capacity_bytes: 134217728
+  max_entry_bytes: 16777216
+  ttl: "5m"
+  fill_concurrency: 8
+```
+
+| Field | Default | Valid values |
+| --- | ---: | --- |
+| `enabled` | `true` | `true` or `false` |
+| `capacity_bytes` | 134217728 | 1 byte through 4 GiB |
+| `max_entry_bytes` | 16777216 | 1 byte through 128 MiB and no more than `capacity_bytes` |
+| `ttl` | `5m` | Greater than zero and no more than `24h` |
+| `fill_concurrency` | 8 | 1 through 1024 |
+
+`capacity_bytes` accounts for keys, response headers, and response bodies. It
+does not provide a hard process-memory ceiling.
+
+The cache stores complete successful responses for supported policy-filtered
+metadata `GET` routes. It excludes static discovery, health, readiness, and
+every package-file route. It also excludes oversized, overloaded,
+unsuccessful, and transient policy-error responses.
+
+The key includes the exact path and query, material request headers, and the
+ecosystem's committed OSV content revision. A content-changing sync advances
+the revision in the same transaction as the advisory change, making older
+cache entries unreachable to new requests.
+
+Identical misses share one fill. `fill_concurrency` bounds distinct fills. A
+package-age transition can expire an entry before `ttl`.
+
+## Configure registry upstreams
+
+You can override any public registry endpoint:
 
 ```yaml
 upstreams:
-  npm:
-    registry_url: "https://registry.npmjs.org"
-  pypi:
-    simple_url: "https://pypi.org/simple"
+  cargo:
+    sparse_index_url: "https://index.crates.io"
+    download_url: "https://static.crates.io/crates"
   go:
     proxy_url: "https://proxy.golang.org"
-  nuget:
-    service_index_url: "https://api.nuget.org/v3/index.json"
-  rubygems:
-    registry_url: "https://rubygems.org"
   maven:
     repository_url: "https://repo.maven.apache.org/maven2"
+  npm:
+    registry_url: "https://registry.npmjs.org"
+  nuget:
+    service_index_url: "https://api.nuget.org/v3/index.json"
+  pypi:
+    simple_url: "https://pypi.org/simple"
+  rubygems:
+    registry_url: "https://rubygems.org"
 ```
 
-- `npm.registry_url`: upstream npm registry metadata endpoint.
-- `pypi.simple_url`: upstream PyPI Simple API endpoint. Project pages are
-  fetched as Simple JSON for policy evaluation.
-- `go.proxy_url`: upstream Go module proxy endpoint.
-- `nuget.service_index_url`: upstream NuGet V3 restore service index.
-- `rubygems.registry_url`: upstream RubyGems registry root used for Compact
-  Index metadata, version metadata, and canonical gem downloads.
-- `maven.repository_url`: upstream Maven repository root used for release
-  metadata, POMs, JARs, Gradle module metadata, classifiers, signatures, and
-  checksums.
+| Field | Purpose |
+| --- | --- |
+| `cargo.sparse_index_url` | Cargo sparse index |
+| `cargo.download_url` | Canonical crates.io package files |
+| `go.proxy_url` | Go module proxy |
+| `maven.repository_url` | Maven release repository |
+| `npm.registry_url` | npm package metadata and canonical tarball discovery |
+| `nuget.service_index_url` | NuGet V3 restore service index |
+| `pypi.simple_url` | PyPI Simple API |
+| `rubygems.registry_url` | RubyGems Compact Index, version metadata, and gems |
 
-All upstream values have public registry defaults, so most
-local configs can omit this section.
+Every URL follows the server URL validation rules.
 
-## Artifacts
+## Configure package-file delivery
 
 ```yaml
 artifacts:
-  behavior: redirect
+  behavior: "redirect"
   trusted_origins:
     - "http://packages.internal.example:8081"
 ```
 
-- `behavior`: `redirect` or `proxy`. Defaults to `redirect`.
-- `trusted_origins`: exact HTTP or HTTPS origins that artifact delivery may
-  contact in addition to the configured ecosystem upstreams. Entries must not
-  contain credentials, paths, queries, or fragments. Keep this list minimal;
-  it is shared by all ecosystems and may explicitly permit private addresses.
-- `redirect`: after the second policy check, allowed artifact requests return
-  `302 Location` to the upstream tarball or file URL.
-- `proxy`: after the second policy check, allowed artifact requests fetch the
-  verified upstream artifact URL and stream the upstream response through
-  `osv-proxy`.
+`behavior` accepts the following values:
 
-Artifact destinations are restricted before any proxy connection. Public HTTPS
-origins are allowed so registries can use their public CDNs. Plain HTTP and
-private, loopback, link-local, or otherwise non-public addresses require an
-exact origin configured for that ecosystem under `upstreams` or listed in
-`trusted_origins`. Artifact requests do not use system HTTP proxies, and
-upstream redirects are rejected instead of followed. NuGet registration URLs
-discovered through service-index and page metadata use the same boundary.
+| Value | Behavior |
+| --- | --- |
+| `redirect` | Returns HTTP `302` to the validated upstream file after policy passes |
+| `proxy` | Fetches the validated upstream file and streams its response |
 
-`proxy_cache_s3` is reserved for future S3-compatible artifact caching and is
-rejected as unsupported.
+`redirect` is the default. `proxy_cache_s3` is reserved and fails validation.
 
-## Policy
+`trusted_origins` contains exact HTTP or HTTPS origins. Each value must omit
+credentials, paths, queries, and fragments. Keep this list small because it
+applies across ecosystems and can explicitly permit private addresses.
+
+Before a proxy connection, `osv-proxy` validates the URL and every resolved
+address. Public HTTPS origins are allowed for registry content-delivery
+networks. Plain HTTP and non-public destinations require an exact configured
+ecosystem origin or a `trusted_origins` entry. Package-file requests ignore
+system HTTP proxy settings and do not follow upstream redirects.
+
+## Configure package policy
 
 ```yaml
 policy:
@@ -174,108 +206,73 @@ policy:
   missing_publish_time: "block"
   osv:
     block_malicious: true
-    source: local
+    block_vulnerabilities: true
+    minimum_cvss_score: 0
     on_error: "block"
 ```
 
-- `minimum_age`: minimum age before a package version can be installed. It must
-  be a valid duration that fits policy evaluation.
-- `missing_publish_time`: `block` or `allow`.
-- `osv.block_malicious`: when true, OSV `MAL-*` records block package versions.
-  Defaults to true.
-- `osv.block_vulnerabilities`: when true, other active matching OSV advisories
-  block according to `minimum_cvss_score`. Defaults to true. Set false for the
-  malicious-only compatibility behavior.
-- `osv.minimum_cvss_score`: inclusive threshold from 0 through 10. A scored
-  advisory blocks when its highest applicable base score is greater than or
-  equal to this value. At the default zero, matching advisories without a score
-  also block; at a positive threshold they do not.
-- `osv.source`: `local` or `live`. Defaults to `local`. Local mode uses the
-  synchronized SQLite dataset and makes no OSV request during install-path
-  policy evaluation. Live mode is an explicit remote-query opt-in.
-- `osv.on_error`: `block` fails closed; `allow` fails open when the OSV check
-  fails or a required OSV result is missing.
-- `osv.api_url`: optional OSV API base URL override. Omit it to use
-  `https://api.osv.dev`. Used only by live checks.
+| Field | Default | Description |
+| --- | --- | --- |
+| `minimum_age` | `72h` | Minimum time after publication before a version is eligible |
+| `missing_publish_time` | `block` | `block` or `allow` when a registry does not provide a publication time |
+| `osv.block_malicious` | `true` | Blocks matching OSV `MAL-*` records |
+| `osv.block_vulnerabilities` | `true` | Blocks other matching OSV advisories according to the threshold |
+| `osv.minimum_cvss_score` | `0` | Inclusive finite threshold from 0 through 10 |
+| `osv.on_error` | `block` | `block` or `allow` for checker failures, missing results, or malformed recognized CVSS vectors |
 
-`MAL-*` records are always classified as malicious, independently of CVSS.
-Other OSV IDs are classified as vulnerabilities. Malformed recognized CVSS
-vectors follow `osv.on_error`; unknown severity types are unscored.
+At threshold zero, matching unscored vulnerabilities block. At a positive
+threshold, unscored vulnerabilities do not block. `MAL-*` records remain
+malicious regardless of CVSS.
 
-### Live OSV Mode
+See [Understand policy decisions](policy.md) for evaluation order and
+allowlist behavior.
 
-Live mode is an explicit opt-in and calls the OSV API while handling install
-requests:
+## Configure local OSV data
+
+Local SQLite is the only OSV policy source:
 
 ```yaml
 policy:
   osv:
-    source: live
-    api_url: "https://api.osv.dev"
-    on_error: block
-```
-
-### Local SQLite OSV Mode
-
-Local mode evaluates synchronized SQLite data and makes no OSV network calls
-during install request handling:
-
-```yaml
-policy:
-  osv:
-    block_malicious: true
-    block_vulnerabilities: true
-    minimum_cvss_score: 0
-    source: local
-    on_error: block
     local:
-      sqlite_path: "./osv-malicious.sqlite"
+      sqlite_path: "./data/osv-malicious.sqlite"
       max_staleness: "24h"
-      on_stale: block
+      on_stale: "block"
       retain_raw_advisories: false
-      background_sync: false
-      sync_interval: "6h"
+      background_sync: true
+      sync_interval: "1h"
 ```
 
-The local source is the default. A configuration may omit `source` and still
-use local SQLite, but keeping it explicit makes deployment intent clearer.
+| Field | Default | Description |
+| --- | --- | --- |
+| `sqlite_path` | `osv-malicious.sqlite` | Path to the synchronized SQLite database |
+| `max_staleness` | `24h` | Maximum age since the last successful sync; must be greater than zero |
+| `on_stale` | `block` | `block` or `allow` after `max_staleness` |
+| `retain_raw_advisories` | `false` | Stores full source advisory JSON when `true` |
+| `background_sync` | `true` | Starts an immediate background update and later scheduled updates |
+| `sync_interval` | `1h` | Delay after a successful cycle; valid from `60s` through `7d` |
 
-- `local.sqlite_path`: SQLite database path for synchronized OSV advisory
-  records. Defaults to `osv-malicious.sqlite` for compatibility.
-- `local.max_staleness`: maximum age since the last successful sync before the
-  local data is stale. Defaults to `24h`.
-- `local.on_stale`: `block` fails closed when local data is stale; `allow`
-  fails open. Defaults to `block`.
-- `local.retain_raw_advisories`: when true, sync stores the full source OSV
-  advisory JSON in SQLite. Defaults to false so the local DB keeps only compact
-  normalized lookup data plus advisory metadata needed for policy decisions.
-- `local.background_sync`: when true, `serve` starts a background sync task and
-  runs an immediate update without waiting for it before serving. A complete
-  database is updated incrementally; missing or incomplete data is bootstrapped
-  from the full OSV archive. Successful cycles repeat after `sync_interval`;
-  failed ecosystems retry independently with exponential backoff starting at 5
-  seconds and capped at 5 minutes.
-- `local.sync_interval`: background sync interval. It must be between `60s` and
-  `7d`; defaults to `6h`.
+The server does not wait for the immediate background update before it starts
+serving. A healthy, non-stale database remains usable while it refreshes.
+Missing, incomplete, unhealthy, or stale data remains unready and fails closed
+by default until synchronization succeeds.
 
-Populate or refresh the SQLite database explicitly with:
+Failed ecosystems retry independently with exponential backoff from five
+seconds through five minutes. A fully successful cycle waits for
+`sync_interval`.
+
+To update the database explicitly, run:
 
 ```sh
 osv-proxy osv sync --config /path/to/osv-proxy.yaml
 ```
 
-The sync command downloads npm, PyPI, Go, crates.io, NuGet, RubyGems, and Maven OSV GCS dumps,
-attempts each ecosystem independently, stores successful advisory generations,
-and reports per-ecosystem successes and failures. Concurrent sync commands for
-the same SQLite store are rejected across processes through an advisory lock on
-the adjacent `<sqlite_path>.sync.lock` file.
-`malicious sync` is a compatibility alias. Full advisory storage is materially
-larger than the former malicious-only database. Missing, corrupt,
-unhealthy, or stale local data fails closed by default through `on_error:
-block` and `local.on_stale: block`.
+The compatibility command `malicious sync` performs the same operation.
+Concurrent syncs against one SQLite path fail through a cross-process sidecar
+lock.
 
-For startup-sensitive deployments, preseed the database before launching the
-proxy:
+For deterministic startup, validate and preseed the database before you start
+the server:
 
 ```sh
 mkdir -p /var/lib/osv-proxy
@@ -284,19 +281,12 @@ osv-proxy osv sync --config /etc/osv-proxy/osv-proxy.yaml
 osv-proxy serve --config /etc/osv-proxy/osv-proxy.yaml
 ```
 
-The sync command should run in a CI job, image-build step, init job, or other
-deployment step that owns the database before the serving process starts. For
-an image-based deployment, bake the completed SQLite file into the image or
-mount it from a prepared persistent volume. A complete, non-stale database is
-ready immediately. With `background_sync: true`, it remains usable while an
-incremental refresh runs; with the default `on_stale: block`, missing or stale
-data remains unready and fail-closed until synchronization succeeds. See
-[performance and fast boot](performance.md) for measured startup, request-path,
-and synchronization costs.
+See [Manage OSV advisory data](osv-data.md) for transaction, migration, and
+readiness semantics.
 
-## Allowlist
+## Configure an allowlist
 
-Allowlist entries are exact-version only.
+Allowlist entries require an exact version:
 
 ```yaml
 allowlist:
@@ -305,21 +295,27 @@ allowlist:
     version: "1.2.3"
     bypass_age_gate: true
     bypass_osv: false
-    reason: "Internal emergency release"
+    reason: "Approved emergency release"
 ```
 
-`bypass_osv: true` requires a non-empty `reason`.
+`bypass_age_gate` and `bypass_osv` are independent. An entry with
+`bypass_osv: true` requires a nonempty `reason`. Wildcard allowlist versions
+fail validation.
 
-## Blocklist
+## Configure a blocklist
 
-Blocklist entries support exact versions and `*`.
+Blocklist entries accept exact versions or `*`:
 
 ```yaml
 blocklist:
   - ecosystem: npm
     name: "event-stream"
     versions: ["*"]
-    reason: "Manually blocked"
+    reason: "Blocked after an internal incident"
+  - ecosystem: pypi
+    name: "example-package"
+    versions: ["1.0.0", "1.0.1"]
+    reason: "Versions fail internal policy"
 ```
 
-Version ranges such as `<4.17.21` are not supported.
+Version ranges such as `<4.17.21` are not supported and fail validation.

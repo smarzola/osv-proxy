@@ -9,12 +9,17 @@ use thiserror::Error;
 
 const LOCAL_OSV_SYNC_INTERVAL_MIN: Duration = Duration::from_secs(60);
 const LOCAL_OSV_SYNC_INTERVAL_MAX: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const METADATA_CACHE_CAPACITY_MAX: usize = 4 * 1024 * 1024 * 1024;
+const METADATA_CACHE_ENTRY_MAX: usize = 128 * 1024 * 1024;
+const METADATA_CACHE_TTL_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+const METADATA_CACHE_FILL_CONCURRENCY_MAX: usize = 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
     pub limits: LimitsConfig,
+    pub metadata_cache: MetadataCacheConfig,
     pub upstreams: UpstreamsConfig,
     pub policy: PolicyConfig,
     pub artifacts: ArtifactsConfig,
@@ -34,6 +39,7 @@ impl Config {
         validate_bind(&self.server.bind)?;
         validate_http_url("server.public_base_url", &self.server.public_base_url)?;
         self.limits.validate()?;
+        self.metadata_cache.validate()?;
         validate_http_url(
             "upstreams.npm.registry_url",
             &self.upstreams.npm.registry_url,
@@ -129,6 +135,62 @@ impl Default for LimitsConfig {
             background_sync_requests: 4,
             queue_timeout: Duration::from_secs(2),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MetadataCacheConfig {
+    pub enabled: bool,
+    pub capacity_bytes: usize,
+    pub max_entry_bytes: usize,
+    #[serde(with = "duration_format")]
+    pub ttl: Duration,
+    pub fill_concurrency: usize,
+}
+
+impl Default for MetadataCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capacity_bytes: 128 * 1024 * 1024,
+            max_entry_bytes: 16 * 1024 * 1024,
+            ttl: Duration::from_secs(5 * 60),
+            fill_concurrency: 8,
+        }
+    }
+}
+
+impl MetadataCacheConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.capacity_bytes == 0 || self.capacity_bytes > METADATA_CACHE_CAPACITY_MAX {
+            return Err(ConfigError::Invalid(format!(
+                "metadata_cache.capacity_bytes must be between 1 and {METADATA_CACHE_CAPACITY_MAX}"
+            )));
+        }
+        if self.max_entry_bytes == 0 || self.max_entry_bytes > METADATA_CACHE_ENTRY_MAX {
+            return Err(ConfigError::Invalid(format!(
+                "metadata_cache.max_entry_bytes must be between 1 and {METADATA_CACHE_ENTRY_MAX}"
+            )));
+        }
+        if self.max_entry_bytes > self.capacity_bytes {
+            return Err(ConfigError::Invalid(
+                "metadata_cache.max_entry_bytes must not exceed metadata_cache.capacity_bytes"
+                    .to_string(),
+            ));
+        }
+        if self.ttl.is_zero() || self.ttl > METADATA_CACHE_TTL_MAX {
+            return Err(ConfigError::Invalid(
+                "metadata_cache.ttl must be greater than zero and at most 24h".to_string(),
+            ));
+        }
+        if self.fill_concurrency == 0 || self.fill_concurrency > METADATA_CACHE_FILL_CONCURRENCY_MAX
+        {
+            return Err(ConfigError::Invalid(format!(
+                "metadata_cache.fill_concurrency must be between 1 and {METADATA_CACHE_FILL_CONCURRENCY_MAX}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -309,8 +371,6 @@ pub struct OsvConfig {
     pub block_malicious: bool,
     pub block_vulnerabilities: bool,
     pub minimum_cvss_score: f64,
-    pub source: OsvSource,
-    pub api_url: String,
     pub on_error: OsvErrorBehavior,
     pub local: LocalOsvConfig,
 }
@@ -321,8 +381,6 @@ impl Default for OsvConfig {
             block_malicious: true,
             block_vulnerabilities: true,
             minimum_cvss_score: 0.0,
-            source: OsvSource::Local,
-            api_url: "https://api.osv.dev".to_string(),
             on_error: OsvErrorBehavior::Block,
             local: LocalOsvConfig::default(),
         }
@@ -331,7 +389,6 @@ impl Default for OsvConfig {
 
 impl OsvConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        validate_http_url("policy.osv.api_url", &self.api_url)?;
         if !self.minimum_cvss_score.is_finite() || !(0.0..=10.0).contains(&self.minimum_cvss_score)
         {
             return Err(ConfigError::Invalid(
@@ -341,14 +398,6 @@ impl OsvConfig {
         }
         self.local.validate()
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OsvSource {
-    #[default]
-    Local,
-    Live,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,8 +427,8 @@ impl Default for LocalOsvConfig {
             max_staleness: Duration::from_secs(24 * 60 * 60),
             on_stale: LocalOsvStaleBehavior::Block,
             retain_raw_advisories: false,
-            background_sync: false,
-            sync_interval: Duration::from_secs(6 * 60 * 60),
+            background_sync: true,
+            sync_interval: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -654,9 +703,7 @@ mod tests {
         assert!(config.policy.osv.block_malicious);
         assert!(config.policy.osv.block_vulnerabilities);
         assert_eq!(config.policy.osv.minimum_cvss_score, 0.0);
-        assert_eq!(config.policy.osv.source, OsvSource::Local);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
-        assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         assert_eq!(
             config.policy.osv.local.sqlite_path,
             PathBuf::from("osv-malicious.sqlite")
@@ -670,11 +717,16 @@ mod tests {
             LocalOsvStaleBehavior::Block
         );
         assert!(!config.policy.osv.local.retain_raw_advisories);
-        assert!(!config.policy.osv.local.background_sync);
+        assert!(config.policy.osv.local.background_sync);
         assert_eq!(
             config.policy.osv.local.sync_interval,
-            Duration::from_secs(6 * 60 * 60)
+            Duration::from_secs(60 * 60)
         );
+        assert!(config.metadata_cache.enabled);
+        assert_eq!(config.metadata_cache.capacity_bytes, 128 * 1024 * 1024);
+        assert_eq!(config.metadata_cache.max_entry_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.metadata_cache.ttl, Duration::from_secs(5 * 60));
+        assert_eq!(config.metadata_cache.fill_concurrency, 8);
         assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
         assert_eq!(
             config.upstreams.maven.repository_url,
@@ -703,9 +755,7 @@ policy:
         assert!(!config.policy.osv.block_malicious);
         assert!(config.policy.osv.block_vulnerabilities);
         assert_eq!(config.policy.osv.minimum_cvss_score, 0.0);
-        assert_eq!(config.policy.osv.source, OsvSource::Local);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
-        assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
     }
 
@@ -784,7 +834,6 @@ policy:
             r#"
 policy:
   osv:
-    source: local
     local:
       sqlite_path: "./data/osv-malicious.sqlite"
       max_staleness: "12h"
@@ -796,7 +845,6 @@ policy:
         )
         .unwrap();
 
-        assert_eq!(config.policy.osv.source, OsvSource::Local);
         assert_eq!(
             config.policy.osv.local.sqlite_path,
             PathBuf::from("./data/osv-malicious.sqlite")
@@ -829,6 +877,18 @@ policy:
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rejects_removed_live_osv_configuration() {
+        for raw in [
+            "policy:\n  osv:\n    source: live\n",
+            "policy:\n  osv:\n    source: local\n",
+            "policy:\n  osv:\n    api_url: https://api.osv.dev\n",
+        ] {
+            let error = load(raw).unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
     }
 
     #[test]
@@ -998,16 +1058,45 @@ policy:
     }
 
     #[test]
-    fn rejects_metadata_cache_config() {
-        let err = load(
+    fn metadata_cache_config_is_bounded_and_strict() {
+        let config = load(
             r#"
 metadata_cache:
-  enabled: true
+  enabled: false
+  capacity_bytes: 1048576
+  max_entry_bytes: 65536
+  ttl: 30s
+  fill_concurrency: 3
+"#,
+        )
+        .unwrap();
+        assert!(!config.metadata_cache.enabled);
+        assert_eq!(config.metadata_cache.capacity_bytes, 1_048_576);
+        assert_eq!(config.metadata_cache.max_entry_bytes, 65_536);
+        assert_eq!(config.metadata_cache.ttl, Duration::from_secs(30));
+        assert_eq!(config.metadata_cache.fill_concurrency, 3);
+
+        let error = load(
+            r#"
+metadata_cache:
   backend: cachebox
 "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("unknown field `metadata_cache`"));
+        assert!(error.to_string().contains("unknown field `backend`"));
+
+        for raw in [
+            "metadata_cache:\n  capacity_bytes: 0\n",
+            "metadata_cache:\n  capacity_bytes: 1024\n  max_entry_bytes: 2048\n",
+            "metadata_cache:\n  max_entry_bytes: 0\n",
+            "metadata_cache:\n  ttl: 0s\n",
+            "metadata_cache:\n  fill_concurrency: 0\n",
+        ] {
+            assert!(
+                load(raw).is_err(),
+                "configuration unexpectedly valid: {raw}"
+            );
+        }
     }
 
     #[test]
@@ -1212,10 +1301,6 @@ policy:
                 "upstreams:\n  pypi:\n    simple_url: https://pypi.example/simple?format=json\n",
                 "upstreams.pypi.simple_url",
             ),
-            (
-                "policy:\n  osv:\n    api_url: https://api.example/#fragment\n",
-                "policy.osv.api_url",
-            ),
         ] {
             let error = load(raw).unwrap_err();
             assert!(error.to_string().contains(field), "{error}");
@@ -1225,7 +1310,7 @@ policy:
     #[test]
     fn every_configured_http_endpoint_rejects_unsafe_url_components() {
         type Endpoint = (&'static str, fn(&mut Config) -> &mut String);
-        let endpoints: [Endpoint; 10] = [
+        let endpoints: [Endpoint; 9] = [
             ("server.public_base_url", |c| &mut c.server.public_base_url),
             ("upstreams.npm.registry_url", |c| {
                 &mut c.upstreams.npm.registry_url
@@ -1249,7 +1334,6 @@ policy:
             ("upstreams.maven.repository_url", |c| {
                 &mut c.upstreams.maven.repository_url
             }),
-            ("policy.osv.api_url", |c| &mut c.policy.osv.api_url),
         ];
         for (field, endpoint) in endpoints {
             for invalid in [
@@ -1284,9 +1368,6 @@ upstreams:
     registry_url: "http://127.0.0.1:4873/npm"
   pypi:
     simple_url: "http://packages.internal/pypi/simple"
-policy:
-  osv:
-    api_url: "http://osv.internal/api"
 "#,
         )
         .unwrap();
@@ -1301,12 +1382,11 @@ policy:
     #[test]
     fn rejects_unusable_http_destinations() {
         type Endpoint = (&'static str, fn(&mut Config) -> &mut String);
-        let endpoints: [Endpoint; 3] = [
+        let endpoints: [Endpoint; 2] = [
             ("server.public_base_url", |c| &mut c.server.public_base_url),
             ("upstreams.npm.registry_url", |c| {
                 &mut c.upstreams.npm.registry_url
             }),
-            ("policy.osv.api_url", |c| &mut c.policy.osv.api_url),
         ];
         for (field, endpoint) in endpoints {
             for invalid in [

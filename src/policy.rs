@@ -3,7 +3,57 @@ use crate::config::{AllowlistEntry, Config, MissingPublishTime, OsvErrorBehavior
 use crate::malicious::{MaliciousChecker, MaliciousHit};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::future::Future;
+
+tokio::task_local! {
+    static CACHE_METADATA: RefCell<PolicyCacheMetadata>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PolicyCacheMetadata {
+    pub valid_until: Option<DateTime<Utc>>,
+    pub cacheable: bool,
+}
+
+impl Default for PolicyCacheMetadata {
+    fn default() -> Self {
+        Self {
+            valid_until: None,
+            cacheable: true,
+        }
+    }
+}
+
+pub(crate) async fn capture_cache_metadata<F>(future: F) -> (F::Output, PolicyCacheMetadata)
+where
+    F: Future,
+{
+    CACHE_METADATA
+        .scope(RefCell::new(PolicyCacheMetadata::default()), async move {
+            let output = future.await;
+            let metadata = CACHE_METADATA.with(|value| *value.borrow());
+            (output, metadata)
+        })
+        .await
+}
+
+fn record_cache_valid_until(valid_until: DateTime<Utc>) {
+    let _ = CACHE_METADATA.try_with(|value| {
+        let mut value = value.borrow_mut();
+        if value
+            .valid_until
+            .is_none_or(|current| valid_until < current)
+        {
+            value.valid_until = Some(valid_until);
+        }
+    });
+}
+
+fn mark_policy_result_uncacheable() {
+    let _ = CACHE_METADATA.try_with(|value| value.borrow_mut().cacheable = false);
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
@@ -146,6 +196,7 @@ impl<'a> PolicyEngine<'a> {
                     }
                 }
                 Some(Err(err)) => {
+                    mark_policy_result_uncacheable();
                     if self.config.policy.osv.on_error == OsvErrorBehavior::Block {
                         let reason = self.osv_error_reason();
                         return blocked(
@@ -159,6 +210,7 @@ impl<'a> PolicyEngine<'a> {
                     }
                 }
                 None => {
+                    mark_policy_result_uncacheable();
                     if self.config.policy.osv.on_error == OsvErrorBehavior::Block {
                         let reason = self.osv_error_reason();
                         return blocked(
@@ -199,6 +251,7 @@ impl<'a> PolicyEngine<'a> {
             Some(published_at) => {
                 let eligible_at = published_at + minimum_age;
                 if eligible_at > now {
+                    record_cache_valid_until(eligible_at);
                     return blocked(
                         DecisionReason::TooYoung,
                         artifact,
@@ -425,10 +478,7 @@ mod tests {
         async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
-                return Err(MaliciousError::InvalidBatchResponse {
-                    expected: 1,
-                    actual: 0,
-                });
+                return Err(MaliciousError::LocalStore("fixture failure".to_string()));
             }
             Ok(self.hits.clone())
         }
@@ -474,6 +524,57 @@ mod tests {
         assert!(!decision.allowed);
         assert_eq!(decision.reason, DecisionReason::TooYoung);
         assert!(decision.eligible_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn cache_validity_ends_at_the_earliest_age_transition() {
+        let config = Config::default();
+        let checker = FakeChecker::clean();
+        let later = Artifact::package(
+            Ecosystem::Npm,
+            "later",
+            "1.0.0",
+            Some(now() - ChronoDuration::hours(12)),
+        );
+        let earlier = Artifact::package(
+            Ecosystem::Npm,
+            "earlier",
+            "1.0.0",
+            Some(now() - ChronoDuration::hours(24)),
+        );
+
+        let ((later_decision, earlier_decision), metadata) = capture_cache_metadata(async {
+            (
+                PolicyEngine::new(&config)
+                    .evaluate(&later, now(), &checker)
+                    .await,
+                PolicyEngine::new(&config)
+                    .evaluate(&earlier, now(), &checker)
+                    .await,
+            )
+        })
+        .await;
+
+        assert_eq!(later_decision.reason, DecisionReason::TooYoung);
+        assert_eq!(earlier_decision.reason, DecisionReason::TooYoung);
+        assert_eq!(metadata.valid_until, earlier_decision.eligible_at);
+        assert!(metadata.cacheable);
+    }
+
+    #[tokio::test]
+    async fn checker_failures_mark_policy_output_uncacheable() {
+        let mut config = Config::default();
+        config.policy.osv.on_error = OsvErrorBehavior::Allow;
+
+        let (decision, metadata) = capture_cache_metadata(PolicyEngine::new(&config).evaluate(
+            &old_artifact(),
+            now(),
+            &FakeChecker::failing(),
+        ))
+        .await;
+
+        assert!(decision.allowed);
+        assert!(!metadata.cacheable);
     }
 
     #[tokio::test]
@@ -705,7 +806,6 @@ mod tests {
                 minimum_age: Duration::from_secs(72 * 60 * 60),
                 osv: OsvConfig {
                     block_malicious: true,
-                    api_url: "https://api.osv.dev".to_string(),
                     on_error: OsvErrorBehavior::Block,
                     ..OsvConfig::default()
                 },
