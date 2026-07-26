@@ -5,6 +5,8 @@ source for GitHub release notes.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-26
+
 ### Added
 
 - Add a bounded in-process cache for complete policy-filtered metadata
@@ -12,6 +14,8 @@ source for GitHub release notes.
   weighted capacity, entry-size and TTL limits, and bounded distinct fills.
 - Add durable per-ecosystem OSV content revisions so a content-changing sync
   invalidates older filtered metadata on the next request.
+- Add automatic additive migration for existing SQLite stores and
+  cancellation-safe same-key cache fills.
 
 ### Changed
 
@@ -19,11 +23,16 @@ source for GitHub release notes.
   its default successful-cycle interval from six hours to one hour.
 - Keep transient OSV checker/revision failures bounded but non-retained, and
   expire cached filtering output at package-age eligibility transitions.
+- Rewrite the README and public documentation around current operator tasks,
+  configuration, protocol behavior, and support boundaries.
 
 ### Removed
 
 - Remove live OSV request-path evaluation and its configuration. Synchronized
   local SQLite data is now the only OSV policy source.
+- Remove the public Rust live-query client and source-selection types. Existing
+  `policy.osv.source` and `policy.osv.api_url` keys now fail strict
+  configuration validation.
 
 ## [0.8.0] - 2026-07-12
 
