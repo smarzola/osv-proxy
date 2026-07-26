@@ -25,10 +25,10 @@ The implemented product provides:
 - exact-version and whole-package manual blocklists;
 - a second policy check on direct artifact routes;
 - HTTP redirect and plain streaming proxy artifact behavior;
-- live OSV API evaluation with bounded, deduplicated detail hydration as an
-  explicit opt-in;
-- generation-scoped local SQLite OSV evaluation with no OSV request on the
-  install path;
+- generation-scoped local SQLite OSV evaluation with automatic hourly
+  synchronization and no OSV request on the install path;
+- bounded revision-aware caching of complete policy-filtered metadata
+  responses;
 - strict YAML configuration and structured JSON decisions.
 
 Default security posture:
@@ -41,13 +41,19 @@ policy:
     block_malicious: true
     block_vulnerabilities: true
     minimum_cvss_score: 0
-    source: local
     on_error: block
     local:
       sqlite_path: "./data/osv-malicious.sqlite"
       max_staleness: "24h"
       on_stale: block
-      background_sync: false
+      background_sync: true
+      sync_interval: "1h"
+metadata_cache:
+  enabled: true
+  capacity_bytes: 134217728
+  max_entry_bytes: 16777216
+  ttl: "5m"
+  fill_concurrency: 8
 artifacts:
   behavior: redirect
 ```
@@ -63,20 +69,23 @@ explicit, and requires a reason.
 - Redirected artifact URLs remain owned by `osv-proxy` until the second check.
 - A denied proxy-mode artifact is rejected before upstream package bytes are
   fetched.
-- Live OSV failures and malformed recognized vectors follow `on_error`.
+- Local OSV failures and malformed recognized vectors follow `on_error`.
 - Local vulnerability checks require a complete active dataset generation.
 - Raw OSV advisory retention is opt-in.
+- Content-changing sync commits invalidate older filtered metadata through a
+  durable ecosystem revision.
+- Artifact routes never use the metadata cache and always recheck policy.
 
 ## Implementation
 
 The current implementation uses Axum/Tokio, Reqwest, Serde, Rusqlite,
-`polycvss`, and ecosystem-specific version parsers. External OSV and registry
+`polycvss`, and ecosystem-specific version parsers. OSV dump and registry
 access remains behind injectable interfaces so policy and adapters can be
 tested hermetically.
 
 ## Future Work
 
-Metadata caching with cachebox, S3-compatible artifact caching,
-MongoDB-compatible advisory storage, authentication/publishing controls,
-license policy, and a structured audit-log sink are possible future features.
-They are not current product capabilities or accepted configuration modes.
+S3-compatible artifact caching, MongoDB-compatible advisory storage,
+authentication/publishing controls, license policy, and a structured audit-log
+sink are possible future features. They are not current product capabilities
+or accepted configuration modes.

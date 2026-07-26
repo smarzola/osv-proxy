@@ -95,15 +95,7 @@ Manual block:
 
 Liveness remains available when the ingress budget is saturated.
 
-`GET /readyz` reports whether the configured OSV policy source is ready. Live
-mode is ready after validated startup because request failures still follow
-`policy.osv.on_error`:
-
-```json
-{"ready":true,"osv_source":"live"}
-```
-
-Local mode reports all seven supported ecosystem datasets. Readiness requires
+`GET /readyz` reports all seven supported ecosystem datasets. Readiness requires
 each active generation to be healthy, complete when vulnerability blocking is
 enabled, and within the configured staleness policy. An unready report returns
 HTTP 503; a ready report returns 200.
@@ -128,6 +120,20 @@ local SQLite evaluation.
 
 The real response contains one entry for every supported ecosystem; the example
 is shortened for readability.
+
+## Metadata Cache
+
+Supported policy-filtered metadata GET routes cache the complete response. The
+cache key includes exact path/query, material representation and conditional
+headers, and the ecosystem's committed OSV content revision. Identical misses
+coalesce; distinct fills are bounded. Transient checker/revision failures,
+non-200 responses, overloads, and oversized bodies are not retained.
+
+Static discovery/configuration routes and every artifact route remain uncached.
+Artifact delivery rebuilds the exact canonical artifact and evaluates current
+policy before redirecting or proxying bytes. A content-changing OSV sync
+advances the revision transactionally, making older metadata entries
+unreachable on the next request.
 
 SIGINT and SIGTERM stop accepting new connections and allow in-flight requests
 and artifact streams 30 seconds to drain. After that opportunity, remaining

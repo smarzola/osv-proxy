@@ -4,12 +4,17 @@
 
 The current implementation blocks active OSV vulnerabilities by default across
 npm, PyPI, Cargo, Go, NuGet, and RubyGems. It supports inclusive CVSS thresholds,
-unscored and malformed-severity behavior, bounded live detail hydration, and a
-generation-scoped all-advisory SQLite store. `osv sync` is canonical;
+unscored and malformed-severity behavior, and a generation-scoped all-advisory
+SQLite store with transactional content revisions. `osv sync` is canonical;
 `malicious sync` is retained as an alias. See [policy](policy.md) and
 [OSV advisory data](osv-data.md).
 
 Maven is supported by the same policy and local advisory store.
+
+Complete policy-filtered metadata responses are cached in process with bounded
+weighted capacity, entry size, TTL, singleflight, and unique-fill concurrency.
+Content-changing OSV syncs invalidate older representations through the
+ecosystem revision. Direct artifacts remain uncached and recheck policy.
 
 Cargo/crates.io sparse replacement filters index records, rechecks policy at
 artifact delivery, and supports redirect or proxy artifact behavior.
@@ -23,7 +28,7 @@ rechecks POMs, JARs, Gradle module metadata, classifiers, signatures, and
 checksums. Snapshots, authentication, publishing, search, and repository
 aggregation are outside the supported surface.
 
-## First End-to-End Target
+## Historical First End-to-End Target
 
 1. Rust binary
 2. YAML config
@@ -35,9 +40,9 @@ aggregation are outside the supported surface.
 8. `MAL-*` block
 9. exact allowlist
 
-Then add PyPI, local malicious mode, metadata cache, and S3 artifact cache
-mode. MongoDB-compatible malicious storage remains a possible future backend if
-SQLite is not enough.
+PyPI, local SQLite OSV policy, in-process metadata caching, and plain artifact
+proxying were subsequently added. S3 artifact caching and MongoDB-compatible
+storage remain possible future work.
 
 ## Milestone 1: Config and Policy Engine
 
@@ -61,11 +66,11 @@ Acceptance tests:
 - manual blocklist blocks package
 - malicious bypass flag is parsed but not yet wired
 
-## Milestone 2: OSV Naive Mode
+## Milestone 2: Historical Remote Query Mode
 
 Build:
 
-- OSV API client
+- remote advisory query client
 - query single package/version
 - filter `MAL-*` records
 - wire malicious check into policy engine
@@ -74,7 +79,7 @@ Acceptance tests:
 
 - `MAL-*` result blocks package
 - non-`MAL` advisory does not block package
-- OSV API failure follows `policy.osv.on_error`
+- remote query failure follows `policy.osv.on_error`
 - `allowlist.bypass_osv=true` allows exact package version
 
 ## Milestone 3: npm Metadata and Redirect
@@ -144,29 +149,31 @@ Acceptance tests:
 
 - sync stores `MAL` records
 - lookup finds malicious package by ecosystem/name/version
-- local mode does not call OSV API during request handling
+- local policy performs no advisory-network call during request handling
 - exact affected versions and OSV range events are evaluated locally
 - stale, missing, corrupt, or unhealthy local data fails closed by default
 
 Status: implemented with SQLite. MongoDB-compatible and mongolino storage remain
 future options if still desired.
 
-## Milestone 6: cachebox Metadata Cache
+## Milestone 6: In-Process Filtered Metadata Cache
 
 Build:
 
-- `NoopMetadataCache`
-- `CacheboxMetadataCache`
-- cache config
-- raw metadata caching
+- one process-local cache in application state
+- complete filtered immutable responses
+- weighted LRU capacity, maximum entry size, TTL, and bounded fills
+- durable OSV revision and representation-aware keys
 
 Acceptance tests:
 
-- disabled cache always fetches upstream
-- enabled cache uses cachebox
-- policy applies after cache read
-- updated malicious store blocks package even when metadata is cached
-- no memory metadata cache implementation exists
+- disabled cache always executes the complete route
+- hits skip upstream fetch, policy evaluation, filtering, and serialization
+- identical misses coalesce and distinct fills remain bounded
+- updated OSV content invalidates older filtered metadata immediately
+- artifact routes remain uncached and recheck current policy
+
+Status: implemented.
 
 ## Milestone 7: Plain Artifact Proxy Mode
 

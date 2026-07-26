@@ -6,6 +6,12 @@ limits:
   egress_requests: 32
   background_sync_requests: 4
   queue_timeout: "2s"
+metadata_cache:
+  enabled: true
+  capacity_bytes: 134217728
+  max_entry_bytes: 16777216
+  ttl: "5m"
+  fill_concurrency: 8
 upstreams:
   cargo:
     sparse_index_url: "https://index.crates.io"

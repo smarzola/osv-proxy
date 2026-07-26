@@ -4,8 +4,8 @@
 
 - `/healthz` reports dependency-free process liveness and remains outside the
   ingress admission budget.
-- `/readyz` reports live/local OSV readiness and per-ecosystem local dataset
-  health; it is bounded by ingress admission.
+- `/readyz` reports per-ecosystem local OSV dataset health and is bounded by
+  ingress admission.
 - Startup warns when the resolved listener is non-loopback.
 - Startup, background sync outcomes, forced-drain timeout, and signal setup
   failures emit plain-text process messages.
@@ -67,8 +67,6 @@ Each blocked decision should log:
 - `osv_proxy_policy_decisions_total`
 - `osv_proxy_blocked_total`
 - `osv_proxy_blocked_by_reason_total`
-- `osv_proxy_osv_api_requests_total`
-- `osv_proxy_osv_api_errors_total`
 - `osv_proxy_metadata_cache_hits_total`
 - `osv_proxy_metadata_cache_misses_total`
 - `osv_proxy_artifact_cache_hits_total`

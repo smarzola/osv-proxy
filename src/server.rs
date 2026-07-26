@@ -3697,6 +3697,107 @@ INSERT INTO advisories (
     }
 
     #[tokio::test]
+    async fn committed_osv_revision_invalidates_cached_metadata() {
+        let directory = tempdir().unwrap();
+        let local = LocalOsvConfig {
+            sqlite_path: directory.path().join("osv.sqlite"),
+            background_sync: false,
+            ..LocalOsvConfig::default()
+        };
+        let bootstrap = FixtureDumpClient::new([(all_zip_url("npm"), zip_bytes([]))]);
+        let report = sync_osv_ecosystems(&local, &bootstrap, &[Ecosystem::Npm])
+            .await
+            .unwrap();
+        assert!(report.is_success());
+
+        let metadata_body = npm_demo_metadata().to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            metadata_body.len(),
+            metadata_body
+        );
+        let (registry_url, requests, upstream) =
+            serve_http_repeated(response, Duration::ZERO).await;
+        let mut config = Config::default();
+        config.policy.osv.local = local.clone();
+        config.upstreams.npm.registry_url = registry_url;
+        let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
+        let checker = Arc::new(SqliteMaliciousChecker::new(&local));
+        let initial_revision = checker.content_revision(Ecosystem::Npm).await.unwrap();
+        let state = Arc::new(AppState::new(
+            config,
+            checker.clone(),
+            budgets,
+            RuntimeControl::default(),
+        ));
+
+        let first = registry_handler(
+            State(Arc::clone(&state)),
+            Method::GET,
+            Uri::from_static("/npm/demo"),
+            HeaderMap::new(),
+        )
+        .await;
+        let first: Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(first["versions"].get("1.0.1").is_some());
+
+        let cached = registry_handler(
+            State(Arc::clone(&state)),
+            Method::GET,
+            Uri::from_static("/npm/demo"),
+            HeaderMap::new(),
+        )
+        .await;
+        let cached: Value = serde_json::from_slice(
+            &axum::body::to_bytes(cached.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(cached["versions"].get("1.0.1").is_some());
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+
+        let osv_id = "MAL-2026-CACHE";
+        let advisory = advisory_json(osv_id, "npm", "demo", "1.0.1");
+        let incremental = FixtureDumpClient::new([
+            (
+                format!("{OSV_DUMP_BASE_URL}/npm/modified_id.csv"),
+                format!("2026-07-02T00:00:00Z,{osv_id}\n").into_bytes(),
+            ),
+            (format!("{OSV_DUMP_BASE_URL}/npm/{osv_id}.json"), advisory),
+        ]);
+        let report = sync_osv_ecosystems(&local, &incremental, &[Ecosystem::Npm])
+            .await
+            .unwrap();
+        assert!(report.is_success());
+        let changed_revision = checker.content_revision(Ecosystem::Npm).await.unwrap();
+        assert!(changed_revision > initial_revision);
+
+        let invalidated = registry_handler(
+            State(state),
+            Method::GET,
+            Uri::from_static("/npm/demo"),
+            HeaderMap::new(),
+        )
+        .await;
+        let invalidated: Value = serde_json::from_slice(
+            &axum::body::to_bytes(invalidated.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(invalidated["versions"].get("1.0.0").is_some());
+        assert!(invalidated["versions"].get("1.0.1").is_none());
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 2);
+        upstream.abort();
+    }
+
+    #[tokio::test]
     async fn router_streams_npm_artifact_proxy_response() {
         let (artifact_base_url, artifact_request) = serve_http_once(
             "HTTP/1.1 200 OK\r\n\
@@ -3837,7 +3938,7 @@ INSERT INTO advisories (
                 let captured = Arc::clone(&captured);
                 tokio::spawn(async move {
                     let mut buffer = [0_u8; 4096];
-                    stream.read(&mut buffer).await.unwrap();
+                    let _ = stream.read(&mut buffer).await.unwrap();
                     captured.fetch_add(1, AtomicOrdering::SeqCst);
                     tokio::time::sleep(delay).await;
                     stream.write_all(response.as_bytes()).await.unwrap();

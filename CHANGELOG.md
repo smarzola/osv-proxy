@@ -5,6 +5,26 @@ source for GitHub release notes.
 
 ## [Unreleased]
 
+### Added
+
+- Add a bounded in-process cache for complete policy-filtered metadata
+  responses, with immutable shared bytes, singleflight, O(1) LRU operations,
+  weighted capacity, entry-size and TTL limits, and bounded distinct fills.
+- Add durable per-ecosystem OSV content revisions so a content-changing sync
+  invalidates older filtered metadata on the next request.
+
+### Changed
+
+- Enable serving-process OSV background synchronization by default and change
+  its default successful-cycle interval from six hours to one hour.
+- Keep transient OSV checker/revision failures bounded but non-retained, and
+  expire cached filtering output at package-age eligibility transitions.
+
+### Removed
+
+- Remove live OSV request-path evaluation and its configuration. Synchronized
+  local SQLite data is now the only OSV policy source.
+
 ## [0.8.0] - 2026-07-12
 
 ### Changed

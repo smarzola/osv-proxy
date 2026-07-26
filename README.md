@@ -38,14 +38,13 @@ Implemented now:
 - YAML config loading and validation.
 - `serve`, `check`, `eval`, `config validate`, `osv sync`, and the compatibility
   `malicious sync` commands.
-- Live OSV API checks during request handling.
-- Local SQLite OSV advisory checks with explicit and background OSV dump
-  sync.
+- Local SQLite OSV advisory checks with explicit or automatic hourly OSV dump
+  synchronization and no OSV query API dependency on the install path.
+- Bounded in-process caching of complete policy-filtered metadata responses.
 - Redirect artifact behavior and plain artifact proxy behavior.
 
 Not implemented yet:
 
-- Metadata caching.
 - S3 artifact caching.
 - Authentication, publishing, license policy, or
   broad package scanning.
@@ -212,6 +211,12 @@ The default config is intentionally small:
 server:
   bind: "127.0.0.1:8080"
   public_base_url: "http://127.0.0.1:8080"
+metadata_cache:
+  enabled: true
+  capacity_bytes: 134217728
+  max_entry_bytes: 16777216
+  ttl: "5m"
+  fill_concurrency: 8
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
@@ -219,21 +224,20 @@ policy:
     block_malicious: true
     block_vulnerabilities: true
     minimum_cvss_score: 0
-    source: local
     on_error: "block"
     local:
       sqlite_path: "./data/osv-malicious.sqlite"
       max_staleness: "24h"
       on_stale: block
-      background_sync: false
+      background_sync: true
+      sync_interval: "1h"
 artifacts:
   behavior: redirect
 ```
 
 The npm registry, PyPI Simple API, Go module proxy, NuGet service index,
-RubyGems registry, Maven Central repository, and OSV API default to their public URLs.
-Set `upstreams` or `policy.osv.api_url` only when using a mirror, fixture, or
-private gateway.
+RubyGems registry, and Maven Central repository default to their public URLs.
+Set `upstreams` only when using a mirror, fixture, or private gateway.
 
 For a shared or non-loopback deployment, place `osv-proxy` behind a trusted
 gateway or reverse proxy that provides TLS, authentication, client rate
@@ -244,14 +248,9 @@ the runtime limits and readiness contract.
 
 ### OSV Data Source
 
-`policy.osv.source: local` is the default. Local mode reads synchronized SQLite
-advisory data during metadata filtering, artifact serving, `check`, and `eval`;
-it makes no OSV network request on the install path.
-
-`policy.osv.source: live` is an explicit opt-in for deployments that prefer
-fresh remote OSV queries over a preseeded local dataset. Live mode calls the OSV
-API during policy evaluation and remains bounded by the process egress budget.
-Populate or refresh the local database with:
+Synchronized local SQLite data is the only OSV policy source. Metadata
+filtering, artifact serving, `check`, and `eval` make no OSV query API request.
+Populate or refresh the database explicitly with:
 
 ```sh
 osv-proxy osv sync --config /path/to/osv-proxy.yaml
@@ -265,15 +264,14 @@ policy:
     block_malicious: true
     block_vulnerabilities: true
     minimum_cvss_score: 0
-    source: local
     on_error: block
     local:
       sqlite_path: "./data/osv-malicious.sqlite"
       max_staleness: "24h"
       on_stale: block
       retain_raw_advisories: false
-      background_sync: false
-      sync_interval: "6h"
+      background_sync: true
+      sync_interval: "1h"
 ```
 
 `on_error: block` and `on_stale: block` fail closed by default. Missing,
@@ -282,16 +280,34 @@ silently allowing installs. `background_sync: true` runs an immediate sync in
 the background and repeats it after `sync_interval`; a valid non-stale database
 remains available while it refreshes. Missing or stale data keeps readiness and
 default fail-closed policy checks unavailable until synchronization succeeds.
-With `background_sync: false`, no automatic OSV sync runs at boot.
+Automatic sync is enabled by default with a one-hour interval. Set
+`background_sync: false` when an external deployment step owns synchronization.
 `retain_raw_advisories` defaults to false so the SQLite database stores compact
 normalized lookup data by default; set it to true only when you need raw OSV
 advisory JSON for audit or debugging.
 
 For fast boot, run `osv sync` in CI or an init/deployment step and ship the
 completed SQLite file with the service. A preseeded, non-stale database is ready
-immediately; enable `background_sync` when automatic refresh at process start
-is desired. Do not place a live, actively-updated SQLite file in an image
+immediately and the default background task refreshes it without replacing the
+last good snapshot. Do not place an actively updated SQLite file in an image
 layer; preseed a complete file, then refresh it outside the serving process.
+
+### Metadata Cache
+
+Supported metadata GET routes cache the complete response after parsing,
+policy evaluation, filtering, URL rewriting, and serialization. Identical
+misses share one fill, while distinct fills are concurrency-bounded. The
+default weighted capacity is 128 MiB, maximum entry size is 16 MiB, and TTL is
+five minutes. These values bound cache accounting, not total process RSS.
+
+With OSV blocking enabled, every cache lookup reads the ecosystem's durable
+SQLite content revision. A sync that changes advisory content commits a new
+revision atomically, so the next request cannot use a response produced from
+the previous data. An entry also expires at the earliest package-age
+eligibility transition it contains.
+Transient policy/checker failures, unsuccessful responses, overloads, and
+oversized entries are not retained. Direct artifact routes are never cached
+and continue to evaluate current policy before redirecting or fetching bytes.
 
 ## Performance
 
@@ -300,9 +316,8 @@ the measured p50 overhead was about 2–7 ms for representative npm, Go, and
 Cargo routes, with higher-cardinality NuGet, RubyGems, PyPI, and Maven routes
 adding more. A full local database is about 195 MiB and a fresh sync takes
 about 21 seconds with roughly 221 MiB peak RSS on the reference machine.
-
-Live mode is substantially slower because it waits on remote OSV batch queries;
-large metadata requests can take several seconds.
+Repeated supported metadata requests can skip the complete upstream
+fetch/parse/policy/filter/serialize path through the bounded in-process cache.
 For the complete matrix, resource measurements, and fast-boot deployment
 patterns, see [Performance and fast boot](docs/performance.md).
 

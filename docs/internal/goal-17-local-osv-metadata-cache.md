@@ -346,7 +346,27 @@ cargo run --locked -- config validate --config examples/basic/osv-proxy.yaml
 git diff --check
 ```
 
-Status: Not started.
+Status: Completed on 2026-07-26. Added a hermetic production-path integration
+test that bootstraps a healthy npm SQLite generation, caches allowed metadata,
+commits a new `MAL-*` advisory through the real incremental sync path, observes
+the durable revision advance, and proves the next request refetches and removes
+the newly blocked version.
+
+Updated README, configuration, architecture, performance, policy, OSV-data,
+product, registry-behavior, observability, mongolino, milestone, example, and
+changelog contracts for local-only OSV policy, enabled hourly synchronization,
+and bounded complete filtered-response caching. Released changelog history and
+historical internal goal records remain unchanged where rewriting them would
+misstate shipped or prior scope.
+
+Verification passed with `cargo fmt --check`,
+`cargo clippy --all-targets --all-features --locked -- -D warnings`,
+`cargo test --locked --lib` (309 tests),
+`cargo test --locked --test workflow_reproducibility` (1 test),
+`cargo test --locked --test package_manager_e2e` (14 tests),
+example configuration validation, and `git diff --check`. No repository-root
+SQLite or sync-lock artifacts were left behind. The persistent adversarial
+reviewer returned `CLEAN`.
 
 ## Final Verification
 

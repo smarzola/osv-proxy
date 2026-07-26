@@ -159,17 +159,21 @@ Malformed recognized vectors follow `on_error`. Set
 `block_vulnerabilities: false` to preserve malicious-only behavior without
 vulnerability detail hydration.
 
-`on_error` applies to checker failures, missing batch results, pagination
-failures, and malformed recognized severity vectors. With `block`, policy emits
+`on_error` applies to local checker failures, missing batch results, and
+malformed recognized severity vectors. With `block`, policy emits
 an OSV error decision; with `allow`, that error does not itself block. This is
 separate from a valid OSV finding: a matching finding is evaluated by its
 classification and threshold even when other advisory lookups fail.
 
-OSV is checked during policy evaluation. Local SQLite data is the default
-source and makes no OSV network request on the install path. Set
-`policy.osv.source: live` to query the remote API instead. The default live API
-URL is `https://api.osv.dev`; override `policy.osv.api_url` only when routing
-through a mirror, fixture, or private gateway.
+OSV is checked during policy evaluation from synchronized local SQLite data.
+The install path makes no OSV network request. Remote data is consumed only by
+explicit or background dump synchronization.
+
+Policy-filtered metadata may be retained in the bounded process cache.
+Content-changing syncs atomically advance the ecosystem revision used in cache
+identity, and package-age transitions shorten entry lifetime. Checker or
+revision failures use bounded singleflight but are never retained. Direct
+artifact routes always evaluate current policy again.
 
 ## Manual Blocklist
 

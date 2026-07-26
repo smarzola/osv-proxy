@@ -1,9 +1,8 @@
 # Performance and Fast Boot
 
-`osv-proxy` defaults to local SQLite OSV evaluation because the install path is
-then bounded by the local process and registry upstream, rather than by a
-remote OSV query and advisory-detail fan-out. Live mode remains available as an
-explicit opt-in when remote freshness is preferred over predictable latency.
+`osv-proxy` uses local SQLite OSV evaluation so the install path is bounded by
+the local process and registry upstream. OSV network access occurs during
+explicit or background synchronization, not package requests.
 
 This page records representative measurements and the operational choices that
 matter most for startup and request latency.
@@ -11,8 +10,8 @@ matter most for startup and request latency.
 ## Baseline
 
 Measurements below were captured on 2026-07-12 on a macOS arm64 development
-machine. Registry and OSV network timings are observations, not service-level
-guarantees; public upstream load and cache state will move them around.
+machine. Registry timings are observations, not service-level guarantees;
+public upstream load and cache state will move them around.
 
 The local-vs-policy-off measurements use the same proxy routes and registry
 upstreams. `policy-off` disables both OSV checks; `local` uses the synchronized
@@ -40,21 +39,24 @@ the number of versions that must be evaluated. Small metadata documents add
 only a few milliseconds; high-cardinality responses require more parsing and
 policy evaluation work.
 
-### Live mode
+### Filtered metadata cache
 
-Live OSV is dominated by the remote API rather than local computation. The
-client respects the OSV API's 1,000-query `/v1/querybatch` limit, splits larger
-requests into bounded concurrent chunks, and hydrates advisory details with
-bounded concurrency. Representative requests produced:
+The table above predates the in-process metadata cache and describes cold
+route work. Supported metadata GET routes now retain the complete filtered
+HTTP representation. A hit skips the upstream fetch, parsing, SQLite policy
+checks, filtering, and serialization. No cache-hit latency or throughput
+number is claimed here until the benchmark matrix is rerun.
 
-- React: HTTP 200, 2,808 versions preserved, 4.77 s.
-- TypeScript: HTTP 200, 3,763 versions preserved, 4.10 s.
-
-For packages below the limit, observed OSV batch time was roughly 1.4–4.8 s;
-advisory-detail hydration added roughly 0.2–0.36 s for the representative
-packages. Live mode has no metadata or detail cache yet.
+Cache lookup and LRU maintenance are O(1). The default weighted capacity is
+128 MiB, maximum body size is 16 MiB, TTL is five minutes, and at most eight
+distinct fills run concurrently. This accounting does not include every
+allocator/runtime overhead and therefore is not a process-RSS ceiling.
 
 ### Process and sync footprint
+
+These measurements also predate the in-process metadata cache. They remain
+cold-path and synchronization reference points, not current steady-state cache
+footprint measurements.
 
 | Measurement | Result |
 | --- | ---: |
@@ -99,7 +101,6 @@ for deterministic startup:
 ```yaml
 policy:
   osv:
-    source: local
     block_malicious: true
     block_vulnerabilities: true
     on_error: block
@@ -108,7 +109,7 @@ policy:
       max_staleness: "24h"
       on_stale: block
       background_sync: false
-      sync_interval: "6h"
+      sync_interval: "1h"
 ```
 
 Recommended preseed patterns:
@@ -120,7 +121,7 @@ Recommended preseed patterns:
 - In CI, sync and validate the database once, then publish the binary, config,
   and database as one deployment artifact.
 
-`/healthz` only reports process liveness. For local mode, `/readyz` verifies
+`/healthz` only reports process liveness. `/readyz` verifies
 that every supported ecosystem has a healthy, complete, non-stale active
 generation. With the default `on_stale: block`, missing, incomplete, unhealthy,
 or stale data makes readiness false and keeps policy checks fail-closed.
@@ -143,28 +144,14 @@ the sync to completion, close the sync process, and then ship the resulting
 database. The normal WAL/generation implementation already lets clients read
 the last good snapshot while a sync transaction is in progress.
 
-## Choosing the source
+## Choosing synchronization ownership
 
-Use the default local source when you need predictable request latency,
-network-independent policy enforcement, or fast repeated installs:
+The default serving process starts an immediate background sync and repeats
+successful cycles hourly. Keep that default when the process should own data
+freshness. Set `background_sync: false` only when CI, an init job, or another
+deployment component reliably runs `osv sync`.
 
-```yaml
-policy:
-  osv:
-    source: local
-```
-
-Opt into live mode when remote OSV freshness is more important than latency and
-the deployment can tolerate multi-second metadata checks:
-
-```yaml
-policy:
-  osv:
-    source: live
-    api_url: "https://api.osv.dev"
-```
-
-For either source, keep `on_error: block` unless the deployment has an explicit
-fail-open risk decision. Local mode still requires regular synchronization;
-configure `max_staleness` and an update schedule that match the deployment's
-freshness requirements.
+Keep `on_error: block` unless the deployment has an explicit fail-open risk
+decision. Configure `max_staleness` and the update schedule to match the
+deployment's freshness requirements. Content-changing syncs atomically advance
+the cache revision; no-op or failed syncs do not.

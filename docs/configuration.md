@@ -19,6 +19,12 @@ limits:
   egress_requests: 32
   background_sync_requests: 4
   queue_timeout: "2s"
+metadata_cache:
+  enabled: true
+  capacity_bytes: 134217728
+  max_entry_bytes: 16777216
+  ttl: "5m"
+  fill_concurrency: 8
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
@@ -26,14 +32,14 @@ policy:
     block_malicious: true
     block_vulnerabilities: true
     minimum_cvss_score: 0
-    source: local
     on_error: "block"
     local:
       sqlite_path: "./data/osv-malicious.sqlite"
       max_staleness: "24h"
       on_stale: block
       retain_raw_advisories: false
-      background_sync: false
+      background_sync: true
+      sync_interval: "1h"
 artifacts:
   behavior: redirect
   trusted_origins: []
@@ -45,8 +51,8 @@ Validate it with:
 cargo run -- config validate --config examples/basic/osv-proxy.yaml
 ```
 
-The npm registry, PyPI Simple API, Go module proxy, NuGet service index,
-RubyGems registry, and OSV API default to their public URLs.
+The npm registry, PyPI Simple API, Go module proxy, NuGet service index, and
+RubyGems registry default to their public URLs.
 Maven defaults to Maven Central at `https://repo.maven.apache.org/maven2`.
 Configure them only when routing through a mirror, fixture, or private gateway.
 
@@ -63,7 +69,7 @@ server:
   metadata and artifact links.
 
 `bind` accepts numeric IPv4, bracketed IPv6, or an ASCII DNS hostname plus a
-port. `public_base_url`, every upstream URL, and `policy.osv.api_url` must use
+port. `public_base_url` and every upstream URL must use
 HTTP or HTTPS, include a host, and contain no credentials, query, or fragment.
 Advertised and outbound URLs reject unspecified addresses (`0.0.0.0` and
 `[::]`) and explicit port zero because clients cannot use those destinations.
@@ -90,7 +96,7 @@ limits:
   immediately. Dependency-free `/healthz` remains outside admission so a
   saturated process can still report liveness.
 - `egress_requests`: aggregate install-path outbound request limit shared by
-  registry metadata, live OSV, and artifact delivery. Permits are retained
+  registry metadata and artifact delivery. Permits are retained
   until buffered or streamed response bodies finish.
 - `background_sync_requests`: separate outbound limit for OSV dump sync, so
   synchronization cannot consume install-path egress capacity.
@@ -102,6 +108,41 @@ limits:
 
 All limits must be greater than zero. Existing adapter-local fan-out caps remain
 in effect inside the aggregate process budget.
+
+## Metadata Cache
+
+```yaml
+metadata_cache:
+  enabled: true
+  capacity_bytes: 134217728
+  max_entry_bytes: 16777216
+  ttl: "5m"
+  fill_concurrency: 8
+```
+
+- `enabled`: enables the process-local cache. Defaults to true.
+- `capacity_bytes`: weighted capacity across keys, headers, and response
+  bodies. Defaults to 128 MiB, accepts 1 byte through 4 GiB, and is not a hard
+  process-RSS limit.
+- `max_entry_bytes`: maximum response body retained. Defaults to 16 MiB and
+  accepts 1 byte through 128 MiB; it must not exceed `capacity_bytes`.
+- `ttl`: maximum entry lifetime. Defaults to `5m`; a package-age transition
+  can expire an entry sooner. It must be greater than zero and at most `24h`.
+- `fill_concurrency`: maximum distinct complete metadata fills running at
+  once. Identical misses share one fill. Defaults to 8 and accepts 1 through
+  1024.
+
+Only supported policy-filtered metadata GET routes are admitted. Static
+discovery/configuration responses and direct artifact routes are excluded.
+The key includes the exact path/query, ecosystem OSV content revision, and
+material request headers. Content-changing sync commits advance that revision,
+so old policy output cannot be returned after the commit. Transient policy or
+revision failures still use bounded singleflight but are not retained.
+
+The admitted route classes are npm package metadata, PyPI project pages, Cargo
+sparse records, Go list/latest/info responses, NuGet registration and
+flat-container version indexes, RubyGems compact info, and Maven metadata
+(including its checksum forms).
 
 ## Upstreams
 
@@ -174,7 +215,6 @@ policy:
   missing_publish_time: "block"
   osv:
     block_malicious: true
-    source: local
     on_error: "block"
 ```
 
@@ -190,34 +230,16 @@ policy:
   advisory blocks when its highest applicable base score is greater than or
   equal to this value. At the default zero, matching advisories without a score
   also block; at a positive threshold they do not.
-- `osv.source`: `local` or `live`. Defaults to `local`. Local mode uses the
-  synchronized SQLite dataset and makes no OSV request during install-path
-  policy evaluation. Live mode is an explicit remote-query opt-in.
 - `osv.on_error`: `block` fails closed; `allow` fails open when the OSV check
   fails or a required OSV result is missing.
-- `osv.api_url`: optional OSV API base URL override. Omit it to use
-  `https://api.osv.dev`. Used only by live checks.
 
 `MAL-*` records are always classified as malicious, independently of CVSS.
 Other OSV IDs are classified as vulnerabilities. Malformed recognized CVSS
 vectors follow `osv.on_error`; unknown severity types are unscored.
 
-### Live OSV Mode
+### Local SQLite OSV Data
 
-Live mode is an explicit opt-in and calls the OSV API while handling install
-requests:
-
-```yaml
-policy:
-  osv:
-    source: live
-    api_url: "https://api.osv.dev"
-    on_error: block
-```
-
-### Local SQLite OSV Mode
-
-Local mode evaluates synchronized SQLite data and makes no OSV network calls
+OSV policy evaluates synchronized SQLite data and makes no OSV network calls
 during install request handling:
 
 ```yaml
@@ -226,19 +248,18 @@ policy:
     block_malicious: true
     block_vulnerabilities: true
     minimum_cvss_score: 0
-    source: local
     on_error: block
     local:
       sqlite_path: "./osv-malicious.sqlite"
       max_staleness: "24h"
       on_stale: block
       retain_raw_advisories: false
-      background_sync: false
-      sync_interval: "6h"
+      background_sync: true
+      sync_interval: "1h"
 ```
 
-The local source is the default. A configuration may omit `source` and still
-use local SQLite, but keeping it explicit makes deployment intent clearer.
+Local SQLite is the only OSV policy source. Remote request-path queries are not
+supported, and unknown keys are rejected.
 
 - `local.sqlite_path`: SQLite database path for synchronized OSV advisory
   records. Defaults to `osv-malicious.sqlite` for compatibility.
@@ -254,9 +275,9 @@ use local SQLite, but keeping it explicit makes deployment intent clearer.
   database is updated incrementally; missing or incomplete data is bootstrapped
   from the full OSV archive. Successful cycles repeat after `sync_interval`;
   failed ecosystems retry independently with exponential backoff starting at 5
-  seconds and capped at 5 minutes.
+  seconds and capped at 5 minutes. Defaults to true.
 - `local.sync_interval`: background sync interval. It must be between `60s` and
-  `7d`; defaults to `6h`.
+  `7d`; defaults to `1h`.
 
 Populate or refresh the SQLite database explicitly with:
 
