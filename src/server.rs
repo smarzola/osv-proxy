@@ -1,6 +1,6 @@
 use crate::artifacts::{ArtifactDeliveryClient, ArtifactDeliveryOptions};
 use crate::cargo::{self, CargoRegistryClient};
-use crate::config::{Config, LocalOsvConfig, OsvSource};
+use crate::config::{Config, LocalOsvConfig};
 use crate::go::{self, GoProxyClient};
 use crate::malicious::{
     ALL_OSV_ECOSYSTEMS, HttpOsvDumpClient, MaliciousChecker, OsvDumpClient,
@@ -253,7 +253,7 @@ fn start_background_osv_sync_if_enabled(
     config: &Config,
     budgets: Arc<RuntimeBudgets>,
 ) -> Option<BackgroundSyncTask> {
-    if config.policy.osv.source != OsvSource::Local || !config.policy.osv.local.background_sync {
+    if !config.policy.osv.local.background_sync {
         return None;
     }
     Some(spawn_background_osv_sync(
@@ -1249,13 +1249,9 @@ mod tests {
     use crate::artifact::{Artifact, Ecosystem};
     use crate::config::{
         AllowlistEntry, ArtifactBehavior, BlocklistEntry, LocalOsvConfig, MissingPublishTime,
-        OsvErrorBehavior, OsvSource,
     };
-    use crate::malicious::{
-        MaliciousError, MaliciousHit, OsvDumpClient, OsvHttpClient, SqliteMaliciousChecker,
-    };
+    use crate::malicious::{MaliciousError, MaliciousHit, OsvDumpClient, SqliteMaliciousChecker};
     use crate::npm::NpmError;
-    use crate::policy::PolicyEngine;
     use crate::pypi::{SimpleFile, SimpleProject};
     use axum::http::StatusCode;
     use chrono::Duration as ChronoDuration;
@@ -2356,6 +2352,15 @@ mod tests {
     }
 
     #[test]
+    fn explicit_background_sync_disable_stops_task_creation() {
+        let mut config = Config::default();
+        config.policy.osv.local.background_sync = false;
+        let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
+
+        assert!(start_background_osv_sync_if_enabled(&config, budgets).is_none());
+    }
+
+    #[test]
     fn background_retry_delay_is_bounded_and_below_normal_interval() {
         let interval = Duration::from_secs(60 * 60);
         assert_eq!(
@@ -2763,37 +2768,6 @@ INSERT INTO advisories (
         assert_eq!(active.await.unwrap().unwrap().status(), StatusCode::OK);
     }
 
-    #[tokio::test]
-    async fn live_osv_overload_is_tracked_even_when_policy_is_fail_open() {
-        let mut config = Config::default();
-        config.policy.osv.on_error = OsvErrorBehavior::Allow;
-        config.limits.egress_requests = 1;
-        config.limits.queue_timeout = Duration::from_millis(10);
-        let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
-        let _held = budgets.install_egress().await.unwrap();
-        let checker = OsvHttpClient::with_vulnerability_policy_and_budgets(
-            "http://127.0.0.1:9",
-            true,
-            Arc::clone(&budgets),
-        );
-        let artifact = Artifact::package(
-            Ecosystem::Npm,
-            "demo",
-            "1.0.0",
-            Some(Utc::now() - ChronoDuration::days(10)),
-        );
-
-        let (decision, overloaded) = track_request_overload(PolicyEngine::new(&config).evaluate(
-            &artifact,
-            Utc::now(),
-            &checker,
-        ))
-        .await;
-
-        assert!(decision.allowed, "fixture must exercise fail-open handling");
-        assert!(overloaded, "HTTP boundary must override fail-open overload");
-    }
-
     fn registry_request() -> axum::http::Request<Body> {
         axum::http::Request::builder()
             .method("GET")
@@ -2865,6 +2839,7 @@ INSERT INTO advisories (
         .await;
         let mut config = Config::default();
         config.artifacts.behavior = ArtifactBehavior::Proxy;
+        config.policy.osv.local.background_sync = false;
         config.policy.osv.block_malicious = false;
         config.policy.osv.block_vulnerabilities = false;
         config.upstreams.npm.registry_url = registry_url;
@@ -3098,28 +3073,22 @@ INSERT INTO advisories (
     }
 
     #[tokio::test]
-    async fn health_and_live_readiness_are_dependency_free() {
-        let mut config = Config::default();
-        config.policy.osv.source = OsvSource::Live;
-        let app = router(config);
-        for (path, field) in [("/healthz", "live"), ("/readyz", "ready")] {
-            let response = app
-                .clone()
-                .oneshot(
-                    axum::http::Request::builder()
-                        .uri(path)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            let body: Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body[field], true);
-        }
+    async fn health_is_dependency_free() {
+        let response = router(Config::default())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["live"], true);
     }
 
     #[tokio::test]
@@ -3183,6 +3152,7 @@ INSERT INTO advisories (
     async fn graceful_shutdown_waits_for_in_flight_registry_request() {
         let (registry_url, accepted, release) = blocking_npm_upstream().await;
         let mut config = Config::default();
+        config.policy.osv.local.background_sync = false;
         config.upstreams.npm.registry_url = registry_url;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3220,6 +3190,7 @@ INSERT INTO advisories (
     async fn graceful_shutdown_has_a_bounded_drain_period() {
         let (registry_url, accepted, release) = blocking_npm_upstream().await;
         let mut config = Config::default();
+        config.policy.osv.local.background_sync = false;
         config.upstreams.npm.registry_url = registry_url;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -3365,7 +3336,8 @@ INSERT INTO advisories (
         ))
         .await;
         let mut config = Config::default();
-        config.policy.osv.source = OsvSource::Live;
+        config.policy.osv.block_malicious = false;
+        config.policy.osv.block_vulnerabilities = false;
         config.artifacts.behavior = ArtifactBehavior::Proxy;
         config.upstreams.npm.registry_url = registry_url;
         config.artifacts.trusted_origins.push(
@@ -3417,8 +3389,10 @@ INSERT INTO advisories (
     async fn idle_connection_does_not_block_unrelated_request() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let mut config = Config::default();
+        config.policy.osv.local.background_sync = false;
         let server = tokio::spawn(async move {
-            serve_listener(listener, Config::default()).await.unwrap();
+            serve_listener(listener, config).await.unwrap();
         });
 
         let _idle_connection = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -3541,8 +3515,6 @@ INSERT INTO advisories (
 
     fn local_malicious_config(sqlite_path: std::path::PathBuf) -> Config {
         let mut config = Config::default();
-        config.policy.osv.source = OsvSource::Local;
-        config.policy.osv.api_url = "http://127.0.0.1:9".to_string();
         config.policy.osv.local.sqlite_path = sqlite_path;
         config
     }

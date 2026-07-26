@@ -1,7 +1,9 @@
 use osv_proxy::artifact::Ecosystem;
-use osv_proxy::config::{AllowlistEntry, ArtifactBehavior, Config, OsvSource};
+use osv_proxy::config::{AllowlistEntry, ArtifactBehavior, Config};
+use osv_proxy::malicious::SqliteMaliciousChecker;
 use osv_proxy::response::RegistryResponse;
 use osv_proxy::server;
+use rusqlite::{Connection, params};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
@@ -198,8 +200,7 @@ fn maven_e2e_config(
 ) -> Config {
     let mut config = Config::default();
     config.upstreams.maven.repository_url = upstream.base_url();
-    config.policy.osv.api_url = upstream.base_url();
-    config.policy.osv.source = OsvSource::Live;
+    configure_local_osv(&mut config);
     config.policy.minimum_age = Duration::ZERO;
     config.artifacts.behavior = behavior;
     if !enforce_vulnerability_policy {
@@ -432,8 +433,7 @@ fn rubygems_e2e_config(
 ) -> Config {
     let mut config = Config::default();
     config.upstreams.rubygems.registry_url = upstream.base_url();
-    config.policy.osv.api_url = upstream.base_url();
-    config.policy.osv.source = OsvSource::Live;
+    configure_local_osv(&mut config);
     config.policy.minimum_age = Duration::from_secs(0);
     config.artifacts.behavior = behavior;
     if !block {
@@ -606,8 +606,7 @@ fn nuget_e2e_config(
 ) -> Config {
     let mut config = Config::default();
     config.upstreams.nuget.service_index_url = format!("{}/v3/index.json", upstream.base_url());
-    config.policy.osv.api_url = upstream.base_url();
-    config.policy.osv.source = OsvSource::Live;
+    configure_local_osv(&mut config);
     config.policy.osv.block_malicious = false;
     config.policy.minimum_age = Duration::from_secs(0);
     config.artifacts.behavior = behavior;
@@ -958,6 +957,99 @@ fn start_fixture_upstream(fixture: FixtureArtifacts) -> TestServer {
     })
 }
 
+fn configure_local_osv(config: &mut Config) {
+    config.policy.osv.local.sqlite_path = create_local_osv_fixture();
+    config.policy.osv.local.background_sync = false;
+}
+
+fn create_local_osv_fixture() -> PathBuf {
+    let (_, path) = tempfile::NamedTempFile::new().unwrap().keep().unwrap();
+    SqliteMaliciousChecker::initialize(&path).unwrap();
+    let connection = Connection::open(&path).unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    let vulnerable = [
+        (Ecosystem::Npm, NPM_PACKAGE, "1.0.1"),
+        (Ecosystem::Pypi, PYPI_PACKAGE, "1.0.1"),
+        (Ecosystem::Go, GO_MODULE, "1.0.0"),
+        (Ecosystem::CratesIo, CARGO_PACKAGE, "1.0.1"),
+        (Ecosystem::Nuget, NUGET_ROOT, "1.0.0"),
+        (Ecosystem::RubyGems, RUBYGEMS_ROOT, "1.0.1"),
+        (Ecosystem::Maven, "com.acme:osv-proxy-e2e-maven", "1.0.1"),
+        (
+            Ecosystem::Maven,
+            "com.acme:osv-proxy-e2e-maven-bom",
+            "1.0.1",
+        ),
+    ];
+    for ecosystem in [
+        Ecosystem::Npm,
+        Ecosystem::Pypi,
+        Ecosystem::Go,
+        Ecosystem::CratesIo,
+        Ecosystem::Nuget,
+        Ecosystem::RubyGems,
+        Ecosystem::Maven,
+    ] {
+        connection
+            .execute(
+                "INSERT INTO dataset_generations
+                 (ecosystem,dataset_version,status,staged_at,activated_at,high_watermark)
+                 VALUES (?1,1,'active',?2,?2,?2)",
+                params![ecosystem.osv_name(), now],
+            )
+            .unwrap();
+        let generation_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO sync_state
+                 (ecosystem,source,high_watermark,last_success_at,last_attempted_at,status,
+                  error_summary,active_generation_id,content_revision)
+                 VALUES (?1,'fixture',?2,?2,?2,'healthy',NULL,?3,1)",
+                params![ecosystem.osv_name(), now, generation_id],
+            )
+            .unwrap();
+        for (index, (_, name, version)) in vulnerable
+            .iter()
+            .enumerate()
+            .filter(|(_, (candidate, _, _))| *candidate == ecosystem)
+        {
+            let osv_id = format!("GHSA-e2e-{generation_id}-{index}");
+            connection
+                .execute(
+                    "INSERT INTO osv_advisories
+                     (generation_id,osv_id,summary,modified,published,withdrawn,raw_json,source,imported_at)
+                     VALUES (?1,?2,'hermetic package-manager vulnerability fixture',?3,NULL,NULL,'{}','fixture',?3)",
+                    params![generation_id, osv_id, now],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO osv_affected_packages
+                     (generation_id,osv_id,ecosystem,name,affected_order,severity_type,
+                      severity_vector,severity_score,severity_error)
+                     VALUES (?1,?2,?3,?4,0,'CVSS_V3',
+                      'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H',9.8,NULL)",
+                    params![
+                        generation_id,
+                        osv_id,
+                        ecosystem.osv_name(),
+                        ecosystem.normalize_name(name)
+                    ],
+                )
+                .unwrap();
+            let affected_package_id = connection.last_insert_rowid();
+            connection
+                .execute(
+                    "INSERT INTO osv_affected_versions (affected_package_id,version)
+                     VALUES (?1,?2)",
+                    params![affected_package_id, version],
+                )
+                .unwrap();
+        }
+    }
+    path
+}
+
 fn start_proxy(upstream_base_url: String) -> TestServer {
     start_go_proxy(upstream_base_url, false, ArtifactBehavior::Redirect)
 }
@@ -991,6 +1083,7 @@ fn start_go_proxy(
     block_go: bool,
     behavior: ArtifactBehavior,
 ) -> TestServer {
+    let local_osv_path = create_local_osv_fixture();
     start_http_server(move |proxy_base_url| {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -1007,8 +1100,8 @@ fn start_go_proxy(
             config.upstreams.go.proxy_url = upstream_base_url.clone();
             config.upstreams.cargo.sparse_index_url = upstream_base_url.clone();
             config.upstreams.cargo.download_url = format!("{upstream_base_url}/cargo-files");
-            config.policy.osv.api_url = upstream_base_url.clone();
-            config.policy.osv.source = OsvSource::Live;
+            config.policy.osv.local.sqlite_path = local_osv_path.clone();
+            config.policy.osv.local.background_sync = false;
             config.artifacts.behavior = behavior;
             if !block_go {
                 config.allowlist.push(AllowlistEntry {
@@ -1066,39 +1159,6 @@ fn fixture_response(
     request: HttpRequest,
 ) -> RegistryResponse {
     let path = request.path.split('?').next().unwrap_or(&request.path);
-    if request.method == "POST" && path == "/v1/query" {
-        let body = serde_json::from_slice::<serde_json::Value>(&request.body).unwrap();
-        let vulnerable = is_e2e_vulnerable_query(&body);
-        return RegistryResponse::json(
-            200,
-            &if vulnerable {
-                json!({ "vulns": [e2e_vulnerability()] })
-            } else {
-                json!({ "vulns": [] })
-            },
-        )
-        .unwrap();
-    }
-    if request.method == "POST" && path == "/v1/querybatch" {
-        let body = serde_json::from_slice::<serde_json::Value>(&request.body).unwrap();
-        let results = body["queries"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|query| {
-                if is_e2e_vulnerable_query(query) {
-                    json!({ "vulns": [{"id":"GHSA-e2e-vulnerable","modified":"2026-07-11T00:00:00Z"}] })
-                } else {
-                    json!({ "vulns": [] })
-                }
-            })
-            .collect::<Vec<_>>();
-        return RegistryResponse::json(200, &json!({ "results": results })).unwrap();
-    }
-    if request.method == "GET" && path == "/v1/vulns/GHSA-e2e-vulnerable" {
-        return RegistryResponse::json(200, &e2e_vulnerability()).unwrap();
-    }
-
     if matches!(request.method.as_str(), "GET" | "HEAD")
         && let Some(file) = fixture.maven_files.get(path)
     {
@@ -1327,18 +1387,6 @@ fn fixture_response(
     .unwrap()
 }
 
-fn e2e_vulnerability() -> serde_json::Value {
-    json!({
-        "id": "GHSA-e2e-vulnerable",
-        "modified": "2026-07-11T00:00:00Z",
-        "summary": "hermetic package-manager vulnerability fixture",
-        "severity": [{
-            "type": "CVSS_V3",
-            "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
-        }]
-    })
-}
-
 fn create_maven_files() -> HashMap<String, MavenFileFixture> {
     let mut files = HashMap::new();
     let group_path = MAVEN_GROUP.replace('.', "/");
@@ -1474,16 +1522,6 @@ fn gradle_module_metadata(version: &str, jar: &[u8]) -> Vec<u8> {
     }))
     .unwrap();
     format!("{{\"formatVersion\":\"1.1\",{}", &remainder[1..]).into_bytes()
-}
-
-fn is_e2e_vulnerable_query(query: &serde_json::Value) -> bool {
-    let version = query["version"].as_str().unwrap_or_default();
-    let ecosystem = query["package"]["ecosystem"].as_str().unwrap_or_default();
-    let name = query["package"]["name"].as_str().unwrap_or_default();
-    version == "1.0.1"
-        || (ecosystem == "Go" && name == GO_MODULE && version == "1.0.0")
-        || (ecosystem == "NuGet" && name.eq_ignore_ascii_case(NUGET_ROOT) && version == "1.0.0")
-        || (ecosystem == "RubyGems" && name == RUBYGEMS_ROOT && version == "1.0.1")
 }
 
 fn go_module_zip() -> Vec<u8> {
@@ -1887,7 +1925,6 @@ struct HttpRequest {
     method: String,
     path: String,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
 }
 
 impl HttpRequest {
@@ -1951,7 +1988,6 @@ fn read_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
         method,
         path,
         headers,
-        body: buffer[body_start..body_start + content_length].to_vec(),
     })
 }
 

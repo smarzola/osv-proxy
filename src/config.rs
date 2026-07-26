@@ -309,8 +309,6 @@ pub struct OsvConfig {
     pub block_malicious: bool,
     pub block_vulnerabilities: bool,
     pub minimum_cvss_score: f64,
-    pub source: OsvSource,
-    pub api_url: String,
     pub on_error: OsvErrorBehavior,
     pub local: LocalOsvConfig,
 }
@@ -321,8 +319,6 @@ impl Default for OsvConfig {
             block_malicious: true,
             block_vulnerabilities: true,
             minimum_cvss_score: 0.0,
-            source: OsvSource::Local,
-            api_url: "https://api.osv.dev".to_string(),
             on_error: OsvErrorBehavior::Block,
             local: LocalOsvConfig::default(),
         }
@@ -331,7 +327,6 @@ impl Default for OsvConfig {
 
 impl OsvConfig {
     fn validate(&self) -> Result<(), ConfigError> {
-        validate_http_url("policy.osv.api_url", &self.api_url)?;
         if !self.minimum_cvss_score.is_finite() || !(0.0..=10.0).contains(&self.minimum_cvss_score)
         {
             return Err(ConfigError::Invalid(
@@ -341,14 +336,6 @@ impl OsvConfig {
         }
         self.local.validate()
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OsvSource {
-    #[default]
-    Local,
-    Live,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,8 +365,8 @@ impl Default for LocalOsvConfig {
             max_staleness: Duration::from_secs(24 * 60 * 60),
             on_stale: LocalOsvStaleBehavior::Block,
             retain_raw_advisories: false,
-            background_sync: false,
-            sync_interval: Duration::from_secs(6 * 60 * 60),
+            background_sync: true,
+            sync_interval: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -654,9 +641,7 @@ mod tests {
         assert!(config.policy.osv.block_malicious);
         assert!(config.policy.osv.block_vulnerabilities);
         assert_eq!(config.policy.osv.minimum_cvss_score, 0.0);
-        assert_eq!(config.policy.osv.source, OsvSource::Local);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
-        assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         assert_eq!(
             config.policy.osv.local.sqlite_path,
             PathBuf::from("osv-malicious.sqlite")
@@ -670,10 +655,10 @@ mod tests {
             LocalOsvStaleBehavior::Block
         );
         assert!(!config.policy.osv.local.retain_raw_advisories);
-        assert!(!config.policy.osv.local.background_sync);
+        assert!(config.policy.osv.local.background_sync);
         assert_eq!(
             config.policy.osv.local.sync_interval,
-            Duration::from_secs(6 * 60 * 60)
+            Duration::from_secs(60 * 60)
         );
         assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
         assert_eq!(
@@ -703,9 +688,7 @@ policy:
         assert!(!config.policy.osv.block_malicious);
         assert!(config.policy.osv.block_vulnerabilities);
         assert_eq!(config.policy.osv.minimum_cvss_score, 0.0);
-        assert_eq!(config.policy.osv.source, OsvSource::Local);
         assert_eq!(config.policy.osv.on_error, OsvErrorBehavior::Block);
-        assert_eq!(config.policy.osv.api_url, "https://api.osv.dev");
         assert_eq!(config.artifacts.behavior, ArtifactBehavior::Redirect);
     }
 
@@ -784,7 +767,6 @@ policy:
             r#"
 policy:
   osv:
-    source: local
     local:
       sqlite_path: "./data/osv-malicious.sqlite"
       max_staleness: "12h"
@@ -796,7 +778,6 @@ policy:
         )
         .unwrap();
 
-        assert_eq!(config.policy.osv.source, OsvSource::Local);
         assert_eq!(
             config.policy.osv.local.sqlite_path,
             PathBuf::from("./data/osv-malicious.sqlite")
@@ -829,6 +810,18 @@ policy:
         )
         .unwrap_err();
         assert!(err.to_string().contains("unknown field `typo`"));
+    }
+
+    #[test]
+    fn rejects_removed_live_osv_configuration() {
+        for raw in [
+            "policy:\n  osv:\n    source: live\n",
+            "policy:\n  osv:\n    source: local\n",
+            "policy:\n  osv:\n    api_url: https://api.osv.dev\n",
+        ] {
+            let error = load(raw).unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
     }
 
     #[test]
@@ -1212,10 +1205,6 @@ policy:
                 "upstreams:\n  pypi:\n    simple_url: https://pypi.example/simple?format=json\n",
                 "upstreams.pypi.simple_url",
             ),
-            (
-                "policy:\n  osv:\n    api_url: https://api.example/#fragment\n",
-                "policy.osv.api_url",
-            ),
         ] {
             let error = load(raw).unwrap_err();
             assert!(error.to_string().contains(field), "{error}");
@@ -1225,7 +1214,7 @@ policy:
     #[test]
     fn every_configured_http_endpoint_rejects_unsafe_url_components() {
         type Endpoint = (&'static str, fn(&mut Config) -> &mut String);
-        let endpoints: [Endpoint; 10] = [
+        let endpoints: [Endpoint; 9] = [
             ("server.public_base_url", |c| &mut c.server.public_base_url),
             ("upstreams.npm.registry_url", |c| {
                 &mut c.upstreams.npm.registry_url
@@ -1249,7 +1238,6 @@ policy:
             ("upstreams.maven.repository_url", |c| {
                 &mut c.upstreams.maven.repository_url
             }),
-            ("policy.osv.api_url", |c| &mut c.policy.osv.api_url),
         ];
         for (field, endpoint) in endpoints {
             for invalid in [
@@ -1284,9 +1272,6 @@ upstreams:
     registry_url: "http://127.0.0.1:4873/npm"
   pypi:
     simple_url: "http://packages.internal/pypi/simple"
-policy:
-  osv:
-    api_url: "http://osv.internal/api"
 "#,
         )
         .unwrap();
@@ -1301,12 +1286,11 @@ policy:
     #[test]
     fn rejects_unusable_http_destinations() {
         type Endpoint = (&'static str, fn(&mut Config) -> &mut String);
-        let endpoints: [Endpoint; 3] = [
+        let endpoints: [Endpoint; 2] = [
             ("server.public_base_url", |c| &mut c.server.public_base_url),
             ("upstreams.npm.registry_url", |c| {
                 &mut c.upstreams.npm.registry_url
             }),
-            ("policy.osv.api_url", |c| &mut c.policy.osv.api_url),
         ];
         for (field, endpoint) in endpoints {
             for invalid in [

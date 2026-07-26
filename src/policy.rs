@@ -425,10 +425,7 @@ mod tests {
         async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail {
-                return Err(MaliciousError::InvalidBatchResponse {
-                    expected: 1,
-                    actual: 0,
-                });
+                return Err(MaliciousError::LocalStore("fixture failure".to_string()));
             }
             Ok(self.hits.clone())
         }
@@ -705,7 +702,6 @@ mod tests {
                 minimum_age: Duration::from_secs(72 * 60 * 60),
                 osv: OsvConfig {
                     block_malicious: true,
-                    api_url: "https://api.osv.dev".to_string(),
                     on_error: OsvErrorBehavior::Block,
                     ..OsvConfig::default()
                 },

@@ -227,7 +227,18 @@ cargo test --locked server
 cargo run --locked -- config validate --config examples/basic/osv-proxy.yaml
 ```
 
-Status: Not started.
+Status: Completed on 2026-07-26. Live OSV configuration and the HTTP checker
+were removed; SQLite content revisions and advisory fingerprints were added
+with additive migration; equal-timestamp incremental rows are replayed
+idempotently; background sync now defaults to enabled at a one-hour interval.
+Verification passed with `cargo test --locked config` (47 tests),
+`cargo test --locked malicious` (66 tests), `cargo test --locked readiness`
+(3 tests), `cargo test --locked server` (48 tests),
+`cargo test --lib` (295 tests), and
+`cargo run --locked -- config validate --config
+examples/basic/osv-proxy.yaml`. The persistent adversarial reviewer returned
+`CLEAN` after a repair round that made listener tests opt out of default
+background sync and verified they leave no repository-root SQLite artifacts.
 
 ## Milestone 2: Bounded Revision-Aware Filtered Metadata Cache
 

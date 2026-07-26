@@ -1,11 +1,10 @@
 use crate::artifact::{Artifact, Ecosystem};
-use crate::config::{Config, LocalOsvConfig, LocalOsvStaleBehavior, OsvSource};
+use crate::config::{Config, LocalOsvConfig, LocalOsvStaleBehavior};
 use crate::go;
 use crate::http_body::{self, HttpBodyError};
 use crate::runtime::{BudgetError, RuntimeBudgets};
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
-use futures_util::stream::{FuturesUnordered, StreamExt};
 use node_semver as npm_semver;
 use pep440_rs as pep440;
 use polycvss::{Vector as CvssVector, Version as CvssVersion};
@@ -14,6 +13,7 @@ use rusqlite::types::ToSql;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use semver::Version as cargo_semver;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
@@ -32,11 +32,6 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const OSV_DUMP_BASE_URL: &str = "https://storage.googleapis.com/osv-vulnerabilities";
-const OSV_DETAIL_CONCURRENCY: usize = 16;
-// api.osv.dev rejects /v1/querybatch requests containing more than 1,000 queries.
-const OSV_QUERY_BATCH_SIZE: usize = 1_000;
-const OSV_QUERY_BATCH_CONCURRENCY: usize = 4;
-const MAX_OSV_API_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OSV_DOCUMENT_BYTES: usize = 256 * 1024 * 1024;
 const MAX_OSV_ARCHIVE_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MAX_OSV_ARCHIVE_ENTRIES: usize = 1_000_000;
@@ -62,6 +57,10 @@ pub(crate) const ALL_OSV_ECOSYSTEMS: [Ecosystem; 7] = [
 pub trait OsvChecker: Send + Sync {
     async fn check(&self, artifact: &Artifact) -> Result<Vec<OsvFinding>, OsvError>;
 
+    async fn content_revision(&self, _ecosystem: Ecosystem) -> Result<u64, OsvError> {
+        Ok(0)
+    }
+
     async fn check_many(&self, artifacts: &[Artifact]) -> Result<Vec<Vec<OsvFinding>>, OsvError> {
         let mut results = Vec::with_capacity(artifacts.len());
         for artifact in artifacts {
@@ -79,19 +78,12 @@ pub fn configured_osv_checker(config: &Config) -> Arc<dyn OsvChecker> {
 
 pub fn configured_osv_checker_with_budgets(
     config: &Config,
-    budgets: Arc<RuntimeBudgets>,
+    _budgets: Arc<RuntimeBudgets>,
 ) -> Arc<dyn OsvChecker> {
-    match config.policy.osv.source {
-        OsvSource::Live => Arc::new(OsvHttpClient::with_vulnerability_policy_and_budgets(
-            &config.policy.osv.api_url,
-            config.policy.osv.block_vulnerabilities,
-            budgets,
-        )),
-        OsvSource::Local => Arc::new(SqliteMaliciousChecker::with_vulnerability_policy(
-            &config.policy.osv.local,
-            config.policy.osv.block_vulnerabilities,
-        )),
-    }
+    Arc::new(SqliteMaliciousChecker::with_vulnerability_policy(
+        &config.policy.osv.local,
+        config.policy.osv.block_vulnerabilities,
+    ))
 }
 
 pub fn configured_malicious_checker(config: &Config) -> Arc<dyn MaliciousChecker> {
@@ -203,8 +195,6 @@ pub enum OsvError {
     Request(#[from] reqwest::Error),
     #[error("OSV upstream body failed validation: {0}")]
     Body(#[from] HttpBodyError),
-    #[error("OSV batch response returned {actual} results for {expected} queries")]
-    InvalidBatchResponse { expected: usize, actual: usize },
     #[error("local malicious store failed: {0}")]
     LocalStore(String),
     #[error("local malicious store could not evaluate range for {package}: {message}")]
@@ -213,445 +203,9 @@ pub enum OsvError {
     Sync(String),
     #[error("OSV severity evaluation failed: {0}")]
     Severity(#[from] OsvSeverityError),
-    #[error("OSV pagination token repeated for {query}: {token}")]
-    PaginationCycle { query: String, token: String },
-    #[error("OSV detail response ID mismatch: requested {requested}, returned {actual}")]
-    DetailIdentity { requested: String, actual: String },
 }
 
 pub type MaliciousError = OsvError;
-
-#[derive(Debug, Clone)]
-pub struct OsvHttpClient {
-    api_url: String,
-    client: Client,
-    block_vulnerabilities: bool,
-    budgets: Arc<RuntimeBudgets>,
-}
-
-impl OsvHttpClient {
-    pub fn new(api_url: impl Into<String>) -> Self {
-        Self::with_vulnerability_policy(api_url, true)
-    }
-
-    pub fn with_vulnerability_policy(
-        api_url: impl Into<String>,
-        block_vulnerabilities: bool,
-    ) -> Self {
-        Self::with_vulnerability_policy_and_budgets(
-            api_url,
-            block_vulnerabilities,
-            Arc::new(RuntimeBudgets::new(&Config::default().limits)),
-        )
-    }
-
-    pub fn with_vulnerability_policy_and_budgets(
-        api_url: impl Into<String>,
-        block_vulnerabilities: bool,
-        budgets: Arc<RuntimeBudgets>,
-    ) -> Self {
-        Self {
-            api_url: api_url.into().trim_end_matches('/').to_string(),
-            client: Client::builder()
-                .connect_timeout(CONNECT_TIMEOUT)
-                .timeout(REQUEST_TIMEOUT)
-                .build()
-                .expect("OSV HTTP client should build with static timeout configuration"),
-            block_vulnerabilities,
-            budgets,
-        }
-    }
-
-    async fn post_query(&self, request: &OsvQueryRequest) -> Result<OsvQueryResponse, OsvError> {
-        let _permit = self.budgets.install_egress().await?;
-        let response = self
-            .client
-            .post(format!("{}/v1/query", self.api_url))
-            .json(request)
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(http_body::collect_json(response, MAX_OSV_API_BYTES, "OSV query response").await?)
-    }
-
-    async fn post_batch(
-        &self,
-        queries: Vec<OsvQueryRequest>,
-    ) -> Result<OsvBatchQueryResponse, OsvError> {
-        let _permit = self.budgets.install_egress().await?;
-        let response = self
-            .client
-            .post(format!("{}/v1/querybatch", self.api_url))
-            .json(&OsvBatchQueryRequest { queries })
-            .send()
-            .await?
-            .error_for_status()?;
-        Ok(http_body::collect_json(response, MAX_OSV_API_BYTES, "OSV batch response").await?)
-    }
-
-    async fn post_batch_chunks(
-        &self,
-        queries: &[OsvQueryRequest],
-    ) -> Result<Vec<OsvBatchQueryResponse>, OsvError> {
-        let mut pending = FuturesUnordered::new();
-        let mut responses = Vec::with_capacity(queries.len().div_ceil(OSV_QUERY_BATCH_SIZE));
-
-        for (chunk_index, chunk) in queries.chunks(OSV_QUERY_BATCH_SIZE).enumerate() {
-            let client = self.clone();
-            let expected_results = chunk.len();
-            let chunk = chunk.to_vec();
-            pending.push(async move {
-                (
-                    chunk_index,
-                    expected_results,
-                    client.post_batch(chunk).await,
-                )
-            });
-
-            if pending.len() >= OSV_QUERY_BATCH_CONCURRENCY {
-                let (chunk_index, expected_results, response) = pending
-                    .next()
-                    .await
-                    .expect("batch request is pending after reaching the concurrency limit");
-                let response = response?;
-                if response.results.len() != expected_results {
-                    return Err(OsvError::InvalidBatchResponse {
-                        expected: expected_results,
-                        actual: response.results.len(),
-                    });
-                }
-                responses.push((chunk_index, response));
-            }
-        }
-
-        while let Some((chunk_index, expected_results, response)) = pending.next().await {
-            let response = response?;
-            if response.results.len() != expected_results {
-                return Err(OsvError::InvalidBatchResponse {
-                    expected: expected_results,
-                    actual: response.results.len(),
-                });
-            }
-            responses.push((chunk_index, response));
-        }
-        responses.sort_unstable_by_key(|(chunk_index, _)| *chunk_index);
-        Ok(responses
-            .into_iter()
-            .map(|(_, response)| response)
-            .collect())
-    }
-
-    async fn hydrate_details(
-        &self,
-        ids: BTreeSet<String>,
-    ) -> BTreeMap<String, Result<OsvVulnerability, String>> {
-        let mut pending = ids.into_iter();
-        let mut in_flight = FuturesUnordered::new();
-        let mut details = BTreeMap::new();
-        loop {
-            while in_flight.len() < OSV_DETAIL_CONCURRENCY {
-                let Some(id) = pending.next() else { break };
-                let client = self.client.clone();
-                let base = self.api_url.clone();
-                let budgets = Arc::clone(&self.budgets);
-                in_flight.push(async move {
-                    let result = async {
-                        let _permit = budgets
-                            .install_egress()
-                            .await
-                            .map_err(|error| error.to_string())?;
-                        let mut url =
-                            reqwest::Url::parse(&base).map_err(|error| error.to_string())?;
-                        url.path_segments_mut()
-                            .map_err(|_| "OSV API URL cannot be a base URL".to_string())?
-                            .extend(["v1", "vulns", id.as_str()]);
-                        let response = client
-                            .get(url)
-                            .send()
-                            .await
-                            .map_err(|error| error.to_string())?
-                            .error_for_status()
-                            .map_err(|error| error.to_string())?;
-                        let detail = http_body::collect_json::<OsvVulnerability>(
-                            response,
-                            MAX_OSV_API_BYTES,
-                            "OSV vulnerability detail",
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                        if detail.id != id {
-                            return Err(OsvError::DetailIdentity {
-                                requested: id.clone(),
-                                actual: detail.id,
-                            }
-                            .to_string());
-                        }
-                        Ok(detail)
-                    }
-                    .await;
-                    (id, result)
-                });
-            }
-            let Some(result) = in_flight.next().await else {
-                break;
-            };
-            let (id, result) = result;
-            details.insert(id, result);
-        }
-        details
-    }
-}
-
-#[async_trait]
-impl OsvChecker for OsvHttpClient {
-    async fn check(&self, artifact: &Artifact) -> Result<Vec<OsvFinding>, OsvError> {
-        let mut request = OsvQueryRequest {
-            package: OsvPackage {
-                name: artifact.name.clone(),
-                ecosystem: artifact.ecosystem.osv_name().to_string(),
-            },
-            version: osv_query_version(artifact),
-            page_token: None,
-        };
-        let mut findings = Vec::new();
-        let mut seen_tokens = BTreeSet::new();
-        let mut initial = true;
-        loop {
-            let response = match self.post_query(&request).await {
-                Ok(response) => response,
-                Err(error) if initial => return Err(error),
-                Err(error) => {
-                    findings.push(error_finding(String::new(), error.to_string()));
-                    break;
-                }
-            };
-            initial = false;
-            for vulnerability in response.vulns {
-                if !self.block_vulnerabilities {
-                    if vulnerability.id.starts_with("MAL-") && vulnerability.withdrawn.is_none() {
-                        findings.push(stub_finding(vulnerability));
-                    }
-                    continue;
-                }
-                let id = vulnerability.id.clone();
-                match finding_from_vulnerability(vulnerability, artifact) {
-                    Ok(Some(finding)) => findings.push(finding),
-                    Ok(None) => {}
-                    Err(error) => findings.push(error_finding(id, error.to_string())),
-                }
-            }
-            let Some(token) = response.next_page_token.filter(|token| !token.is_empty()) else {
-                break;
-            };
-            if !seen_tokens.insert(token.clone()) {
-                findings.push(error_finding(
-                    String::new(),
-                    OsvError::PaginationCycle {
-                        query: artifact.identity(),
-                        token,
-                    }
-                    .to_string(),
-                ));
-                break;
-            }
-            request.page_token = Some(token);
-        }
-        findings.sort_by(|left, right| left.osv_id.cmp(&right.osv_id));
-        findings.dedup_by(|left, right| left.osv_id == right.osv_id);
-        Ok(findings)
-    }
-
-    async fn check_many(&self, artifacts: &[Artifact]) -> Result<Vec<Vec<OsvFinding>>, OsvError> {
-        if artifacts.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let base_queries = artifacts
-            .iter()
-            .map(|artifact| OsvQueryRequest {
-                package: OsvPackage {
-                    name: artifact.name.clone(),
-                    ecosystem: artifact.ecosystem.osv_name().to_string(),
-                },
-                version: osv_query_version(artifact),
-                page_token: None,
-            })
-            .collect::<Vec<_>>();
-        let responses = self.post_batch_chunks(&base_queries).await?;
-        let mut batch_results = Vec::with_capacity(artifacts.len());
-        for response in responses {
-            batch_results.extend(response.results);
-        }
-        if batch_results.len() != artifacts.len() {
-            return Err(OsvError::InvalidBatchResponse {
-                expected: artifacts.len(),
-                actual: batch_results.len(),
-            });
-        }
-
-        let mut stubs = vec![Vec::<OsvVulnerability>::new(); artifacts.len()];
-        let mut pending = Vec::new();
-        let mut seen_tokens = vec![BTreeSet::new(); artifacts.len()];
-        for (index, result) in batch_results.into_iter().enumerate() {
-            stubs[index].extend(result.vulns);
-            if let Some(token) = result.next_page_token.filter(|token| !token.is_empty()) {
-                seen_tokens[index].insert(token.clone());
-                pending.push((index, token));
-            }
-        }
-        let mut continuation_errors = vec![Vec::<String>::new(); artifacts.len()];
-        while !pending.is_empty() {
-            let mut next = Vec::new();
-            for (index, previous_token) in pending {
-                let mut query = base_queries[index].clone();
-                query.page_token = Some(previous_token);
-                let response = match self.post_batch(vec![query]).await {
-                    Ok(response) => response,
-                    Err(error) => {
-                        continuation_errors[index].push(error.to_string());
-                        continue;
-                    }
-                };
-                if response.results.len() != 1 {
-                    continuation_errors[index].push(
-                        OsvError::InvalidBatchResponse {
-                            expected: 1,
-                            actual: response.results.len(),
-                        }
-                        .to_string(),
-                    );
-                    continue;
-                }
-                let result = response.results.into_iter().next().unwrap();
-                stubs[index].extend(result.vulns);
-                if let Some(token) = result.next_page_token.filter(|token| !token.is_empty()) {
-                    if !seen_tokens[index].insert(token.clone()) {
-                        continuation_errors[index].push(
-                            OsvError::PaginationCycle {
-                                query: artifacts[index].identity(),
-                                token,
-                            }
-                            .to_string(),
-                        );
-                        continue;
-                    }
-                    next.push((index, token));
-                }
-            }
-            pending = next;
-        }
-
-        let detail_ids = stubs
-            .iter()
-            .flatten()
-            .filter(|stub| self.block_vulnerabilities && !stub.id.starts_with("MAL-"))
-            .map(|stub| stub.id.clone())
-            .collect::<BTreeSet<_>>();
-        let details = self.hydrate_details(detail_ids).await;
-        let mut results = Vec::with_capacity(artifacts.len());
-        for (index, (artifact, artifact_stubs)) in artifacts.iter().zip(stubs).enumerate() {
-            let mut findings = Vec::new();
-            for stub in artifact_stubs {
-                if stub.id.starts_with("MAL-") {
-                    findings.push(stub_finding(stub));
-                } else if let Some(detail) = details.get(&stub.id) {
-                    match detail {
-                        Ok(detail) => match finding_from_vulnerability(detail.clone(), artifact) {
-                            Ok(Some(finding)) => findings.push(finding),
-                            Ok(None) => {}
-                            Err(error) => {
-                                findings.push(error_finding(stub.id.clone(), error.to_string()))
-                            }
-                        },
-                        Err(error) => findings.push(error_finding(stub.id.clone(), error.clone())),
-                    }
-                }
-            }
-            findings.extend(
-                continuation_errors[index]
-                    .drain(..)
-                    .map(|error| error_finding(String::new(), error)),
-            );
-            findings.sort_by(|left, right| left.osv_id.cmp(&right.osv_id));
-            findings.dedup_by(|left, right| left.osv_id == right.osv_id);
-            results.push(findings);
-        }
-        Ok(results)
-    }
-}
-
-fn stub_finding(vulnerability: OsvVulnerability) -> OsvFinding {
-    OsvFinding {
-        osv_id: vulnerability.id,
-        summary: vulnerability.summary,
-        source: "osv".to_string(),
-        modified: vulnerability.modified,
-        effective_severity: None,
-        evaluation_error: None,
-    }
-}
-
-fn error_finding(osv_id: String, error: String) -> OsvFinding {
-    OsvFinding {
-        osv_id,
-        summary: None,
-        source: "osv".to_string(),
-        modified: None,
-        effective_severity: None,
-        evaluation_error: Some(error),
-    }
-}
-
-fn finding_from_vulnerability(
-    vulnerability: OsvVulnerability,
-    artifact: &Artifact,
-) -> Result<Option<OsvFinding>, OsvError> {
-    if vulnerability.withdrawn.is_some() {
-        return Ok(None);
-    }
-    if vulnerability.id.starts_with("MAL-") {
-        return Ok(Some(stub_finding(vulnerability)));
-    }
-    let matching = vulnerability
-        .affected
-        .iter()
-        .filter(|affected| {
-            affected.package.ecosystem == artifact.ecosystem.osv_name()
-                && artifact.ecosystem.normalize_name(&affected.package.name) == artifact.name
-        })
-        .collect::<Vec<_>>();
-    let mut effective_severity = None;
-    if matching.is_empty() {
-        effective_severity = effective_osv_severity(&vulnerability.severity, None)?;
-    } else {
-        for affected in matching {
-            let candidate = effective_osv_severity(
-                &vulnerability.severity,
-                Some(affected.severity.as_slice()),
-            )?;
-            if candidate.as_ref().is_some_and(|candidate| {
-                effective_severity
-                    .as_ref()
-                    .is_none_or(|current: &OsvEffectiveSeverity| {
-                        candidate.base_score > current.base_score
-                            || (candidate.base_score == current.base_score
-                                && (&candidate.severity_type, &candidate.vector)
-                                    < (&current.severity_type, &current.vector))
-                    })
-            }) {
-                effective_severity = candidate;
-            }
-        }
-    }
-    Ok(Some(OsvFinding {
-        osv_id: vulnerability.id,
-        summary: vulnerability.summary,
-        source: "osv".to_string(),
-        modified: vulnerability.modified,
-        effective_severity,
-        evaluation_error: None,
-    }))
-}
 
 #[derive(Debug, Clone)]
 pub struct SqliteMaliciousChecker {
@@ -828,6 +382,28 @@ impl OsvChecker for SqliteMaliciousChecker {
         run_sqlite_check(move || {
             let connection = checker.open_read_only()?;
             checker.check_many_with_connection(&connection, &artifacts)
+        })
+        .await
+    }
+
+    async fn content_revision(&self, ecosystem: Ecosystem) -> Result<u64, OsvError> {
+        let checker = self.clone();
+        run_sqlite_check(move || {
+            let connection = checker.open_read_only()?;
+            let ecosystem_name = ecosystem.osv_name();
+            ensure_store_healthy(&connection, ecosystem_name, &checker)?;
+            let revision = connection
+                .query_row(
+                    "SELECT content_revision FROM sync_state WHERE ecosystem=?1",
+                    [ecosystem_name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(sqlite_error)?;
+            u64::try_from(revision).map_err(|_| {
+                OsvError::LocalStore(format!(
+                    "sync_state for ecosystem {ecosystem_name} has invalid content_revision {revision}"
+                ))
+            })
         })
         .await
     }
@@ -1334,6 +910,7 @@ fn import_zip_bootstrap_and_record_success<R: Read + Seek>(
         imported_at,
         high_watermark,
         generation_id,
+        true,
     )?;
     refresh_lookup_statistics(&transaction)?;
     transaction.commit().map_err(sqlite_error)?;
@@ -1491,7 +1068,7 @@ fn parse_modified_id_csv(
             )));
         }
         let modified_at = parse_modified_timestamp(modified_at)?;
-        if previous_high_watermark.is_some_and(|previous| modified_at <= previous) {
+        if previous_high_watermark.is_some_and(|previous| modified_at < previous) {
             continue;
         }
         let osv_id = id.rsplit('/').next().unwrap_or(id).to_string();
@@ -1574,6 +1151,7 @@ struct ImportStats {
     imported: usize,
     withdrawn: usize,
     skipped_non_malicious: usize,
+    content_changed: bool,
 }
 
 fn import_advisories_and_record_success(
@@ -1634,6 +1212,7 @@ fn import_advisories_and_record_success(
         imported_at,
         high_watermark.clone(),
         generation_id,
+        bootstrap || stats.content_changed,
     )?;
     transaction
         .execute(
@@ -1666,7 +1245,11 @@ fn import_advisories(
 ) -> Result<ImportStats, OsvError> {
     let mut stats = ImportStats::default();
     for advisory in advisories {
+        if !advisory_changed(transaction, generation_id, advisory)? {
+            continue;
+        }
         replace_advisory(transaction, generation_id, ecosystem, advisory, imported_at)?;
+        stats.content_changed = true;
         if advisory.withdrawn.is_some() {
             stats.withdrawn += 1;
         } else {
@@ -1674,6 +1257,30 @@ fn import_advisories(
         }
     }
     Ok(stats)
+}
+
+fn advisory_changed(
+    transaction: &rusqlite::Transaction<'_>,
+    generation_id: i64,
+    advisory: &OsvDumpAdvisory,
+) -> Result<bool, OsvError> {
+    let fingerprint = advisory_fingerprint(advisory)?;
+    let stored = transaction
+        .query_row(
+            "SELECT content_fingerprint FROM osv_advisories
+             WHERE generation_id=?1 AND osv_id=?2",
+            params![generation_id, advisory.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(sqlite_error)?;
+    Ok(stored.is_none_or(|stored| stored != fingerprint))
+}
+
+fn advisory_fingerprint(advisory: &OsvDumpAdvisory) -> Result<String, OsvError> {
+    let encoded = serde_json::to_vec(advisory)
+        .map_err(|error| OsvError::Sync(format!("failed to fingerprint OSV advisory: {error}")))?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
 fn replace_advisory(
@@ -1701,8 +1308,9 @@ INSERT INTO osv_advisories (
     withdrawn,
     raw_json,
     source,
-    imported_at
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'osv-gcs', ?8)
+    imported_at,
+    content_fingerprint
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'osv-gcs', ?8, ?9)
 "#,
             params![
                 generation_id,
@@ -1712,7 +1320,8 @@ INSERT INTO osv_advisories (
                 advisory.published,
                 advisory.withdrawn,
                 advisory.raw_json,
-                imported_at.to_rfc3339()
+                imported_at.to_rfc3339(),
+                advisory_fingerprint(advisory)?
             ],
         )
         .map_err(sqlite_error)?;
@@ -1840,6 +1449,7 @@ fn record_sync_success(
     attempted_at: DateTime<Utc>,
     high_watermark: Option<String>,
     generation_id: i64,
+    content_changed: bool,
 ) -> Result<(), OsvError> {
     transaction
         .execute(
@@ -1852,8 +1462,9 @@ INSERT INTO sync_state (
     last_attempted_at,
     status,
     error_summary,
-    active_generation_id
-) VALUES (?1, 'osv-gcs', ?2, ?3, ?3, 'healthy', NULL, ?4)
+    active_generation_id,
+    content_revision
+) VALUES (?1, 'osv-gcs', ?2, ?3, ?3, 'healthy', NULL, ?4, ?5)
 ON CONFLICT(ecosystem) DO UPDATE SET
     source = excluded.source,
     high_watermark = excluded.high_watermark,
@@ -1861,13 +1472,15 @@ ON CONFLICT(ecosystem) DO UPDATE SET
     last_attempted_at = excluded.last_attempted_at,
     status = excluded.status,
     error_summary = excluded.error_summary,
-    active_generation_id = excluded.active_generation_id
+    active_generation_id = excluded.active_generation_id,
+    content_revision = sync_state.content_revision + excluded.content_revision
 "#,
             params![
                 ecosystem,
                 high_watermark,
                 attempted_at.to_rfc3339(),
-                generation_id
+                generation_id,
+                i64::from(content_changed)
             ],
         )
         .map_err(sqlite_error)?;
@@ -2015,7 +1628,9 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_success_at TEXT,
     last_attempted_at TEXT,
     status TEXT NOT NULL,
-    error_summary TEXT
+    error_summary TEXT,
+    active_generation_id INTEGER,
+    content_revision INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS dataset_generations (
@@ -2040,6 +1655,7 @@ CREATE TABLE IF NOT EXISTS osv_advisories (
     raw_json TEXT NOT NULL,
     source TEXT NOT NULL,
     imported_at TEXT NOT NULL,
+    content_fingerprint TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (generation_id, osv_id)
 );
 
@@ -2091,6 +1707,8 @@ CREATE TABLE IF NOT EXISTS osv_affected_range_events (
         .execute_batch("DROP INDEX IF EXISTS idx_osv_versions_lookup")
         .map_err(sqlite_error)?;
     ensure_sync_active_generation_column(connection)?;
+    ensure_sync_content_revision_column(connection)?;
+    ensure_osv_content_fingerprint_column(connection)?;
     migrate_legacy_generations(connection)
 }
 
@@ -2109,6 +1727,46 @@ fn ensure_sync_active_generation_column(connection: &Connection) -> Result<(), O
     {
         connection
             .execute_batch("ALTER TABLE sync_state ADD COLUMN active_generation_id INTEGER")
+            .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn ensure_sync_content_revision_column(connection: &Connection) -> Result<(), OsvError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(sync_state)")
+        .map_err(sqlite_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    if !columns.iter().any(|column| column == "content_revision") {
+        connection
+            .execute_batch(
+                "ALTER TABLE sync_state
+                 ADD COLUMN content_revision INTEGER NOT NULL DEFAULT 0",
+            )
+            .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+fn ensure_osv_content_fingerprint_column(connection: &Connection) -> Result<(), OsvError> {
+    let mut statement = connection
+        .prepare("PRAGMA table_info(osv_advisories)")
+        .map_err(sqlite_error)?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(sqlite_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sqlite_error)?;
+    if !columns.iter().any(|column| column == "content_fingerprint") {
+        connection
+            .execute_batch(
+                "ALTER TABLE osv_advisories
+                 ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''",
+            )
             .map_err(sqlite_error)?;
     }
     Ok(())
@@ -2147,6 +1805,7 @@ fn migrate_legacy_generations(connection: &mut Connection) -> Result<(), OsvErro
         transaction
             .execute(
                 "INSERT INTO osv_advisories
+                 (generation_id,osv_id,summary,modified,published,withdrawn,raw_json,source,imported_at)
                  SELECT ?1,a.osv_id,a.summary,a.modified,a.published,a.withdrawn,a.raw_json,a.source,a.imported_at
                  FROM advisories a WHERE EXISTS (
                    SELECT 1 FROM affected_packages ap WHERE ap.osv_id=a.osv_id AND ap.ecosystem=?2
@@ -2759,518 +2418,18 @@ fn sqlite_error(error: rusqlite::Error) -> OsvError {
     OsvError::LocalStore(error.to_string())
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct OsvQueryRequest {
-    package: OsvPackage,
-    version: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    page_token: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct OsvBatchQueryRequest {
-    queries: Vec<OsvQueryRequest>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct OsvPackage {
-    name: String,
-    ecosystem: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OsvQueryResponse {
-    #[serde(default)]
-    vulns: Vec<OsvVulnerability>,
-    #[serde(default)]
-    next_page_token: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OsvBatchQueryResponse {
-    #[serde(default)]
-    results: Vec<OsvQueryResponse>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct OsvVulnerability {
-    id: String,
-    summary: Option<String>,
-    modified: Option<DateTime<Utc>>,
-    withdrawn: Option<DateTime<Utc>>,
-    #[serde(default)]
-    severity: Vec<OsvSeverity>,
-    #[serde(default)]
-    affected: Vec<OsvLiveAffected>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct OsvLiveAffected {
-    package: OsvPackageResponse,
-    #[serde(default)]
-    severity: Vec<OsvSeverity>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct OsvPackageResponse {
-    name: String,
-    ecosystem: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::artifact::{Artifact, Ecosystem};
-    use crate::config::{Config, LocalOsvConfig, LocalOsvStaleBehavior, OsvSource};
-    use axum::{
-        Json, Router,
-        extract::{Path as AxumPath, State},
-        routing::{get, post},
-    };
+    use crate::config::{Config, LocalOsvConfig, LocalOsvStaleBehavior};
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::path::Path;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
     use tempfile::tempdir;
     use zip::{ZipWriter, write::SimpleFileOptions};
-
-    #[derive(Default)]
-    struct LiveMockState {
-        query_calls: AtomicUsize,
-        batch_calls: AtomicUsize,
-        active_batches: AtomicUsize,
-        peak_batches: AtomicUsize,
-        batch_delay_ms: AtomicUsize,
-        active_details: AtomicUsize,
-        peak_details: AtomicUsize,
-        detail_counts: Mutex<BTreeMap<String, usize>>,
-    }
-
-    struct BatchActivityGuard(Arc<LiveMockState>);
-
-    impl Drop for BatchActivityGuard {
-        fn drop(&mut self) {
-            self.0.active_batches.fetch_sub(1, AtomicOrdering::SeqCst);
-        }
-    }
-
-    async fn mock_query(
-        State(state): State<Arc<LiveMockState>>,
-        Json(body): Json<serde_json::Value>,
-    ) -> Json<serde_json::Value> {
-        state.query_calls.fetch_add(1, AtomicOrdering::SeqCst);
-        if body.get("version").and_then(|value| value.as_str()) == Some("direct-mal-cycle") {
-            let vulns = if body.get("page_token").is_none() {
-                vec![serde_json::json!({
-                    "id":"MAL-2026-page-one","modified":"2026-07-11T00:00:00Z"
-                })]
-            } else {
-                Vec::new()
-            };
-            return Json(serde_json::json!({"vulns":vulns,"next_page_token":"cycle"}));
-        }
-        if body.get("version").and_then(|value| value.as_str()) == Some("single-cycle") {
-            return Json(serde_json::json!({"vulns":[],"next_page_token":"cycle"}));
-        }
-        if body.get("version").and_then(|value| value.as_str()) == Some("withdrawn") {
-            return Json(serde_json::json!({"vulns":[{
-                "id":"GHSA-withdrawn","modified":"2026-07-11T00:00:00Z",
-                "withdrawn":"2026-07-11T01:00:00Z"
-            }]}));
-        }
-        if body.get("version").and_then(|value| value.as_str()) == Some("parity") {
-            return Json(serde_json::json!({"vulns": [{
-                "id":"GHSA-shared", "modified":"2026-07-11T00:00:00Z",
-                "severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
-                "affected":[{"package":{"ecosystem":"npm","name":"demo"}}]
-            }]}));
-        }
-        if body.get("page_token").is_some() {
-            Json(serde_json::json!({"vulns": [{
-                "id": "GHSA-page-2", "modified": "2026-07-11T00:00:00Z",
-                "severity": [{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
-                "affected": [{"package":{"ecosystem":"npm","name":"demo"}}]
-            }]}))
-        } else {
-            Json(serde_json::json!({
-                "vulns": [{
-                    "id": "GHSA-page-1", "modified": "2026-07-11T00:00:00Z",
-                    "severity": [{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
-                    "affected": [{"package":{"ecosystem":"npm","name":"demo"},"severity":[{"type":"CVSS_V2","score":"AV:A/AC:H/Au:N/C:C/I:C/A:C"}]}]
-                }], "next_page_token": "single-next"
-            }))
-        }
-    }
-
-    async fn mock_batch(
-        State(state): State<Arc<LiveMockState>>,
-        Json(body): Json<serde_json::Value>,
-    ) -> Json<serde_json::Value> {
-        state.batch_calls.fetch_add(1, AtomicOrdering::SeqCst);
-        let active = state.active_batches.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-        state.peak_batches.fetch_max(active, AtomicOrdering::SeqCst);
-        let _activity = BatchActivityGuard(Arc::clone(&state));
-        let delay = state.batch_delay_ms.load(AtomicOrdering::SeqCst);
-        if delay > 0 {
-            tokio::time::sleep(Duration::from_millis(delay as u64)).await;
-        }
-        let queries = body["queries"].as_array().unwrap();
-        if queries.iter().any(|query| {
-            query.get("version").and_then(|value| value.as_str()) == Some("batch-cycle")
-                && query.get("page_token").is_some()
-        }) {
-            return Json(serde_json::json!({"results":[{
-                "vulns":[],"next_page_token":"batch-cycle-token"
-            }]}));
-        }
-        if queries
-            .iter()
-            .any(|query| query.get("page_token").is_some())
-        {
-            return Json(serde_json::json!({"results":[{"vulns":[{
-                "id":"GHSA-extra", "modified":"2026-07-11T00:00:00Z"
-            }]}]}));
-        }
-        let results = queries
-            .iter()
-            .enumerate()
-            .map(|(index, _)| {
-                let version = queries[index]
-                    .get("version")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default();
-                if version == "mal-bad" {
-                    return serde_json::json!({"vulns":[
-                        {"id":"MAL-2026-known","modified":"2026-07-11T00:00:00Z"},
-                        {"id":"GHSA-bad","modified":"2026-07-11T00:00:00Z"}
-                    ]});
-                }
-                if version == "mal-initial" {
-                    return serde_json::json!({"vulns":[
-                        {"id":"MAL-2026-initial","modified":"2026-07-11T00:00:00Z"}
-                    ]});
-                }
-                if version == "batch-cycle" {
-                    return serde_json::json!({
-                        "vulns":[],"next_page_token":"batch-cycle-token"
-                    });
-                }
-                if version == "mismatch" {
-                    return serde_json::json!({"vulns":[
-                        {"id":"GHSA-mismatch","modified":"2026-07-11T00:00:00Z"}
-                    ]});
-                }
-                if version == "withdrawn" {
-                    return serde_json::json!({"vulns":[
-                        {"id":"GHSA-withdrawn","modified":"2026-07-11T00:00:00Z"}
-                    ]});
-                }
-                let mut vulns = vec![serde_json::json!({
-                    "id":"GHSA-shared", "modified":"2026-07-11T00:00:00Z"
-                })];
-                if index == 0 {
-                    vulns.extend((0..18).map(|number| {
-                        serde_json::json!({
-                            "id": format!("GHSA-unique-{number:02}"),
-                            "modified":"2026-07-11T00:00:00Z"
-                        })
-                    }));
-                    serde_json::json!({"vulns":vulns,"next_page_token":"batch-next"})
-                } else {
-                    serde_json::json!({"vulns":vulns})
-                }
-            })
-            .collect::<Vec<_>>();
-        Json(serde_json::json!({"results":results}))
-    }
-
-    async fn mock_detail(
-        State(state): State<Arc<LiveMockState>>,
-        AxumPath(id): AxumPath<String>,
-    ) -> Json<serde_json::Value> {
-        *state
-            .detail_counts
-            .lock()
-            .unwrap()
-            .entry(id.clone())
-            .or_default() += 1;
-        let active = state.active_details.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-        state.peak_details.fetch_max(active, AtomicOrdering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        state.active_details.fetch_sub(1, AtomicOrdering::SeqCst);
-        if id == "GHSA-bad" {
-            return Json(serde_json::json!({
-                "id":id,"modified":"2026-07-11T00:00:00Z",
-                "severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:BROKEN"}],
-                "affected":[{"package":{"ecosystem":"npm","name":"demo"}}]
-            }));
-        }
-        if id == "GHSA-mismatch" {
-            return Json(serde_json::json!({
-                "id":"GHSA-other","modified":"2026-07-11T00:00:00Z",
-                "affected":[{"package":{"ecosystem":"npm","name":"demo"}}]
-            }));
-        }
-        if id == "GHSA-withdrawn" {
-            return Json(serde_json::json!({
-                "id":id,"modified":"2026-07-11T00:00:00Z",
-                "withdrawn":"2026-07-11T01:00:00Z"
-            }));
-        }
-        Json(serde_json::json!({
-            "id":id, "modified":"2026-07-11T00:00:00Z",
-            "severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
-            "affected":[{"package":{"ecosystem":"npm","name":"demo"}}]
-        }))
-    }
-
-    async fn live_mock() -> (String, Arc<LiveMockState>) {
-        let state = Arc::new(LiveMockState::default());
-        let app = Router::new()
-            .route("/v1/query", post(mock_query))
-            .route("/v1/querybatch", post(mock_batch))
-            .route("/v1/vulns/{id}", get(mock_detail))
-            .with_state(state.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (format!("http://{address}"), state)
-    }
-
-    #[tokio::test]
-    async fn live_queries_paginate_hydrate_once_bound_concurrency_and_preserve_cardinality() {
-        let (url, state) = live_mock().await;
-        let client = OsvHttpClient::new(url);
-        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None);
-        let single = client.check(&artifact).await.unwrap();
-        assert_eq!(single.len(), 2);
-        assert_eq!(
-            single[0].effective_severity.as_ref().unwrap().base_score,
-            6.8
-        );
-        assert_eq!(state.query_calls.load(AtomicOrdering::SeqCst), 2);
-
-        let batch = client
-            .check_many(&[artifact.clone(), artifact.clone()])
-            .await
-            .unwrap();
-        assert_eq!(batch.len(), 2);
-        assert!(
-            batch[0]
-                .iter()
-                .any(|finding| finding.osv_id == "GHSA-extra")
-        );
-        assert_eq!(
-            state.detail_counts.lock().unwrap().get("GHSA-shared"),
-            Some(&1)
-        );
-        assert_eq!(state.batch_calls.load(AtomicOrdering::SeqCst), 2);
-        assert!(state.peak_details.load(AtomicOrdering::SeqCst) > 1);
-        assert!(state.peak_details.load(AtomicOrdering::SeqCst) <= OSV_DETAIL_CONCURRENCY);
-    }
-
-    #[tokio::test]
-    async fn live_batch_queries_chunk_at_api_limit_and_bound_concurrency() {
-        let (url, state) = live_mock().await;
-        state.batch_delay_ms.store(20, AtomicOrdering::SeqCst);
-        let client = OsvHttpClient::with_vulnerability_policy(url, false);
-        let query_count = OSV_QUERY_BATCH_SIZE * 2 + 1;
-        let artifacts = (0..query_count)
-            .map(|index| {
-                let version = if index % OSV_QUERY_BATCH_SIZE == 0 {
-                    "mal-bad".to_string()
-                } else {
-                    format!("chunk-{index}")
-                };
-                Artifact::package(Ecosystem::Npm, "demo", version, None)
-            })
-            .collect::<Vec<_>>();
-
-        let results = client.check_many(&artifacts).await.unwrap();
-
-        assert_eq!(results.len(), query_count);
-        assert_eq!(state.batch_calls.load(AtomicOrdering::SeqCst), 3);
-        assert!(state.peak_batches.load(AtomicOrdering::SeqCst) >= 2);
-        assert!(state.peak_batches.load(AtomicOrdering::SeqCst) <= OSV_QUERY_BATCH_CONCURRENCY);
-        for (index, findings) in results.iter().enumerate() {
-            if index % OSV_QUERY_BATCH_SIZE == 0 {
-                assert_eq!(findings.len(), 1);
-                assert_eq!(findings[0].osv_id, "MAL-2026-known");
-            } else {
-                assert!(findings.is_empty());
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn global_egress_budget_bounds_osv_detail_fanout() {
-        let (url, state) = live_mock().await;
-        let mut config = Config::default();
-        config.limits.egress_requests = 1;
-        config.limits.queue_timeout = Duration::from_secs(1);
-        let client = OsvHttpClient::with_vulnerability_policy_and_budgets(
-            url,
-            true,
-            Arc::new(RuntimeBudgets::new(&config.limits)),
-        );
-        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None);
-
-        client
-            .check_many(&[artifact.clone(), artifact])
-            .await
-            .unwrap();
-
-        assert_eq!(state.peak_details.load(AtomicOrdering::SeqCst), 1);
-        assert!(state.detail_counts.lock().unwrap().len() > 1);
-    }
-
-    #[tokio::test]
-    async fn malicious_only_batch_does_not_hydrate_non_malicious_details() {
-        let (url, state) = live_mock().await;
-        let client = OsvHttpClient::with_vulnerability_policy(url, false);
-        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None);
-        let findings = client.check_many(&[artifact]).await.unwrap();
-        assert!(findings[0].is_empty());
-        assert!(state.detail_counts.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn live_direct_and_batch_findings_are_equivalent_for_same_advisory() {
-        let (url, _) = live_mock().await;
-        let client = OsvHttpClient::new(url);
-        let direct_artifact = Artifact::package(Ecosystem::Npm, "demo", "parity", None);
-        let batch_artifact = Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None);
-        let direct = client.check(&direct_artifact).await.unwrap();
-        let batch = client.check_many(&[batch_artifact]).await.unwrap();
-        let batch_shared = batch[0]
-            .iter()
-            .find(|finding| finding.osv_id == "GHSA-shared")
-            .unwrap();
-        assert_eq!(&direct[0], batch_shared);
-    }
-
-    #[tokio::test]
-    async fn repeated_single_and_batch_page_tokens_become_scoped_errors() {
-        let (url, _) = live_mock().await;
-        let client = OsvHttpClient::new(url);
-        let single = Artifact::package(Ecosystem::Npm, "demo", "single-cycle", None);
-        let single = client.check(&single).await.unwrap();
-        assert!(
-            single
-                .iter()
-                .any(|finding| finding.evaluation_error.is_some())
-        );
-        let batch = Artifact::package(Ecosystem::Npm, "demo", "batch-cycle", None);
-        let batch = client.check_many(&[batch]).await.unwrap();
-        assert!(
-            batch[0]
-                .iter()
-                .any(|finding| finding.evaluation_error.is_some())
-        );
-    }
-
-    #[tokio::test]
-    async fn continuation_cycles_preserve_mal_and_obey_error_policy() {
-        let (url, _) = live_mock().await;
-        let client = OsvHttpClient::new(url);
-        let direct = Artifact::package(Ecosystem::Npm, "demo", "direct-mal-cycle", None);
-        let direct_findings = client.check(&direct).await.unwrap();
-        let mut config = Config::default();
-        config.policy.osv.on_error = crate::config::OsvErrorBehavior::Allow;
-        config.policy.missing_publish_time = crate::config::MissingPublishTime::Allow;
-        let decision = crate::policy::PolicyEngine::new(&config).evaluate_with_malicious_result(
-            &direct,
-            Utc::now(),
-            Some(Ok(direct_findings)),
-        );
-        assert_eq!(decision.reason, crate::policy::DecisionReason::Malicious);
-
-        let mal = Artifact::package(Ecosystem::Npm, "demo", "mal-initial", None);
-        let cycling = Artifact::package(Ecosystem::Npm, "demo", "batch-cycle", None);
-        let results = client
-            .check_many(&[mal.clone(), cycling.clone()])
-            .await
-            .unwrap();
-        let mal_decision = crate::policy::PolicyEngine::new(&config)
-            .evaluate_with_malicious_result(&mal, Utc::now(), Some(Ok(results[0].clone())));
-        assert_eq!(
-            mal_decision.reason,
-            crate::policy::DecisionReason::Malicious
-        );
-        let allowed = crate::policy::PolicyEngine::new(&config).evaluate_with_malicious_result(
-            &cycling,
-            Utc::now(),
-            Some(Ok(results[1].clone())),
-        );
-        assert!(allowed.allowed);
-
-        config.policy.osv.on_error = crate::config::OsvErrorBehavior::Block;
-        let blocked = crate::policy::PolicyEngine::new(&config).evaluate_with_malicious_result(
-            &cycling,
-            Utc::now(),
-            Some(Ok(results[1].clone())),
-        );
-        assert_eq!(blocked.reason, crate::policy::DecisionReason::Vulnerable);
-        assert!(blocked.rule_id.is_none());
-        assert!(blocked.message.contains("OSV query"));
-    }
-
-    #[tokio::test]
-    async fn batch_preserves_known_mal_and_isolates_detail_errors() {
-        let (url, _) = live_mock().await;
-        let client = OsvHttpClient::new(url);
-        let bad = Artifact::package(Ecosystem::Npm, "demo", "mal-bad", None);
-        let clean = Artifact::package(Ecosystem::Npm, "demo", "clean", None);
-        let results = client.check_many(&[bad.clone(), clean]).await.unwrap();
-        assert!(
-            results[0]
-                .iter()
-                .any(|finding| finding.osv_id.starts_with("MAL-"))
-        );
-        assert!(
-            results[0]
-                .iter()
-                .any(|finding| finding.evaluation_error.is_some())
-        );
-        assert_eq!(results[1].len(), 1);
-        assert!(results[1][0].evaluation_error.is_none());
-
-        let mut config = Config::default();
-        config.policy.osv.on_error = crate::config::OsvErrorBehavior::Allow;
-        let decision = crate::policy::PolicyEngine::new(&config).evaluate_with_malicious_result(
-            &bad,
-            Utc::now(),
-            Some(Ok(results[0].clone())),
-        );
-        assert_eq!(decision.reason, crate::policy::DecisionReason::Malicious);
-    }
-
-    #[tokio::test]
-    async fn mismatched_detail_identity_is_assigned_to_requesting_artifact() {
-        let (url, _) = live_mock().await;
-        let client = OsvHttpClient::new(url);
-        let artifact = Artifact::package(Ecosystem::Npm, "demo", "mismatch", None);
-        let findings = client.check_many(&[artifact]).await.unwrap();
-        assert_eq!(findings[0].len(), 1);
-        assert!(
-            findings[0][0]
-                .evaluation_error
-                .as_deref()
-                .unwrap()
-                .contains("ID mismatch")
-        );
-    }
-
-    #[tokio::test]
-    async fn withdrawn_live_single_and_batch_findings_are_ignored() {
-        let (url, _) = live_mock().await;
-        let client = OsvHttpClient::new(url);
-        let artifact = Artifact::package(Ecosystem::Npm, "demo", "withdrawn", None);
-        assert!(client.check(&artifact).await.unwrap().is_empty());
-        assert!(client.check_many(&[artifact]).await.unwrap()[0].is_empty());
-    }
 
     fn severity(severity_type: &str, vector: &str) -> OsvSeverity {
         OsvSeverity {
@@ -3438,25 +2597,6 @@ mod tests {
     }
 
     #[test]
-    fn repeated_matching_affected_entries_choose_highest_package_score() {
-        let vulnerability: OsvVulnerability = serde_json::from_str(
-            r#"{
-              "id":"GHSA-repeated","modified":"2026-07-11T00:00:00Z",
-              "affected":[
-                {"package":{"ecosystem":"npm","name":"demo"},"severity":[{"type":"CVSS_V2","score":"AV:A/AC:H/Au:N/C:C/I:C/A:C"}]},
-                {"package":{"ecosystem":"npm","name":"demo"},"severity":[{"type":"CVSS_V3","score":"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}]}
-              ]
-            }"#,
-        )
-        .unwrap();
-        let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None);
-        let finding = finding_from_vulnerability(vulnerability, &artifact)
-            .unwrap()
-            .unwrap();
-        assert_eq!(finding.effective_severity.unwrap().base_score, 9.8);
-    }
-
-    #[test]
     fn missing_and_unknown_severity_are_unscored() {
         assert_eq!(effective_osv_severity(&[], None).unwrap(), None);
         assert_eq!(
@@ -3502,34 +2642,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_osv_response_without_vulns_as_empty() {
-        let parsed = serde_json::from_str::<OsvQueryResponse>("{}").unwrap();
-        assert!(parsed.vulns.is_empty());
-    }
-
-    #[test]
-    fn parses_osv_response_hits() {
-        let parsed = serde_json::from_str::<OsvQueryResponse>(
-            r#"{
-              "vulns": [
-                {
-                  "id": "MAL-2026-000001",
-                  "summary": "Malicious package",
-                  "modified": "2026-07-05T12:00:00Z"
-                }
-              ]
-            }"#,
-        )
-        .unwrap();
-        assert_eq!(parsed.vulns[0].id, "MAL-2026-000001");
-        assert_eq!(
-            parsed.vulns[0].summary.as_deref(),
-            Some("Malicious package")
-        );
-        assert!(parsed.vulns[0].modified.is_some());
-    }
-
-    #[test]
     fn osv_ecosystem_names_match_api_expectations() {
         let npm = Artifact::package(Ecosystem::Npm, "lodash", "4.17.21", None);
         let pypi = Artifact::package(Ecosystem::Pypi, "Requests", "2.32.3", None);
@@ -3557,6 +2669,48 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_count, 1);
+    }
+
+    #[test]
+    fn sqlite_schema_adds_revision_and_fingerprint_columns_to_existing_store() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("legacy-columns.sqlite");
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE sync_state (
+                    ecosystem TEXT PRIMARY KEY NOT NULL,
+                    source TEXT NOT NULL,
+                    high_watermark TEXT,
+                    last_success_at TEXT,
+                    last_attempted_at TEXT,
+                    status TEXT NOT NULL,
+                    error_summary TEXT
+                 );
+                 CREATE TABLE osv_advisories (
+                    generation_id INTEGER NOT NULL,
+                    osv_id TEXT NOT NULL,
+                    summary TEXT,
+                    modified TEXT,
+                    published TEXT,
+                    withdrawn TEXT,
+                    raw_json TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    imported_at TEXT NOT NULL,
+                    PRIMARY KEY (generation_id, osv_id)
+                 );",
+            )
+            .unwrap();
+        drop(connection);
+
+        SqliteMaliciousChecker::initialize(&db).unwrap();
+
+        let connection = Connection::open(&db).unwrap();
+        let sync_columns = table_columns(&connection, "sync_state");
+        assert!(sync_columns.contains(&"active_generation_id".to_string()));
+        assert!(sync_columns.contains(&"content_revision".to_string()));
+        let advisory_columns = table_columns(&connection, "osv_advisories");
+        assert!(advisory_columns.contains(&"content_fingerprint".to_string()));
     }
 
     #[tokio::test]
@@ -3735,7 +2889,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_checker_uses_sqlite_for_local_source() {
+    async fn configured_checker_uses_sqlite() {
         let dir = tempdir().unwrap();
         let db = initialized_db(dir.path());
         let connection = Connection::open(&db).unwrap();
@@ -3749,8 +2903,6 @@ mod tests {
             Some("local factory hit"),
         );
         let mut config = Config::default();
-        config.policy.osv.source = OsvSource::Local;
-        config.policy.osv.api_url = "http://127.0.0.1:9".to_string();
         config.policy.osv.local.sqlite_path = db;
         let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None);
 
@@ -4487,7 +3639,7 @@ INSERT INTO advisories (
     }
 
     #[tokio::test]
-    async fn local_import_matches_live_severity_for_repeated_unscored_and_malformed_records() {
+    async fn local_import_preserves_scored_unscored_and_malformed_records() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("parity.sqlite");
         let config = local_config_for(&db);
@@ -4517,20 +3669,26 @@ INSERT INTO advisories (
         let artifact = Artifact::package(Ecosystem::Npm, "demo", "1.2.3", None);
         let local = checker_for(&db).check(&artifact).await.unwrap();
 
-        for raw in [scored.as_slice(), unscored.as_slice(), malformed.as_slice()] {
-            let vulnerability: OsvVulnerability = serde_json::from_slice(raw).unwrap();
-            let expected = match finding_from_vulnerability(vulnerability.clone(), &artifact) {
-                Ok(Some(finding)) => finding,
-                Err(error) => error_finding(vulnerability.id, error.to_string()),
-                Ok(None) => unreachable!(),
-            };
-            let actual = local
-                .iter()
-                .find(|finding| finding.osv_id == expected.osv_id)
-                .unwrap();
-            assert_eq!(actual.effective_severity, expected.effective_severity);
-            assert_eq!(actual.evaluation_error, expected.evaluation_error);
-        }
+        let scored = local
+            .iter()
+            .find(|finding| finding.osv_id == "GHSA-scored")
+            .unwrap();
+        assert_eq!(scored.effective_severity.as_ref().unwrap().base_score, 9.8);
+        assert!(scored.evaluation_error.is_none());
+
+        let unscored = local
+            .iter()
+            .find(|finding| finding.osv_id == "GHSA-unscored")
+            .unwrap();
+        assert!(unscored.effective_severity.is_none());
+        assert!(unscored.evaluation_error.is_none());
+
+        let malformed = local
+            .iter()
+            .find(|finding| finding.osv_id == "GHSA-malformed")
+            .unwrap();
+        assert!(malformed.effective_severity.is_none());
+        assert!(malformed.evaluation_error.is_some());
     }
 
     #[tokio::test]
@@ -4733,11 +3891,15 @@ INSERT INTO advisories (
             (advisory_json_url(Ecosystem::Npm, "MAL-2026-000001"), second),
         ]);
         sync_malicious(&config, &client).await.unwrap();
+        let connection = Connection::open(&db).unwrap();
+        assert_eq!(stored_content_revision(&connection, "npm"), 1);
 
         let report = sync_malicious(&config, &client).await.unwrap();
 
         assert_eq!(report.ecosystems[0].mode, MaliciousSyncMode::Incremental);
+        assert_eq!(stored_content_revision(&connection, "npm"), 1);
         let checker = checker_for(&db);
+        assert_eq!(checker.content_revision(Ecosystem::Npm).await.unwrap(), 1);
         assert!(
             checker
                 .check(&Artifact::package(Ecosystem::Npm, "demo", "1.0.0", None))
@@ -4753,6 +3915,79 @@ INSERT INTO advisories (
                 .osv_id,
             "MAL-2026-000001"
         );
+
+        let no_op = sync_malicious(&config, &client).await.unwrap();
+        assert_eq!(no_op.ecosystems[0].imported, 0);
+        assert_eq!(stored_content_revision(&connection, "npm"), 1);
+    }
+
+    #[test]
+    fn content_revision_advances_only_for_changed_advisory_content() {
+        let dir = tempdir().unwrap();
+        let db = initialized_db(dir.path());
+        let mut connection = Connection::open(&db).unwrap();
+        insert_healthy_sync_state(&connection, "npm");
+        let first = parse_osv_advisory_bytes(
+            &advisory_json(
+                "MAL-2026-000001",
+                "npm",
+                "demo",
+                &["1.0.0"],
+                r#""ranges":[]"#,
+                None,
+            ),
+            false,
+        )
+        .unwrap();
+        let changed = parse_osv_advisory_bytes(
+            &advisory_json(
+                "MAL-2026-000001",
+                "npm",
+                "demo",
+                &["2.0.0"],
+                r#""ranges":[]"#,
+                None,
+            ),
+            false,
+        )
+        .unwrap();
+        let now = Utc::now();
+
+        import_advisories_and_record_success(
+            &mut connection,
+            Ecosystem::Npm,
+            std::slice::from_ref(&first),
+            now,
+            "npm",
+            Some("2026-07-02T00:00:00Z".to_string()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(stored_content_revision(&connection, "npm"), 1);
+
+        import_advisories_and_record_success(
+            &mut connection,
+            Ecosystem::Npm,
+            std::slice::from_ref(&first),
+            now,
+            "npm",
+            Some("2026-07-02T00:00:00Z".to_string()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(stored_content_revision(&connection, "npm"), 1);
+
+        import_advisories_and_record_success(
+            &mut connection,
+            Ecosystem::Npm,
+            &[changed],
+            now,
+            "npm",
+            Some("2026-07-02T00:00:00Z".to_string()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(stored_content_revision(&connection, "npm"), 2);
     }
 
     #[tokio::test]
@@ -4828,6 +4063,8 @@ INSERT INTO advisories (
             (all_zip_url(Ecosystem::CratesIo), zip_bytes([])),
         ]);
         sync_malicious(&config, &bootstrap_client).await.unwrap();
+        let connection = Connection::open(&db).unwrap();
+        assert_eq!(stored_content_revision(&connection, "npm"), 1);
         let client = FixtureDumpClient::new([
             (
                 modified_id_csv_url(Ecosystem::Npm),
@@ -4853,7 +4090,7 @@ INSERT INTO advisories (
             .await
             .unwrap();
         assert_eq!(hits[0].osv_id, "MAL-2026-000001");
-        let connection = Connection::open(&db).unwrap();
+        assert_eq!(stored_content_revision(&connection, "npm"), 1);
         let (status, error_summary): (String, Option<String>) = connection
             .query_row(
                 "SELECT status, error_summary FROM sync_state WHERE ecosystem = 'npm'",
@@ -4982,17 +4219,18 @@ INSERT INTO advisories (
     }
 
     #[test]
-    fn modified_id_csv_compares_fractional_timestamps_chronologically() {
+    fn modified_id_csv_replays_equal_timestamp_and_keeps_newer_fractional_rows() {
         let rows = parse_modified_id_csv(
             b"2026-07-07T17:16:49Z,MAL-2026-000001\n2026-07-07T17:16:49.1Z,MAL-2026-000002\n",
             Some("2026-07-07T17:16:49Z"),
         )
         .unwrap();
 
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].osv_id, "MAL-2026-000002");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].osv_id, "MAL-2026-000001");
+        assert_eq!(rows[1].osv_id, "MAL-2026-000002");
         assert_eq!(
-            serialize_high_watermark(rows[0].modified_at),
+            serialize_high_watermark(rows[1].modified_at),
             "2026-07-07T17:16:49.100000000Z"
         );
     }
@@ -5249,6 +4487,27 @@ INSERT OR REPLACE INTO sync_state (
                 [ecosystem],
                 |row| row.get(0),
             )
+            .unwrap()
+    }
+
+    fn stored_content_revision(connection: &Connection, ecosystem: &str) -> i64 {
+        connection
+            .query_row(
+                "SELECT content_revision FROM sync_state WHERE ecosystem=?1",
+                [ecosystem],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn table_columns(connection: &Connection, table: &str) -> Vec<String> {
+        let mut statement = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap()
     }
 
