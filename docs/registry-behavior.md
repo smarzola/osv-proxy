@@ -1,26 +1,39 @@
-# Registry Behavior
+# Review registry and HTTP behavior
 
-## Cargo sparse registry
+This reference describes the supported read-only routes and their policy,
+cache, and package-file behavior.
 
-`/cargo/config.json` provides proxy downloads. Sparse JSON-lines records are
-validated and policy-filtered without rewriting retained bytes. Filtered index
-responses have a content ETag and support `If-None-Match`; direct `.crate`
-downloads recheck policy before redirecting or proxying exact upstream bytes.
+## Common policy behavior
 
-Under the default OSV policy, metadata omits versions matching either `MAL-*`
-or other active advisories at the inclusive CVSS threshold. Direct npm
-tarballs, PyPI files, Cargo crates, Go `.mod`/`.zip` files, NuGet
-`.nupkg`/`.nuspec` requests, RubyGems `.gem` requests, and Maven artifacts
-rebuild the canonical artifact and re-run the same
-policy before fetching package bytes. Denials use `reason: malicious` for
-`MAL-*` and `reason: vulnerable` for other advisories. An exact allowlist with
-`bypass_osv: true` is the only OSV bypass.
+Metadata routes remove denied versions or files before a package manager
+resolves a dependency. Retained download URLs point back through
+`osv-proxy`.
 
-## HTTP Responses
+Package-file routes rebuild the exact canonical artifact and evaluate current
+policy before redirecting or contacting the upstream file origin. They never
+use the metadata cache.
 
-Blocked requests return HTTP 403 with the structured decision model.
+The default OSV policy has the following effects:
 
-Malicious block:
+- A matching `MAL-*` record blocks with reason `malicious`.
+- Another active matching advisory blocks with reason `vulnerable` when it
+  meets the inclusive CVSS threshold.
+- At the default threshold of zero, matching unscored advisories also block.
+- An exact allowlist entry with `bypass_osv: true` is the only OSV bypass.
+
+## HTTP status behavior
+
+| Condition | Response |
+| --- | --- |
+| Direct policy denial | HTTP `403` with a structured decision |
+| Route not found or requested file does not match registry metadata | HTTP `404` |
+| Unsupported method on an owned route | HTTP `405` |
+| Ingress or outbound-capacity timeout | HTTP `503` with `Retry-After: 1` |
+| Invalid or failed upstream response | Structured gateway error |
+| Allowed file in redirect mode | HTTP `302` |
+| Allowed file in proxy mode | Validated upstream status, headers, and body |
+
+A malicious-package denial has this form:
 
 ```json
 {
@@ -33,7 +46,7 @@ Malicious block:
 }
 ```
 
-Scored vulnerability block:
+A scored vulnerability denial has this form:
 
 ```json
 {
@@ -47,21 +60,7 @@ Scored vulnerability block:
 }
 ```
 
-Unscored vulnerability block at the default zero threshold (`cvss_score` is
-omitted when absent):
-
-```json
-{
-  "allowed": false,
-  "reason": "vulnerable",
-  "package": "pypi:some-package@1.2.3",
-  "message": "Blocked by OSV vulnerability GHSA-wxyz-5678",
-  "source": "osv",
-  "rule_id": "GHSA-wxyz-5678"
-}
-```
-
-Age-gate block:
+An age denial has this form:
 
 ```json
 {
@@ -74,41 +73,29 @@ Age-gate block:
 }
 ```
 
-Manual block:
+## Health and readiness
 
-```json
-{
-  "allowed": false,
-  "reason": "manually_blocked",
-  "package": "npm:event-stream@3.3.6",
-  "message": "Blocked by local blocklist: Known problematic package"
-}
-```
-
-## Health Endpoints
-
-`GET /healthz` is dependency-free liveness:
+`GET /healthz` returns dependency-free liveness:
 
 ```json
 {"live":true}
 ```
 
-Liveness remains available when the ingress budget is saturated.
+Liveness remains outside ingress admission.
 
-`GET /readyz` reports all seven supported ecosystem datasets. Readiness requires
-each active generation to be healthy, complete when vulnerability blocking is
-enabled, and within the configured staleness policy. An unready report returns
-HTTP 503; a ready report returns 200.
-Readiness consumes the shared ingress budget, so saturation returns the same
-immediate HTTP 503 and `Retry-After: 1` as registry admission without entering
-local SQLite evaluation.
+`GET /readyz` reports all seven local OSV datasets. A ready response returns
+HTTP `200`. Missing, incomplete, unhealthy, or stale required data returns
+HTTP `503`.
 
 ```json
 {
   "ready": false,
   "osv_source": "local",
   "ecosystems": [
-    {"ecosystem": "npm", "ready": true},
+    {
+      "ecosystem": "npm",
+      "ready": true
+    },
     {
       "ecosystem": "Maven",
       "ready": false,
@@ -118,72 +105,129 @@ local SQLite evaluation.
 }
 ```
 
-The real response contains one entry for every supported ecosystem; the example
-is shortened for readability.
+The example shortens the ecosystem list. The actual response includes every
+supported ecosystem. Readiness uses the ingress budget; saturation returns
+HTTP `503` without entering SQLite evaluation.
 
-## Metadata Cache
+## Filtered metadata cache
 
-Supported policy-filtered metadata GET routes cache the complete response. The
-cache key includes exact path/query, material representation and conditional
-headers, and the ecosystem's committed OSV content revision. Identical misses
-coalesce; distinct fills are bounded. Transient checker/revision failures,
-non-200 responses, overloads, and oversized bodies are not retained.
+The following responses can enter the cache after successful policy filtering:
 
-Static discovery/configuration routes and every artifact route remain uncached.
-Artifact delivery rebuilds the exact canonical artifact and evaluates current
-policy before redirecting or proxying bytes. A content-changing OSV sync
-advances the revision transactionally, making older metadata entries
-unreachable on the next request.
+| Ecosystem | Cached response |
+| --- | --- |
+| Cargo | Sparse index record |
+| Go | Version list, latest version, and version information |
+| Maven | Version-bearing metadata and owned checksum forms |
+| npm | Package metadata |
+| NuGet | Registration and flat-container version index |
+| PyPI | Project Simple JSON or rendered HTML |
+| RubyGems | Per-gem Compact Index info |
 
-SIGINT and SIGTERM stop accepting new connections and allow in-flight requests
-and artifact streams 30 seconds to drain. After that opportunity, remaining
-route work and streams are canceled; forced-close coordination may take up to
-one additional second.
+The cache key includes the exact path and query, representation and conditional
+headers, range inputs, and the ecosystem's committed OSV content revision.
+Identical misses share one fill, and distinct fills are bounded.
 
-## npm Routes
+The cache does not retain non-success responses, overloads, oversized bodies,
+or transient checker and revision errors. A content-changing OSV commit
+advances the revision and makes older entries unreachable to new requests.
 
-Supported routes:
+Static discovery responses and package-file routes remain outside the cache.
+
+## Cargo sparse registry
+
+Supported routes include:
+
+- `GET /cargo/config.json`
+- Cargo sparse index paths under `/cargo/`
+- Proxy-owned `.crate` download paths
+
+`/cargo/config.json` advertises proxy-owned downloads. The proxy validates and
+filters sparse JSON-lines records without rewriting the bytes of retained
+records. A filtered index response has a proxy-owned ETag and supports
+`If-None-Match`.
+
+A `.crate` request rebuilds package identity and evaluates current policy
+before redirecting or streaming the exact upstream bytes.
+
+## Go module proxy
+
+The `/go/` prefix implements:
+
+- `@v/list`
+- `@latest`
+- `@v/<version>.info`
+- `@v/<version>.mod`
+- `@v/<version>.zip`
+
+The proxy applies Go's `!` escaping for uppercase module path and version
+characters.
+
+Version discovery enriches at most 256 versions with at most 16 requests in
+flight, applies policy, and returns deterministic Go-semver order. An
+enrichment error fails the discovery response closed.
+
+Version information can enter the filtered metadata cache. `.mod` and `.zip`
+requests remain uncached and evaluate current policy. Allowed module bytes
+remain unchanged so Go checksum verification continues to work.
+
+An upstream `404` or `410` remains a fallback signal for `GOPROXY`. Policy
+denials use terminal HTTP `403`.
+
+## Maven repository
+
+The `/maven/` prefix exposes a read-only Maven Central-compatible release
+repository for Maven and Gradle.
+
+Version-bearing `maven-metadata.xml` removes denied versions before dynamic
+selection. The proxy owns filtered ETags and matching checksum sidecars.
+Conditional requests use weak ETag comparison. Bounded plugin-prefix metadata
+passes through unchanged because it does not identify a package version.
+
+Direct requests cover the following release files:
+
+- POMs and JARs.
+- Gradle `.module` metadata.
+- Classifiers.
+- Signatures.
+- Checksums.
+
+Each direct request resolves `groupId:artifactId:version` and evaluates current
+policy. POM metadata supplies publication time and SHA-256 when available.
+Other files do not inherit the POM hash.
+
+`GET` and `HEAD` denials return structured HTTP `403`. Redirect mode validates
+the upstream file with `HEAD` before it returns the location.
+
+Snapshots, authentication, publishing, search, and multi-repository
+aggregation are not supported. Client-side Maven and Gradle caches remain
+outside proxy control.
+
+## npm registry
+
+Supported routes include:
 
 - `GET /npm/{package}`
 - `GET /npm/@{scope}/{package}`
 - `GET /npm/{package}/-/{tarball}`
 - `GET /npm/@{scope}/{package}/-/{tarball}`
 
-Examples:
+For package metadata, the proxy performs the following steps:
 
-- `GET /npm/lodash`
-- `GET /npm/@babel/core`
-- `GET /npm/lodash/-/lodash-4.17.21.tgz`
-- `GET /npm/@babel/core/-/core-7.24.0.tgz`
+1. Fetches upstream package metadata.
+2. Builds one canonical artifact for each version.
+3. Evaluates policy in a batch.
+4. Removes denied versions.
+5. Rewrites retained `dist.tarball` URLs through `osv-proxy`.
+6. Preserves `dist.integrity` and `dist.shasum`.
+7. Recomputes `dist-tags` so that they do not name removed versions.
 
-For metadata requests:
+A tarball request fetches the requested version's metadata and requires the
+requested basename to match the upstream `dist.tarball` basename exactly. A
+mismatch returns HTTP `404` without redirecting or fetching package bytes.
 
-1. Fetch raw metadata from upstream npm registry.
-2. Parse all versions.
-3. Build an artifact for each version.
-4. Evaluate policy.
-5. Remove blocked versions from metadata.
-6. Rewrite allowed versions' `dist.tarball` URLs to `osv-proxy` artifact URLs.
-7. Preserve `dist.integrity` and `dist.shasum`.
-8. Recompute `dist-tags` so they do not point to filtered versions.
-9. Return filtered metadata.
+## NuGet V3 restore
 
-Tarball requests fetch the version's upstream metadata, require the requested
-tarball basename to exactly match that version's upstream `dist.tarball`
-basename, and then evaluate policy again before artifact delivery. A basename
-mismatch returns `404` and does not fetch or redirect artifact bytes.
-
-## PyPI Routes
-
-Supported routes:
-
-- `GET /pypi/simple/`
-- `GET /pypi/simple/{project}/`
-- `GET /pypi/packages/{project}/{version}/{filename}`
-
-## NuGet V3 Restore Routes
-
-Supported read-only restore routes:
+Supported routes include:
 
 - `GET /nuget/v3/index.json`
 - `GET /nuget/v3/registration-semver2/{id}/...json`
@@ -191,132 +235,107 @@ Supported read-only restore routes:
 - `GET /nuget/v3/flatcontainer/{id}/{version}/{id}.{version}.nupkg`
 - `GET /nuget/v3/flatcontainer/{id}/{version}/{id}.nuspec`
 
-The service index advertises only these proxy-owned resources. Registration and
-flat-container discovery omit versions denied by policy; package bytes are
-rechecked before redirect or proxy delivery. Search, publish, delete, symbols,
-and authentication are unsupported.
+The service index advertises only proxy-owned restore resources. Registration
+and flat-container version indexes omit denied versions. Package and nuspec
+requests evaluate policy again before delivery.
 
-Examples:
+The proxy validates registration URLs discovered through the service index and
+registration pages before it fetches their bounded JSON.
 
-- `GET /pypi/simple/requests/`
-- `GET /pypi/packages/requests/2.32.3/requests-2.32.3-py3-none-any.whl`
+Search, publishing, deletion, symbols, authentication, and private registry
+hosting are not supported.
 
-For `/pypi/simple/{project}/`, policy is evaluated from upstream Simple JSON
-project metadata. This matters because the JSON API provides `files[].upload-time`
-for the age gate.
+## PyPI Simple API
 
-For `/pypi/simple/`, the proxy fetches the upstream Simple root and renders a
-minimal root page whose project links point at
-`{server.public_base_url}/pypi/simple/{project}/`. Upstream `/simple/...`
-links are not passed through to clients.
+Supported routes include:
 
-1. Normalize project name.
-2. Fetch upstream Simple JSON metadata.
-3. Extract filename, version, upstream URL, hashes, and `upload-time`.
-4. Build an artifact for every file/version.
-5. Evaluate policy.
-6. Remove blocked files.
-7. Recompute `versions` from allowed files.
-8. Rewrite allowed file URLs to `osv-proxy` artifact URLs.
-9. Return filtered Simple JSON when the client requests
-   `application/vnd.pypi.simple.v1+json`.
-10. Otherwise render a filtered Simple HTML page from the same filtered JSON
-    model.
+- `GET /pypi/simple/`
+- `GET /pypi/simple/{project}/`
+- `GET /pypi/packages/{project}/{version}/{filename}`
 
-File routes fetch upstream Simple JSON, rebuild the requested artifact, and
-evaluate policy again before artifact delivery.
+The Simple root returns proxy-owned project links. The root does not enter the
+filtered metadata cache.
 
-## Go module routes
+For a project page, the proxy performs the following steps:
 
-`/go/` implements the read-only GOPROXY routes `@v/list`, `@latest`,
-`@v/<version>.info`, `.mod`, and `.zip`. The proxy escapes uppercase module
-path and version characters using Go's `!` encoding. It enriches at most 256
-listed versions with at most 16 in flight, filters each one by policy, and
-returns a deterministic Go-semver-sorted result. An enrichment error fails the
-discovery response closed. Direct `.info`, `.mod`, and `.zip` requests rebuild
-the canonical artifact and re-evaluate policy; denials are terminal `403`.
+1. Normalizes the project name.
+2. Fetches upstream Simple JSON.
+3. Extracts filenames, versions, URLs, hashes, and `upload-time`.
+4. Builds one canonical artifact for every file.
+5. Evaluates policy in a batch.
+6. Removes denied files.
+7. Recomputes the `versions` collection from retained files.
+8. Rewrites retained file URLs through `osv-proxy`.
 
-Allowed `.mod` and `.zip` bytes are redirected or streamed unchanged, so Go's
-module checksum verification remains valid. A missing upstream module remains
-`404`/`410`, which is the only response class that permits GOPROXY fallback.
+When the client requests `application/vnd.pypi.simple.v1+json`, the proxy
+returns filtered Simple JSON. Otherwise, it renders filtered Simple HTML from
+the same model.
 
-## RubyGems / Bundler routes
+A package-file route fetches upstream Simple JSON, rebuilds the requested
+artifact, and evaluates current policy before delivery.
 
-Supported read-only Compact Index routes:
+## RubyGems Compact Index
+
+Supported routes include:
 
 - `GET /rubygems/versions`
 - `GET /rubygems/info/{gem}`
 - `GET /rubygems/gems/{filename}.gem`
 
-The global versions index preserves upstream Compact Index behavior. Per-gem
-info correlates every version/platform line with bounded upstream version
-metadata, validates its checksum and publication time, batch-evaluates policy,
-and removes denied variants without rewriting retained lines. Filtered bodies
-require cache revalidation and own their ETag, SHA-256 Digest/Repr-Digest, and
-byte-range responses.
+The global versions index preserves upstream Compact Index behavior. It does
+not enter the filtered metadata cache.
 
-Direct gem downloads resolve the requested filename to exactly one validated
-name/version/platform tuple and re-run policy before redirect or proxy delivery.
-Ambiguous or inconsistent metadata fails closed. The proxy validates registry
-metadata and its advertised SHA-256; it does not independently rehash streamed
-CDN bytes. Legacy Marshal indexes, standalone `gem install`, dependency/search
-APIs, publishing, yanking, authentication, and gem hosting are unsupported.
+Per-gem info correlates each version and platform with bounded upstream
+metadata, validates the checksum and publication time, applies policy in a
+batch, and removes denied variants without rewriting retained lines. A
+filtered body owns its ETag, SHA-256 `Digest` and `Repr-Digest`, conditional
+behavior, and byte-range responses.
 
-## Maven repository routes
+A gem request resolves the filename to exactly one validated package, version,
+and platform tuple. Ambiguous or inconsistent metadata fails closed. The proxy
+validates the checksum advertised by registry metadata; it does not
+independently hash streamed content-delivery bytes.
 
-`/maven/` exposes a read-only Maven Central-compatible release repository for
-Maven and Gradle. It filters artifact-level `maven-metadata.xml`, removing
-denied versions before dynamic version selection. Bounded, validated
-plugin-prefix metadata is passed through unchanged because it does not identify
-a version. Filtered metadata has a strong proxy-owned ETag and matching checksum
-sidecars; conditional requests apply weak ETag comparison.
+Legacy Marshal indexes, standalone `gem install`, dependency and search APIs,
+publishing, yanking, authentication, and private gem hosting are not
+supported.
 
-Direct POM, JAR, Gradle `.module`, classifier, signature, and checksum requests
-resolve the canonical `groupId:artifactId:version` identity and re-run policy
-before redirecting or streaming bytes. POM metadata supplies publication time
-and SHA-256 where available; non-POM files do not inherit the POM hash. `GET`
-and `HEAD` denials are structured `403` responses, and redirect mode validates
-the artifact with upstream `HEAD` before returning its location.
+## Package-file delivery modes
 
-Only releases are supported. Snapshots, private authentication, publishing,
-search, and repository aggregation are outside the route surface. Client-side
-caches remain outside proxy control.
-
-## Artifact Modes
-
-Redirect mode is the default public-service mode:
+Redirect mode is the default:
 
 ```text
-client -> osv-proxy artifact URL
-osv-proxy -> policy check
-if blocked -> 403
-if allowed -> 302 redirect to upstream artifact URL
-client -> downloads bytes from upstream registry/CDN
+client --> proxy-owned file URL
+       --> current policy check
+       --> 403 when denied
+       --> 302 to the validated upstream URL when allowed
 ```
 
-Plain proxy mode streams allowed artifact bytes through `osv-proxy`:
+Proxy mode streams bytes:
 
 ```text
-client -> osv-proxy artifact URL
-osv-proxy -> policy check
-if blocked -> 403
-if allowed -> fetch verified upstream artifact URL
-osv-proxy -> stream upstream status, body, and useful artifact headers
+client --> proxy-owned file URL
+       --> current policy check
+       --> 403 when denied
+       --> validated upstream fetch when allowed
+       --> streamed status, headers, and body
 ```
 
-Proxy mode forwards selected request headers such as `Range`, `If-None-Match`,
-and `If-Modified-Since`. It preserves useful upstream artifact response headers
-such as `Content-Type`, `Content-Length`, `ETag`, `Last-Modified`,
-`Accept-Ranges`, `Content-Range`, `Cache-Control`, and `Expires`.
+Proxy mode forwards selected range and conditional request headers. It
+preserves useful upstream response headers, including content type, length,
+ETag, modification time, range information, cache control, and expiry.
 
-Before connecting, proxy mode validates the URL and every resolved address.
-Public HTTPS CDN origins are accepted. Plain HTTP and non-public destinations
-are accepted only for an exact configured ecosystem origin or an explicit
-`artifacts.trusted_origins` entry. A configured origin cannot be borrowed by a
-different ecosystem or contacted on a different port. System proxy settings
-are ignored, and upstream redirects fail with `502` rather than being followed.
-NuGet applies the same checks to service-index registration resources and
-registration page links before fetching their bounded JSON metadata.
+Before it connects, the proxy validates the destination URL and resolved
+addresses. Public HTTPS content-delivery origins are allowed. Plain HTTP and
+non-public destinations require an exact configured ecosystem origin or an
+explicit `artifacts.trusted_origins` entry. The request ignores system proxy
+settings and rejects upstream redirects.
 
-`proxy_cache_s3` is not implemented. Configurations that select it are rejected
-until a future S3 cache milestone implements cache reads and writes.
+`proxy_cache_s3` is not implemented and fails configuration validation.
+
+## Graceful shutdown
+
+SIGINT and SIGTERM stop new connections and allow active registry requests and
+streams 30 seconds to drain. After that interval, the server cancels remaining
+route work and streams. Forced-close coordination can take up to one
+additional second.

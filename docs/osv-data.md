@@ -1,51 +1,134 @@
-# OSV Advisory Data
+# Manage OSV advisory data
 
-`osv-proxy` evaluates active OSV records for npm, PyPI, Go, crates.io, NuGet,
-RubyGems, and Maven. `MAL-*` records are classified as known malicious packages. Other IDs
-are vulnerabilities and are evaluated against `policy.osv.minimum_cvss_score`.
+`osv-proxy` evaluates OSV policy from local SQLite. It synchronizes advisory
+data for npm, PyPI, Go, crates.io, NuGet, RubyGems, and Maven.
 
-Local SQLite is the only policy source and performs no OSV network request on
-the install path. Populate it with the canonical command:
+Run synchronization before the first server start:
 
 ```sh
+osv-proxy config validate --config /path/to/osv-proxy.yaml
 osv-proxy osv sync --config /path/to/osv-proxy.yaml
 ```
 
-`malicious sync` remains a compatibility alias. Bootstrap imports all supported
-advisory IDs into a staging generation, catches up changes published alongside
-the archive, and atomically activates the complete generation. Incremental sync
-uses only consumed OSV source timestamps. An upgraded malicious-only database
-is marked version 0 and cannot return a clean vulnerability result until this
-full bootstrap succeeds.
+`malicious sync` remains a compatibility alias. New automation should use
+`osv sync`.
 
-Each sync run attempts all seven ecosystems and reports successes and failures
-separately, so an early failure does not prevent later generation updates.
-Only one explicit or background run may operate on a SQLite store at a time,
-including across processes; a sidecar advisory lock is held for the full run.
-Background sync retries only failed ecosystems with bounded exponential backoff;
-a fully successful cycle waits for the configured normal interval. Background
-sync is enabled by default and the normal interval defaults to one hour.
+## Understand the stored data
 
-The compact schema stores advisory metadata, affected occurrences, exact
-versions, ranges/events, and each occurrence's selected severity type, original
-vector, base score, or evaluation error. Raw source JSON is retained only when
-`retain_raw_advisories: true`. Repeated `affected[]` entries remain independent.
-Exact and range findings are unioned and withdrawn advisories are excluded.
+The compact schema stores the following data:
 
-Each ecosystem has a durable content revision. Import commits advance it only
-when normalized advisory content changes, in the same transaction that exposes
-the change. No-op and failed syncs preserve it. Policy-filtered metadata cache
-keys include this revision, so a request after a content-changing commit cannot
-use an older response.
+- Advisory identifiers, modification state, and withdrawal state.
+- Normalized affected ecosystems and package names.
+- Exact affected versions.
+- Range types and ordered range events.
+- Selected severity type, vector, base score, or evaluation error.
+- Per-ecosystem generation, health, source timestamp, and content revision.
 
-Full advisory storage is materially larger than a malicious-only dataset. The
-current reference database is about 195 MiB without raw advisory JSON. Plan
-disk capacity for dataset growth and SQLite WAL activity during sync.
+Set `retain_raw_advisories: true` only when you need the full source JSON for
+audit or debugging. The default value is `false`.
 
-Missing, corrupt, unhealthy, incomplete, or stale data follows `on_error` and
-`local.on_stale`; both block by default. A failed staging import rolls back and
-does not expose partial data. Exact allowlist entries with `bypass_osv: true`
-skip both malicious and vulnerability checks.
+The reference all-ecosystem database measured about 195 MiB without raw JSON.
+Allow additional disk capacity for dataset growth and SQLite write-ahead-log
+activity.
 
-For request-path performance measurements, resource numbers, and fast-boot
-deployment patterns, see [performance and fast boot](performance.md).
+## Understand bootstrap and incremental sync
+
+A bootstrap performs the following steps:
+
+1. Downloads and validates the ecosystem archive.
+2. Imports records into a staging generation.
+3. Catches up changes published near the archive boundary.
+4. Activates the complete generation in one transaction.
+
+A failed bootstrap rolls back and leaves the previous active generation
+unchanged.
+
+An incremental sync reads changes after the consumed OSV source timestamp.
+Rows at the exact high-watermark timestamp replay safely so that equal
+timestamps cannot hide distinct records. Changed advisory data replaces the
+normalized rows in one transaction.
+
+Each requested ecosystem succeeds or fails independently. A failure in one
+ecosystem does not prevent another ecosystem from committing a healthy update.
+
+## Understand cache invalidation
+
+Each ecosystem has a monotonically increasing content revision. A transaction
+advances it only when normalized advisory content changes.
+
+The filtered metadata cache includes the revision in its key. After a
+content-changing commit, a new request cannot use metadata filtered at the
+previous revision. No-op and failed syncs preserve the revision.
+
+## Run background synchronization
+
+The default server configuration enables background sync:
+
+```yaml
+policy:
+  osv:
+    local:
+      background_sync: true
+      sync_interval: "1h"
+```
+
+The server starts one update immediately without waiting for it. A complete,
+non-stale database remains ready while an incremental update runs. Missing,
+incomplete, unhealthy, or stale data remains unready until a successful sync
+satisfies policy.
+
+A fully successful cycle waits for `sync_interval` before it starts the next
+cycle. Failed ecosystems retry independently with bounded exponential backoff
+from five seconds through five minutes.
+
+Set `background_sync: false` only when another component reliably owns
+synchronization.
+
+## Preseed the database
+
+Preseed the database when startup must not depend on OSV network availability:
+
+```sh
+mkdir -p /var/lib/osv-proxy
+osv-proxy config validate --config /etc/osv-proxy/osv-proxy.yaml
+osv-proxy osv sync --config /etc/osv-proxy/osv-proxy.yaml
+osv-proxy serve --config /etc/osv-proxy/osv-proxy.yaml
+```
+
+Run the sync in CI, an image-build job, or a deployment init job. Ship or mount
+the completed database only after the sync process exits.
+
+Do not copy a SQLite database while another process writes it. SQLite
+write-ahead logging allows live readers to continue using the last committed
+generation, but a filesystem copy must also account for active WAL state.
+
+## Prevent concurrent syncs
+
+Only one explicit or background sync can operate on a SQLite path at a time.
+The process holds an advisory lock on the adjacent
+`<sqlite_path>.sync.lock` file for the entire run. A concurrent process fails
+instead of interleaving writes.
+
+## Handle stale or invalid data
+
+The default failure posture is:
+
+```yaml
+policy:
+  osv:
+    on_error: "block"
+    local:
+      max_staleness: "24h"
+      on_stale: "block"
+```
+
+Missing, corrupt, unhealthy, incomplete, or stale data fails closed. `/readyz`
+reports each ecosystem separately and returns HTTP `503` if any required
+dataset is not ready.
+
+An upgraded malicious-only database has dataset version zero. It cannot
+produce a clean vulnerability result until an all-advisory bootstrap
+succeeds.
+
+An exact allowlist entry with `bypass_osv: true` skips both malicious and
+vulnerability checks for that version.

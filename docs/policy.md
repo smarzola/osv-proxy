@@ -1,37 +1,47 @@
-# Policy Model
+# Understand policy decisions
 
-The policy engine decides whether a canonical artifact is installable.
+`osv-proxy` evaluates one canonical artifact model across every registry. A
+decision records whether the package file is allowed and why.
 
-## Decision Model
+## Evaluation order
 
-```rust
-pub struct Decision {
-    pub allowed: bool,
-    pub reason: DecisionReason,
-    pub package: String,
-    pub message: String,
-    pub rule_id: Option<String>,
-    pub source: Option<String>,
-    pub published_at: Option<DateTime<Utc>>,
-    pub eligible_at: Option<DateTime<Utc>>,
-    pub cvss_score: Option<f64>,
-}
+The policy engine evaluates an artifact in the following order:
 
-pub enum DecisionReason {
-    Allowed,
-    Allowlisted,
-    TooYoung,
-    Malicious,
-    Vulnerable,
-    ManuallyBlocked,
-    MissingPublishTime,
-    Unknown,
-}
-```
+1. Match an exact-version allowlist entry.
+2. Skip OSV only when that entry sets `bypass_osv: true`.
+3. Otherwise, check local OSV data.
+4. Block a matching `MAL-*` record as `malicious` when malicious blocking is
+   enabled.
+5. Block another matching advisory as `vulnerable` when it meets the configured
+   CVSS threshold.
+6. Apply the manual blocklist.
+7. Skip the age gate only when the allowlist entry sets
+   `bypass_age_gate: true`.
+8. Apply the minimum-age and missing-publication-time policy.
+9. Allow the artifact when no rule blocks it.
 
-Optional fields are omitted from JSON when absent.
+Malicious findings take precedence over vulnerability findings. Manual blocks
+take precedence over age decisions.
 
-Allowed decision:
+## Decision response
+
+A decision contains the following fields:
+
+| Field | Description |
+| --- | --- |
+| `allowed` | Whether policy allows the artifact |
+| `reason` | Stable machine-readable reason |
+| `package` | Canonical ecosystem, package, and version identity |
+| `message` | Human-readable result |
+| `rule_id` | Matching allowlist, blocklist, or OSV identifier when present |
+| `source` | Decision source when present |
+| `published_at` | Registry publication time when known |
+| `eligible_at` | Earliest age-gate eligibility time when relevant |
+| `cvss_score` | Selected base score for a scored vulnerability |
+
+Optional fields are absent from JSON when they do not apply.
+
+An allowed decision has this form:
 
 ```json
 {
@@ -42,7 +52,7 @@ Allowed decision:
 }
 ```
 
-Blocked decision:
+A malicious-package decision has this form:
 
 ```json
 {
@@ -55,7 +65,7 @@ Blocked decision:
 }
 ```
 
-Scored vulnerability decision:
+A scored vulnerability decision has this form:
 
 ```json
 {
@@ -69,62 +79,7 @@ Scored vulnerability decision:
 }
 ```
 
-## Evaluation Order
-
-1. Build canonical `Artifact`.
-2. Check exact-version allowlist.
-3. If allowlist has `bypass_osv=true`, skip OSV check.
-4. Otherwise check OSV.
-5. If a `MAL-*` record matches and malicious blocking is enabled, block as `malicious`.
-6. If another active advisory meets the vulnerability threshold, block as `vulnerable`.
-7. Check manual local blocklist.
-8. If manually blocked, block.
-9. If allowlist has `bypass_age_gate=true`, skip age gate.
-10. Otherwise apply minimum age gate.
-11. If package is too young, block.
-12. If publish time is missing, follow `missing_publish_time` config.
-13. Otherwise allow.
-
-Allowlist entries are exact-version only.
-
-## Allowlist
-
-Allowed:
-
-```yaml
-allowlist:
-  - ecosystem: npm
-    name: lodash
-    version: "4.17.21"
-    bypass_age_gate: true
-    bypass_osv: false
-    reason: "Known safe old version"
-```
-
-Not supported:
-
-```yaml
-allowlist:
-  - ecosystem: npm
-    name: lodash
-    version: "*"
-```
-
-Bypassing OSV package blocks must be explicit and require a reason.
-
-```yaml
-allowlist:
-  - ecosystem: npm
-    name: some-package
-    version: "1.2.3"
-    bypass_age_gate: true
-    bypass_osv: true
-    reason: "False positive confirmed internally"
-```
-
-## Minimum Age Gate
-
-Default:
+## Configure the minimum-age gate
 
 ```yaml
 policy:
@@ -132,65 +87,113 @@ policy:
   missing_publish_time: "block"
 ```
 
-Behavior:
+The age gate follows these rules:
 
-- `published_at + minimum_age <= now` means allowed, subject to other policy.
-- `published_at + minimum_age > now` means blocked.
-- missing publish time follows `missing_publish_time`, either `block` or `allow`.
+- A version is old enough when `published_at + minimum_age` is no later than
+  the evaluation time.
+- A younger version receives reason `too_young`.
+- A missing publication time follows `missing_publish_time`.
+- An exact allowlist entry can bypass the age gate.
 
-The age gate applies during metadata filtering and artifact serving.
+Metadata filtering and package-file delivery both apply the age gate. Cached
+metadata expires at the earliest contained age transition, even when the
+configured cache time to live is longer.
 
-## OSV Advisory Blocking
+## Configure OSV blocking
 
-By default, active matching OSV advisories block. `MAL-*` IDs are classified as
-malicious and take precedence over vulnerability findings. Other IDs are
-classified as vulnerable.
+```yaml
+policy:
+  osv:
+    block_malicious: true
+    block_vulnerabilities: true
+    minimum_cvss_score: 0
+    on_error: "block"
+```
 
-Classification:
+`MAL-*` identifiers represent malicious-package records. Other active
+identifiers, including CVEs and GHSAs, represent vulnerabilities.
 
-- `MAL-*`: malicious
-- CVEs, GHSAs, and other advisories: vulnerable
+`minimum_cvss_score` is inclusive. `osv-proxy` selects the highest recognized
+CVSS v2, v3, or v4 base score that applies to the matching package occurrence.
+A nonempty package-level severity list takes precedence over the top-level
+severity list.
 
-`minimum_cvss_score` is inclusive: a score equal to the threshold blocks. The
-matching package's non-empty severity list overrides top-level severity, and
-the highest recognized CVSS v2/v3/v4 base score is used. At threshold zero,
-unscored matching advisories block. At positive thresholds they do not.
-Malformed recognized vectors follow `on_error`. Set
-`block_vulnerabilities: false` to preserve malicious-only behavior without
-vulnerability detail hydration.
+Threshold behavior is as follows:
 
-`on_error` applies to local checker failures, missing batch results, and
-malformed recognized severity vectors. With `block`, policy emits
-an OSV error decision; with `allow`, that error does not itself block. This is
-separate from a valid OSV finding: a matching finding is evaluated by its
-classification and threshold even when other advisory lookups fail.
+| Advisory | Threshold zero | Positive threshold |
+| --- | --- | --- |
+| Score meets or exceeds threshold | Block | Block |
+| Score is below threshold | Not applicable at zero | Allow |
+| No recognized score | Block | Allow |
+| Malformed recognized vector | Follow `on_error` | Follow `on_error` |
 
-OSV is checked during policy evaluation from synchronized local SQLite data.
-The install path makes no OSV network request. Remote data is consumed only by
-explicit or background dump synchronization.
+Set `block_vulnerabilities: false` to retain `MAL-*` blocking without general
+vulnerability blocking.
 
-Policy-filtered metadata may be retained in the bounded process cache.
-Content-changing syncs atomically advance the ecosystem revision used in cache
-identity, and package-age transitions shorten entry lifetime. Checker or
-revision failures use bounded singleflight but are never retained. Direct
-artifact routes always evaluate current policy again.
+`on_error` applies to SQLite checker failures, missing batch results, and
+malformed recognized CVSS vectors. `block` fails closed. `allow` permits that
+error but does not override a valid matching finding.
 
-## Manual Blocklist
+The install path reads synchronized SQLite data and makes no OSV network
+request. Policy or revision errors can share a bounded in-flight metadata fill,
+but the cache does not retain their results.
+
+## Configure an allowlist
+
+Allowlist entries match one exact version:
+
+```yaml
+allowlist:
+  - ecosystem: npm
+    name: "lodash"
+    version: "4.17.21"
+    bypass_age_gate: true
+    bypass_osv: false
+    reason: "Approved version"
+```
+
+Use `bypass_osv` only for a reviewed exception:
+
+```yaml
+allowlist:
+  - ecosystem: npm
+    name: "some-package"
+    version: "1.2.3"
+    bypass_age_gate: false
+    bypass_osv: true
+    reason: "False positive confirmed internally"
+```
+
+An OSV bypass requires a nonempty `reason`. Wildcard allowlist versions are
+not supported.
+
+## Configure a manual blocklist
+
+A blocklist entry accepts exact versions or `*`:
 
 ```yaml
 blocklist:
   - ecosystem: npm
     name: "event-stream"
     versions: ["*"]
-    reason: "Known problematic package"
+    reason: "Blocked after an internal incident"
   - ecosystem: pypi
     name: "example-package"
     versions: ["1.0.0", "1.0.1"]
-    reason: "Internal incident"
-  - ecosystem: npm
-    name: "lodash"
-    versions: ["<4.17.21"]
-    reason: "Legacy versions not allowed"
+    reason: "Versions fail internal policy"
 ```
 
-Version ranges can follow after exact-version behavior is stable.
+Version ranges are not supported.
+
+## Understand metadata and file enforcement
+
+Metadata routes remove denied versions before a package manager resolves a
+dependency. Retained file URLs point back through `osv-proxy`.
+
+Package-file routes rebuild the requested canonical artifact and evaluate
+current policy again. They do not use the metadata cache. A newly synchronized
+advisory can therefore block a file even when a client previously received
+metadata that advertised it.
+
+The proxy cannot revoke files already stored in a package manager's local
+cache.

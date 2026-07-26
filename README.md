@@ -1,60 +1,55 @@
 # osv-proxy
 
-`osv-proxy` is a package-registry security proxy for npm, PyPI,
-Cargo/crates.io, Go modules, NuGet restore, RubyGems/Bundler, and Maven Central
-for Maven and Gradle. It combines the
-[OSV vulnerability database](https://osv.dev/) with local policy.
+`osv-proxy` is a read-only package-registry security proxy that combines the
+[OSV vulnerability database](https://osv.dev/) with local policy. It filters
+registry metadata before dependency resolution and checks policy again before
+it redirects or proxies package files.
 
-It sits between package managers and public registries, filters package metadata
-through deterministic policy backed by OSV data and local rules, and checks the
-same policy again before delivering artifact downloads according to the
-configured artifact behavior.
+Use `osv-proxy` when you want one policy gate for npm, PyPI, Cargo, Go modules,
+NuGet, RubyGems, or Maven Central without adding OSV network calls to package
+install requests.
 
-## What It Does
+## How it works
 
-- Blocks package versions that are too new for the configured minimum age.
-- Blocks package versions with active OSV malicious-package and vulnerability
-  records.
-- Supports exact-version allowlist exceptions.
-- Supports exact-version and whole-package blocklist entries.
-- Filters npm metadata and PyPI Simple project metadata so blocked versions are
-  not offered to clients.
-- Rewrites allowed artifact URLs back through `osv-proxy`, then either redirects
-  to upstream or streams bytes through the proxy after a second policy check.
+For a metadata request, `osv-proxy` does the following:
 
-## Current Scope
+1. Fetches and validates metadata from the public registry or your configured
+   upstream.
+2. Removes package versions that fail OSV, minimum-age, allowlist, or blocklist
+   policy.
+3. Rewrites retained download URLs so that package files return through the
+   proxy for a second policy check.
 
-Implemented now:
+The proxy evaluates OSV policy from a synchronized local SQLite database. It
+does not call the OSV query API while serving registry, `check`, or `eval`
+requests.
 
-- npm metadata filtering and tarball delivery.
-- PyPI Simple JSON-backed filtering, HTML/JSON responses, and file delivery.
-- Go module proxy filtering for `@v/list`, `@latest`, `.info`, `.mod`, and `.zip`.
-- NuGet V3 restore service discovery, registration filtering, flat-container
-  version enumeration, and protected `.nupkg`/`.nuspec` delivery.
-- RubyGems Compact Index filtering and protected `.gem` delivery for modern
-  Bundler installs.
-- Maven metadata filtering and protected POM, JAR, Gradle module metadata,
-  classifier, signature, and checksum delivery for Maven and Gradle builds.
-- YAML config loading and validation.
-- `serve`, `check`, `eval`, `config validate`, `osv sync`, and the compatibility
-  `malicious sync` commands.
-- Local SQLite OSV advisory checks with explicit or automatic hourly OSV dump
-  synchronization and no OSV query API dependency on the install path.
-- Bounded in-process caching of complete policy-filtered metadata responses.
-- Redirect artifact behavior and plain artifact proxy behavior.
+Supported metadata responses use a bounded in-process cache. A cache hit skips
+the upstream fetch, parsing, SQLite policy evaluation, filtering, and
+serialization. Package files never enter this cache and always receive the
+delivery-time policy check.
 
-Not implemented yet:
+## Supported package managers
 
-- S3 artifact caching.
-- Authentication, publishing, license policy, or
-  broad package scanning.
+| Ecosystem | Clients and protocol | Metadata and file behavior |
+| --- | --- | --- |
+| Cargo | Cargo sparse registry | Filters index records; protects `.crate` files |
+| Go | `GOPROXY` | Filters version discovery; protects `.info`, `.mod`, and `.zip` |
+| Maven | Maven and Gradle | Filters release metadata; protects POMs, JARs, modules, classifiers, signatures, and checksums |
+| npm | npm, pnpm, Yarn, and Bun | Filters package metadata; protects tarballs |
+| NuGet | `dotnet restore` and NuGet V3 | Filters registration and version indexes; protects `.nupkg` and `.nuspec` files |
+| PyPI | pip, uv, and Poetry | Filters Simple JSON and HTML; protects distribution files |
+| RubyGems | Modern Bundler Compact Index | Filters gem versions; protects `.gem` files |
 
-## Install
+`osv-proxy` does not implement publishing, authentication, search, private
+registry hosting, license policy, S3 artifact caching, Maven snapshots, or
+legacy RubyGems indexes.
 
-Download a prebuilt binary from the
-[GitHub releases](https://github.com/smarzola/osv-proxy/releases) page.
+## Install osv-proxy
 
-Release archives are named by version and target:
+Download an archive and `SHA256SUMS` from
+[GitHub Releases](https://github.com/smarzola/osv-proxy/releases). Release
+archives use the following names:
 
 ```text
 osv-proxy-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz
@@ -63,160 +58,89 @@ osv-proxy-vX.Y.Z-x86_64-apple-darwin.tar.gz
 osv-proxy-vX.Y.Z-aarch64-apple-darwin.tar.gz
 ```
 
-Each release also includes `SHA256SUMS`.
-
-Build from source:
+To build from source, run:
 
 ```sh
-cargo build --release
+cargo build --release --locked
 ```
 
-Run the binary:
+## Start the proxy
 
-```sh
-osv-proxy config validate --config examples/basic/osv-proxy.yaml
-```
-
-## License
-
-`osv-proxy` is licensed under the Apache License, Version 2.0. OSV advisory
-data and upstream vulnerability records retain their original source licenses
-and attribution requirements when cached, exported, or redistributed.
-
-## Quick Start
-
-Validate the example config:
-
-```sh
-osv-proxy config validate --config examples/basic/osv-proxy.yaml
-```
-
-Start the proxy:
+The repository includes a working local configuration. Validate it, populate
+the OSV database, and start the server:
 
 ```sh
 mkdir -p data
+osv-proxy config validate --config examples/basic/osv-proxy.yaml
 osv-proxy osv sync --config examples/basic/osv-proxy.yaml
 osv-proxy serve --config examples/basic/osv-proxy.yaml
 ```
 
-The example uses the local SQLite OSV source by default. Preseeding the
-database before `serve` keeps startup independent of the OSV network and makes
-the first request follow the same fast path as steady-state requests. See
-[Performance and fast boot](docs/performance.md) for CI, image, and deployment
-patterns.
+Preseeding the database makes startup independent of OSV network availability.
+The default background task then starts an incremental update immediately and
+starts each later update one hour after the previous successful cycle.
 
-Point npm at the proxy:
+Check liveness and readiness:
+
+```sh
+curl --fail http://127.0.0.1:8080/healthz
+curl --fail http://127.0.0.1:8080/readyz
+```
+
+`/healthz` reports process liveness. `/readyz` returns HTTP `200` only when all
+seven OSV datasets satisfy health, completeness, and staleness requirements.
+
+## Configure a package manager
+
+The following examples use `http://127.0.0.1:8080`.
+
+Configure npm:
 
 ```sh
 npm config set registry http://127.0.0.1:8080/npm/
 ```
 
-Point pip at the proxy:
+Configure pip:
 
 ```sh
 pip config set global.index-url http://127.0.0.1:8080/pypi/simple/
 ```
 
-Use `uv` with the proxy:
+Configure Cargo in `.cargo/config.toml`:
+
+```toml
+[source.crates-io]
+replace-with = "osv-proxy"
+
+[source.osv-proxy]
+registry = "sparse+http://127.0.0.1:8080/cargo/"
+```
+
+Configure Go:
 
 ```sh
-uv pip install --index-url http://127.0.0.1:8080/pypi/simple/ requests
+export GOPROXY=http://127.0.0.1:8080/go
+export GONOSUMDB='*'
 ```
 
-Use Go modules with the proxy:
+Do not append `,direct` or another proxy when `osv-proxy` must enforce policy.
+Go can use those fallbacks after an upstream `404` or `410`.
 
-```sh
-GOPROXY=http://127.0.0.1:8080/go GONOSUMDB='*' go mod download
-```
+For NuGet, Bundler, Maven, Gradle, pnpm, uv, and Poetry instructions, see
+[Configure package-manager clients](docs/client-configuration.md).
 
-For a mandatory policy gate, use a single proxy URL. `GOPROXY` values such as
-`http://127.0.0.1:8080/go,direct` or a second public proxy allow Go to fall
-back after upstream `404`/`410` responses and can bypass this proxy. Keep
-private-module patterns out of `GONOPROXY`/`GOPRIVATE` when the proxy must
-enforce policy. `osv-proxy` returns `403` for policy denials, which Go treats
-as terminal rather than a fallback signal.
+## Configure security policy
 
-Use the proxy as the sole Bundler source in `Gemfile`:
-
-```ruby
-source "http://127.0.0.1:8080/rubygems/"
-```
-
-RubyGems support targets modern Bundler Compact Index installs. Standalone
-legacy `gem install` index protocols, search, publishing, yanking, private
-registry authentication, and gem hosting are unsupported.
-
-Use Maven with a mirror whose `mirrorOf` is `*`:
-
-```xml
-<mirror>
-  <id>osv-proxy</id>
-  <url>http://127.0.0.1:8080/maven/</url>
-  <mirrorOf>*</mirrorOf>
-</mirror>
-```
-
-For Gradle, declare `http://127.0.0.1:8080/maven/` as the sole Maven repository
-and enforce that repository policy in `settings.gradle`. Additional public
-repositories can bypass the proxy. Already-cached artifacts cannot be revoked;
-use a clean or refreshed dependency cache when validating a policy change.
-
-## Check a Package
-
-`check` fetches upstream registry metadata, builds the same canonical artifact
-context used by proxy routes, evaluates policy, and prints structured JSON:
-
-```sh
-osv-proxy check npm:lodash@4.17.21 \
-  --config examples/basic/osv-proxy.yaml
-```
-
-PyPI checks evaluate every file published for the requested version and allow
-the package only when every file is allowed:
-
-```sh
-osv-proxy check pypi:requests@2.32.3 \
-  --config examples/basic/osv-proxy.yaml
-```
-
-Package identities use this form:
-
-```text
-npm:lodash@4.17.21
-npm:@babel/core@7.24.0
-pypi:requests@2.32.3
-go:github.com/pkg/errors@v0.9.1
-rubygems:rails@8.0.2
-maven:org.apache.commons:commons-lang3@3.17.0
-```
-
-If upstream metadata is missing or malformed, `check` exits non-zero rather than
-evaluating a synthetic artifact.
-
-For manual policy evaluation without registry metadata, use `eval`. It is not
-proxy-equivalent and only evaluates the artifact fields supplied on the command
-line:
-
-```sh
-osv-proxy eval npm:lodash@4.17.21 \
-  --config examples/basic/osv-proxy.yaml \
-  --published-at 2026-06-01T00:00:00Z
-```
-
-## Configuration
-
-The default config is intentionally small:
+The example configuration uses the following security posture:
 
 ```yaml
-server:
-  bind: "127.0.0.1:8080"
-  public_base_url: "http://127.0.0.1:8080"
 metadata_cache:
   enabled: true
   capacity_bytes: 134217728
   max_entry_bytes: 16777216
   ttl: "5m"
   fill_concurrency: 8
+
 policy:
   minimum_age: "72h"
   missing_publish_time: "block"
@@ -228,172 +152,133 @@ policy:
     local:
       sqlite_path: "./data/osv-malicious.sqlite"
       max_staleness: "24h"
-      on_stale: block
+      on_stale: "block"
+      retain_raw_advisories: false
       background_sync: true
       sync_interval: "1h"
+
 artifacts:
-  behavior: redirect
+  behavior: "redirect"
 ```
 
-The npm registry, PyPI Simple API, Go module proxy, NuGet service index,
-RubyGems registry, and Maven Central repository default to their public URLs.
-Set `upstreams` only when using a mirror, fixture, or private gateway.
+These defaults have the following effects:
 
-For a shared or non-loopback deployment, place `osv-proxy` behind a trusted
-gateway or reverse proxy that provides TLS, authentication, client rate
-limiting, and edge access control. The process enforces configurable global
-ingress and outbound-request budgets, exposes `/healthz` and `/readyz`, and
-gracefully drains SIGINT/SIGTERM; see [configuration](docs/configuration.md) for
-the runtime limits and readiness contract.
+- A package version must be at least 72 hours old.
+- Missing publication times fail closed.
+- Matching `MAL-*` records block as malicious.
+- Other matching OSV advisories block at an inclusive CVSS threshold of zero.
+  At zero, matching unscored advisories also block.
+- OSV lookup failures and stale local data fail closed.
+- Complete filtered metadata responses use a 128 MiB weighted cache with a
+  16 MiB body limit, a five-minute maximum lifetime, and eight concurrent
+  distinct fills.
+- Allowed package files return an HTTP `302` redirect after the second policy
+  check.
 
-### OSV Data Source
+Set `policy.osv.block_vulnerabilities: false` if you want to block only OSV
+malicious-package records. Set `artifacts.behavior: proxy` if clients must
+receive package bytes through `osv-proxy`.
 
-Synchronized local SQLite data is the only OSV policy source. Metadata
-filtering, artifact serving, `check`, and `eval` make no OSV query API request.
-Populate or refresh the database explicitly with:
+See the [configuration reference](docs/configuration.md) for every field and
+validation rule. See the [policy reference](docs/policy.md) for evaluation
+order and decision semantics.
+
+## Keep OSV data current
+
+Run an explicit update at any time:
 
 ```sh
 osv-proxy osv sync --config /path/to/osv-proxy.yaml
 ```
 
-Local mode configuration:
+The command bootstraps missing or incomplete ecosystems and incrementally
+updates complete ones. Each ecosystem commits independently, and a failed
+import never replaces its last healthy generation.
 
-```yaml
-policy:
-  osv:
-    block_malicious: true
-    block_vulnerabilities: true
-    minimum_cvss_score: 0
-    on_error: block
-    local:
-      sqlite_path: "./data/osv-malicious.sqlite"
-      max_staleness: "24h"
-      on_stale: block
-      retain_raw_advisories: false
-      background_sync: true
-      sync_interval: "1h"
-```
+A content-changing commit also advances that ecosystem's durable revision.
+New metadata requests then use a new cache key and cannot receive a response
+filtered against older OSV content. No-op and failed syncs leave the revision
+unchanged.
 
-`on_error: block` and `on_stale: block` fail closed by default. Missing,
-corrupt, incomplete, unhealthy, or stale local data blocks OSV checks instead of
-silently allowing installs. `background_sync: true` runs an immediate sync in
-the background and repeats it after `sync_interval`; a valid non-stale database
-remains available while it refreshes. Missing or stale data keeps readiness and
-default fail-closed policy checks unavailable until synchronization succeeds.
-Automatic sync is enabled by default with a one-hour interval. Set
-`background_sync: false` when an external deployment step owns synchronization.
-`retain_raw_advisories` defaults to false so the SQLite database stores compact
-normalized lookup data by default; set it to true only when you need raw OSV
-advisory JSON for audit or debugging.
+Set `background_sync: false` only when CI, an init job, or another deployment
+component owns synchronization. For database lifecycle and failure semantics,
+see [Manage OSV advisory data](docs/osv-data.md).
 
-For fast boot, run `osv sync` in CI or an init/deployment step and ship the
-completed SQLite file with the service. A preseeded, non-stale database is ready
-immediately and the default background task refreshes it without replacing the
-last good snapshot. Do not place an actively updated SQLite file in an image
-layer; preseed a complete file, then refresh it outside the serving process.
+## Check a package from the command line
 
-### Metadata Cache
-
-Supported metadata GET routes cache the complete response after parsing,
-policy evaluation, filtering, URL rewriting, and serialization. Identical
-misses share one fill, while distinct fills are concurrency-bounded. The
-default weighted capacity is 128 MiB, maximum entry size is 16 MiB, and TTL is
-five minutes. These values bound cache accounting, not total process RSS.
-
-With OSV blocking enabled, every cache lookup reads the ecosystem's durable
-SQLite content revision. A sync that changes advisory content commits a new
-revision atomically, so the next request cannot use a response produced from
-the previous data. An entry also expires at the earliest package-age
-eligibility transition it contains.
-Transient policy/checker failures, unsuccessful responses, overloads, and
-oversized entries are not retained. Direct artifact routes are never cached
-and continue to evaluate current policy before redirecting or fetching bytes.
-
-## Performance
-
-Local OSV evaluation is designed to stay close to the policy-disabled path:
-the measured p50 overhead was about 2–7 ms for representative npm, Go, and
-Cargo routes, with higher-cardinality NuGet, RubyGems, PyPI, and Maven routes
-adding more. A full local database is about 195 MiB and a fresh sync takes
-about 21 seconds with roughly 221 MiB peak RSS on the reference machine.
-Repeated supported metadata requests can skip the complete upstream
-fetch/parse/policy/filter/serialize path through the bounded in-process cache.
-For the complete matrix, resource measurements, and fast-boot deployment
-patterns, see [Performance and fast boot](docs/performance.md).
-
-## Policy Behavior
-
-For every package version or file, `osv-proxy` evaluates:
-
-1. Exact-version allowlist.
-2. OSV `MAL-*` records when malicious blocking is enabled.
-3. Other active OSV advisories whose score is at least `minimum_cvss_score`.
-   The default threshold is zero, so matching unscored advisories also block.
-4. Manual blocklist.
-5. Minimum package age and missing publish time behavior.
-
-This default is behavior-changing for operators upgrading from malicious-only
-policy. Set `block_vulnerabilities: false` for the compatibility escape hatch;
-`MAL-*` blocking remains controlled independently by `block_malicious`.
-
-Blocked artifact requests return HTTP `403` with a structured JSON decision.
-Allowed artifact requests return HTTP `302` to the upstream tarball or file URL
-by default. With `artifacts.behavior: proxy`, allowed artifact requests stream
-the upstream response body and useful artifact headers through `osv-proxy`.
-
-For PyPI project pages, `osv-proxy` fetches upstream Simple JSON and uses
-`files[].upload-time` for the age gate. If a client requests
-`application/vnd.pypi.simple.v1+json`, the proxy returns filtered Simple JSON.
-Otherwise it renders filtered Simple HTML from the same JSON-backed policy
-model. The PyPI Simple root is rendered with project links that stay on
-`/pypi/simple/...` proxy routes.
-
-## Development
-
-Run Rust unit tests without external package managers:
+`check` fetches registry metadata and evaluates the same canonical artifact
+data used by proxy routes:
 
 ```sh
-cargo test --locked --lib
+osv-proxy check npm:lodash@4.17.21 \
+  --config examples/basic/osv-proxy.yaml
 ```
 
-This is a partial verification command. The required fully provisioned suite is
-`cargo test --locked`; missing external tools intentionally fail rather than
-skip.
+Supported identities include:
 
-Run only the route-level policy flow tests:
+```text
+npm:@babel/core@7.24.0
+pypi:requests@2.32.3
+cargo:serde@1.0.219
+go:github.com/pkg/errors@v0.9.1
+nuget:Newtonsoft.Json@13.0.3
+rubygems:rails@8.0.2
+maven:org.apache.commons:commons-lang3@3.17.0
+```
+
+`check` exits nonzero if required upstream metadata is missing or malformed.
+Use `eval` only when you intentionally want to supply synthetic artifact
+fields:
 
 ```sh
-cargo test --locked e2e
+osv-proxy eval npm:example@1.2.3 \
+  --config examples/basic/osv-proxy.yaml \
+  --published-at 2026-06-01T00:00:00Z
 ```
 
-Run only the package-manager end-to-end tests. These start local fixture
-registries and a local proxy, then run npm, uv/pip, Cargo, Go, .NET, Bundler,
-Maven, and Gradle clients against the proxy:
+## Deploy safely
 
-```sh
-cargo test --locked --test package_manager_e2e
-```
+The default listener is loopback-only. For a shared deployment, place
+`osv-proxy` behind a trusted gateway or reverse proxy that provides TLS,
+authentication, client rate limiting, and edge access control.
 
-The full local toolchain matches required CI: Rust 1.97.0; Temurin Java
-21.0.7+6, Maven 3.9.11, and Gradle 8.14.3; .NET SDK 8.0.128; Node 24.18.0 and
-npm; Go 1.24.0; Ruby 3.3.8 with `gem` and Bundler 2.5.23; uv 0.11.28; plus
-`zip` and `shasum`. Every corresponding command (`java`, `mvn`, `gradle`,
-`dotnet`, `node`/`npm`, `go`, `ruby`/`gem`/`bundle`, `uv`, `cargo`, `zip`, and
-`shasum`) must be available on `PATH`.
+`osv-proxy` provides process-wide ingress and outbound-request budgets, local
+readiness, and graceful shutdown. It does not replace an internet-facing
+gateway. See [Configure osv-proxy](docs/configuration.md) and
+[Understand the architecture](docs/architecture.md) before exposing a shared
+service.
 
-Format check:
+## Develop and verify
+
+Run the repository checks:
 
 ```sh
 cargo fmt --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --locked
+cargo run --locked -- config validate \
+  --config examples/basic/osv-proxy.yaml
 ```
 
-## More Documentation
+The full test suite invokes npm, uv/pip, Cargo, Go, .NET, Bundler, Maven, and
+Gradle against hermetic local registries. CI installs the required client
+toolchains.
 
-- [Policy model](docs/policy.md)
-- [Configuration reference](docs/configuration.md)
-- [Registry behavior](docs/registry-behavior.md)
-- [Client configuration](docs/client-configuration.md)
-- [OSV advisory data](docs/osv-data.md)
-- [Performance and fast boot](docs/performance.md)
-- [Architecture notes](docs/architecture.md)
-- [Milestones](docs/milestones.md)
+## Documentation
+
+- [Configure osv-proxy](docs/configuration.md)
+- [Configure package-manager clients](docs/client-configuration.md)
+- [Understand policy decisions](docs/policy.md)
+- [Review registry and HTTP behavior](docs/registry-behavior.md)
+- [Manage OSV advisory data](docs/osv-data.md)
+- [Plan performance and startup](docs/performance.md)
+- [Understand the architecture](docs/architecture.md)
+- [Monitor the service](docs/observability.md)
+- [Review product scope and invariants](docs/product-spec.md)
+- [Review support status and roadmap](docs/milestones.md)
+
+## License
+
+`osv-proxy` is licensed under the Apache License, Version 2.0. OSV advisories
+and upstream vulnerability records retain their source licenses and
+attribution requirements when you cache, export, or redistribute them.

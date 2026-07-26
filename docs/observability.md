@@ -1,83 +1,97 @@
-# Observability
+# Monitor the service
 
-## Implemented Signals
+`osv-proxy` currently exposes health, readiness, and process messages. It does
+not yet expose structured request logs or a metrics endpoint.
 
-- `/healthz` reports dependency-free process liveness and remains outside the
-  ingress admission budget.
-- `/readyz` reports per-ecosystem local OSV dataset health and is bounded by
-  ingress admission.
-- Startup warns when the resolved listener is non-loopback.
-- Startup, background sync outcomes, forced-drain timeout, and signal setup
-  failures emit plain-text process messages.
+## Check liveness
 
-Structured request logs, request IDs, latency/upstream metrics, and a metrics
-exporter are not implemented. The sections below are the target telemetry
-contract, not current emitted behavior.
+Request dependency-free process liveness:
 
-## Target Structured Logs And Metrics
+```sh
+curl --fail http://127.0.0.1:8080/healthz
+```
 
-### Metadata Request Logs
+A live process returns HTTP `200`:
 
-Each metadata request should log:
+```json
+{"live":true}
+```
 
-- `request_id`
-- `ecosystem`
-- `package`
-- `route_type=metadata`
-- `upstream_status`
-- `cache_status`
-- `versions_total`
-- `versions_allowed`
-- `versions_blocked`
-- `duration_ms`
+`/healthz` remains outside the ingress request budget so it can respond during
+registry saturation.
 
-### Artifact Request Logs
+## Check readiness
 
-Each artifact request should log:
+Request local OSV readiness:
 
-- `request_id`
-- `ecosystem`
-- `package`
-- `version`
-- `filename`
-- `route_type=artifact`
-- `decision`
-- `reason`
-- `artifact_behavior`
-- `upstream_url`
-- `duration_ms`
+```sh
+curl http://127.0.0.1:8080/readyz
+```
 
-### Blocked Decision Logs
+`/readyz` evaluates all seven ecosystems. It requires each active generation
+to satisfy health, dataset-version, completeness, and staleness policy.
 
-Each blocked decision should log:
+A ready response returns HTTP `200`. An unready or ingress-saturated response
+returns HTTP `503`. Saturation also includes `Retry-After: 1`.
 
-- `ecosystem`
-- `package`
-- `version`
-- `decision=blocked`
-- `reason`
-- `rule_id`
-- `source`
-- `message`
+```json
+{
+  "ready": false,
+  "osv_source": "local",
+  "ecosystems": [
+    {
+      "ecosystem": "npm",
+      "ready": true
+    },
+    {
+      "ecosystem": "Maven",
+      "ready": false,
+      "message": "local malicious data for ecosystem Maven is stale"
+    }
+  ]
+}
+```
 
-### Metrics
+The actual response contains one entry for every supported ecosystem.
 
-- `osv_proxy_metadata_requests_total`
+## Review process messages
+
+The process emits plain-text messages for the following events:
+
+- A non-loopback listener warning.
+- Initial and scheduled OSV sync outcomes.
+- Per-ecosystem sync failures and retries.
+- Signal-handler setup failures.
+- A forced graceful-shutdown drain timeout.
+
+Treat readiness as the machine-readable OSV health source. Process messages
+provide operational context but do not replace structured telemetry.
+
+## Planned telemetry
+
+Structured request logs, request identifiers, latency and upstream metrics,
+cache metrics, and a metrics exporter are not implemented.
+
+If telemetry is added, it should distinguish metadata from package-file
+requests and include the following dimensions where they apply:
+
+- Ecosystem, package, version, and route type.
+- Policy decision, reason, source, rule identifier, and CVSS score.
+- Upstream status and request duration.
+- Cache hit, miss, fill, bypass, and non-retention outcomes.
+- Artifact behavior.
+- OSV sync mode, ecosystem, imported or withdrawn count, and failure state.
+
+Candidate metric names include:
+
 - `osv_proxy_artifact_requests_total`
-- `osv_proxy_policy_decisions_total`
-- `osv_proxy_blocked_total`
 - `osv_proxy_blocked_by_reason_total`
 - `osv_proxy_metadata_cache_hits_total`
 - `osv_proxy_metadata_cache_misses_total`
-- `osv_proxy_artifact_cache_hits_total`
-- `osv_proxy_artifact_cache_misses_total`
-- `osv_proxy_osv_sync_last_success_timestamp` (planned canonical name; retain
-  the existing malicious-prefixed metric as a compatibility alias when metrics
-  are implemented)
+- `osv_proxy_metadata_requests_total`
+- `osv_proxy_osv_sync_last_success_timestamp`
 - `osv_proxy_osv_sync_records_total`
+- `osv_proxy_policy_decisions_total`
 
-Policy decision records must distinguish `reason=malicious` from
-`reason=vulnerable`, include the OSV ID as `rule_id`, and include the selected
-base score in the message when one exists. Sync logs use general OSV wording and
-report ecosystem, bootstrap/incremental mode, imported/withdrawn counts, and
-failure state without claiming a partial generation is healthy.
+These names describe a future contract. Do not configure monitors against them
+until the application exposes them.
