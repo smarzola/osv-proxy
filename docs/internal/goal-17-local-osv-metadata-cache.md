@@ -283,7 +283,28 @@ cargo test --locked rubygems
 cargo test --locked maven
 ```
 
-Status: Not started.
+Status: Completed on 2026-07-26. Added one process-wide cache in application
+state for policy-filtered metadata GET routes only. Complete HTTP responses are
+stored as shared immutable bytes behind a weighted-capacity and maximum-entry
+bound, TTL and policy-age expiry, O(1) indexed LRU operations, same-key
+singleflight, and bounded unique fills. Cache identity includes the ecosystem
+content revision, exact path/query, and representation/conditional/range
+headers. Artifact and static discovery routes remain uncached.
+
+Transient checker, revision, overload, non-200, and oversized results are
+singleflight-bounded but not retained. The persistent adversarial reviewer
+found and drove repairs for a scan-based hot path, retention of error-derived
+policy output, and revision-failure bypass of fill bounds; re-review returned
+`CLEAN`. Focused recovery coverage now proves both fail-open and fail-closed
+checker failures are refetched after recovery, while revision failures still
+coalesce and respect unique-fill concurrency without retention.
+
+Verification passed with `cargo test --locked metadata_cache` (9 tests),
+`cargo test --locked server` (52 tests), and the exact npm, PyPI, Cargo, Go,
+NuGet, RubyGems, and Maven command set above. The production-path cache test
+proves a hit skips both upstream fetch and policy filtering, and a 20,000-entry
+scale test guards against linear cache-hit scans. `cargo fmt --check` and
+`git diff --check` also pass.
 
 ## Milestone 3: Integration Coverage, Documentation, And Regression Closure
 

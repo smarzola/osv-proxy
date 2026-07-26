@@ -1,6 +1,10 @@
 use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Response, StatusCode};
+use bytes::Bytes;
 use serde_json::Value;
+
+#[derive(Debug, Clone)]
+pub(crate) struct BufferedResponseBody(pub Bytes);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryResponse {
@@ -50,6 +54,11 @@ impl RegistryResponse {
     pub fn into_http_response(self) -> Response<Body> {
         let status = StatusCode::from_u16(self.status).unwrap_or(StatusCode::OK);
         let mut builder = Response::builder().status(status);
+        let body = Bytes::from(self.body);
+        builder
+            .extensions_mut()
+            .expect("extensions are available before response body is built")
+            .insert(BufferedResponseBody(body.clone()));
         let headers = builder
             .headers_mut()
             .expect("headers are available before response body is built");
@@ -63,7 +72,7 @@ impl RegistryResponse {
             headers.insert(name, value);
         }
         builder
-            .body(Body::from(self.body))
+            .body(Body::from(body))
             .expect("registry response should convert to HTTP response")
     }
 }

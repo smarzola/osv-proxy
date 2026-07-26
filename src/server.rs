@@ -1,3 +1,4 @@
+use crate::artifact::Ecosystem;
 use crate::artifacts::{ArtifactDeliveryClient, ArtifactDeliveryOptions};
 use crate::cargo::{self, CargoRegistryClient};
 use crate::config::{Config, LocalOsvConfig};
@@ -7,6 +8,7 @@ use crate::malicious::{
     configured_malicious_checker, configured_malicious_checker_with_budgets, sync_osv_ecosystems,
 };
 use crate::maven::{self, MavenRepositoryClient, MetadataChecksum};
+use crate::metadata_cache::{MetadataCache, MetadataCacheKey, MetadataFill};
 use crate::npm::{self, NpmMetadataProvider, NpmRegistryClient};
 use crate::nuget::{self, NugetClient};
 use crate::pypi::{self, PypiSimpleClient, PypiSimpleProvider};
@@ -177,6 +179,7 @@ struct AppState {
     config: Config,
     checker: Arc<dyn MaliciousChecker>,
     clients: RegistryClients,
+    metadata_cache: Arc<MetadataCache>,
     budgets: Arc<RuntimeBudgets>,
     control: RuntimeControl,
 }
@@ -189,10 +192,12 @@ impl AppState {
         control: RuntimeControl,
     ) -> Self {
         let clients = RegistryClients::new(&config, Arc::clone(&budgets));
+        let metadata_cache = MetadataCache::new(&config.metadata_cache);
         Self {
             config,
             checker,
             clients,
+            metadata_cache,
             budgets,
             control,
         }
@@ -357,15 +362,49 @@ async fn registry_handler(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
 
-    let route = track_request_overload(route_http_request_with_clients(
-        &state.config,
-        state.checker.as_ref(),
-        &state.clients,
-        &method,
-        &path,
-        accept.as_deref(),
-        &headers,
-    ));
+    let route = async {
+        if state.metadata_cache.enabled()
+            && let Some(ecosystem) = metadata_cache_ecosystem(&method, &path)
+        {
+            let (key, revision_cacheable) =
+                metadata_cache_key(state.as_ref(), ecosystem, &path, &headers).await;
+            return state
+                .metadata_cache
+                .execute(key, || async {
+                    let ((response, overloaded), policy_cache) =
+                        crate::policy::capture_cache_metadata(track_request_overload(
+                            route_http_request_with_clients(
+                                &state.config,
+                                state.checker.as_ref(),
+                                &state.clients,
+                                &method,
+                                &path,
+                                accept.as_deref(),
+                                &headers,
+                            ),
+                        ))
+                        .await;
+                    MetadataFill {
+                        response,
+                        overloaded,
+                        valid_until: policy_cache.valid_until,
+                        policy_cacheable: policy_cache.cacheable && revision_cacheable,
+                    }
+                })
+                .await;
+        }
+
+        track_request_overload(route_http_request_with_clients(
+            &state.config,
+            state.checker.as_ref(),
+            &state.clients,
+            &method,
+            &path,
+            accept.as_deref(),
+            &headers,
+        ))
+        .await
+    };
     let (response, overloaded) = tokio::select! {
         result = route => result,
         _ = state.control.forced() => {
@@ -381,6 +420,79 @@ async fn registry_handler(
         return BudgetError::EgressSaturated.response();
     }
     hold_permits(response, vec![ingress], state.control.clone())
+}
+
+fn metadata_cache_ecosystem(method: &str, path: &str) -> Option<Ecosystem> {
+    if method != "GET" {
+        return None;
+    }
+    if parse_maven_metadata_route(path).is_some() {
+        return Some(Ecosystem::Maven);
+    }
+    if matches!(parse_rubygems_route(path), Some(RubyGemsRoute::Info { .. })) {
+        return Some(Ecosystem::RubyGems);
+    }
+    if parse_nuget_registration_route(path).is_some()
+        || parse_nuget_flat_index_route(path).is_some()
+    {
+        return Some(Ecosystem::Nuget);
+    }
+    if let Some((_, route)) = go::parse_route(path)
+        && matches!(
+            route,
+            go::GoRoute::List | go::GoRoute::Latest | go::GoRoute::Info(_)
+        )
+    {
+        return Some(Ecosystem::Go);
+    }
+    if matches!(parse_cargo_route(path), Some(CargoRoute::Index { .. })) {
+        return Some(Ecosystem::CratesIo);
+    }
+    if matches!(parse_npm_route(path), Some(NpmRoute::Metadata { .. })) {
+        return Some(Ecosystem::Npm);
+    }
+    if matches!(
+        parse_pypi_route(path),
+        Some(PypiRoute::SimpleProject { .. })
+    ) {
+        return Some(Ecosystem::Pypi);
+    }
+    None
+}
+
+async fn metadata_cache_key(
+    state: &AppState,
+    ecosystem: Ecosystem,
+    path: &str,
+    headers: &HeaderMap,
+) -> (MetadataCacheKey, bool) {
+    let (revision, revision_cacheable) = if state.config.policy.osv.block_malicious
+        || state.config.policy.osv.block_vulnerabilities
+    {
+        match state.checker.content_revision(ecosystem).await {
+            Ok(revision) => (Some(revision), true),
+            Err(_) => (None, false),
+        }
+    } else {
+        (Some(0), true)
+    };
+    (
+        MetadataCacheKey {
+            ecosystem,
+            revision,
+            path: path.to_string(),
+            accept: cache_header(headers, header::ACCEPT),
+            if_none_match: cache_header(headers, header::IF_NONE_MATCH),
+            if_modified_since: cache_header(headers, header::IF_MODIFIED_SINCE),
+            range: cache_header(headers, header::RANGE),
+            if_range: cache_header(headers, header::IF_RANGE),
+        },
+        revision_cacheable,
+    )
+}
+
+fn cache_header(headers: &HeaderMap, name: header::HeaderName) -> Option<Vec<u8>> {
+    headers.get(name).map(|value| value.as_bytes().to_vec())
 }
 
 pub async fn route_request(config: &Config, method: &str, path: &str) -> RegistryResponse {
@@ -1327,6 +1439,58 @@ mod tests {
     impl MaliciousChecker for CleanChecker {
         async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
             Ok(Vec::new())
+        }
+    }
+
+    struct CountingChecker {
+        checks: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl MaliciousChecker for CountingChecker {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            self.checks.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(Vec::new())
+        }
+
+        async fn content_revision(&self, _ecosystem: Ecosystem) -> Result<u64, MaliciousError> {
+            Ok(7)
+        }
+    }
+
+    struct RecoveringBatchChecker {
+        batch_calls: AtomicUsize,
+        revision_fails: bool,
+    }
+
+    #[async_trait]
+    impl MaliciousChecker for RecoveringBatchChecker {
+        async fn check(&self, _artifact: &Artifact) -> Result<Vec<MaliciousHit>, MaliciousError> {
+            Ok(Vec::new())
+        }
+
+        async fn check_many(
+            &self,
+            artifacts: &[Artifact],
+        ) -> Result<Vec<Vec<MaliciousHit>>, MaliciousError> {
+            let call = self.batch_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            if !self.revision_fails && call == 0 {
+                Err(MaliciousError::LocalStore(
+                    "transient checker failure".to_string(),
+                ))
+            } else {
+                Ok(vec![Vec::new(); artifacts.len()])
+            }
+        }
+
+        async fn content_revision(&self, _ecosystem: Ecosystem) -> Result<u64, MaliciousError> {
+            if self.revision_fails {
+                Err(MaliciousError::LocalStore(
+                    "transient revision failure".to_string(),
+                ))
+            } else {
+                Ok(7)
+            }
         }
     }
 
@@ -2743,7 +2907,17 @@ INSERT INTO advisories (
         tokio::time::timeout(Duration::from_secs(1), accepted.notified())
             .await
             .unwrap();
-        let overloaded = app.clone().oneshot(registry_request()).await.unwrap();
+        let overloaded = app
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/npm/other")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
         assert_eq!(overloaded.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(overloaded.headers()["retry-after"], "1");
         let body = axum::body::to_bytes(overloaded.into_body(), usize::MAX)
@@ -3303,6 +3477,225 @@ INSERT INTO advisories (
         }
     }
 
+    #[test]
+    fn metadata_cache_classifier_admits_filtered_gets_only() {
+        for (path, ecosystem) in [
+            ("/maven/com/acme/maven-metadata.xml", Ecosystem::Maven),
+            ("/rubygems/info/demo", Ecosystem::RubyGems),
+            (
+                "/nuget/v3/registration-semver2/demo/index.json",
+                Ecosystem::Nuget,
+            ),
+            ("/nuget/v3/flatcontainer/demo/index.json", Ecosystem::Nuget),
+            ("/go/example.com/demo/@v/list", Ecosystem::Go),
+            ("/go/example.com/demo/@latest", Ecosystem::Go),
+            ("/go/example.com/demo/@v/v1.0.0.info", Ecosystem::Go),
+            ("/cargo/de/mo/demo", Ecosystem::CratesIo),
+            ("/npm/demo", Ecosystem::Npm),
+            ("/pypi/simple/demo/", Ecosystem::Pypi),
+        ] {
+            assert_eq!(metadata_cache_ecosystem("GET", path), Some(ecosystem));
+        }
+
+        for path in [
+            "/maven/com/acme/demo/1.0/demo-1.0.jar",
+            "/rubygems/versions",
+            "/rubygems/gems/demo-1.0.0.gem",
+            "/nuget/v3/index.json",
+            "/nuget/v3/flatcontainer/demo/1.0.0/demo.1.0.0.nupkg",
+            "/go/example.com/demo/@v/v1.0.0.mod",
+            "/go/example.com/demo/@v/v1.0.0.zip",
+            "/cargo/config.json",
+            "/cargo/api/v1/crates/demo/1.0.0/download",
+            "/npm/demo/-/demo-1.0.0.tgz",
+            "/pypi/simple/",
+            "/pypi/packages/demo/1.0.0/demo.whl",
+        ] {
+            assert_eq!(metadata_cache_ecosystem("GET", path), None, "{path}");
+        }
+        assert_eq!(
+            metadata_cache_ecosystem("HEAD", "/maven/com/acme/maven-metadata.xml"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn app_cache_hit_skips_upstream_fetch_and_policy_filtering() {
+        let metadata_body = npm_demo_metadata().to_string();
+        let (registry_url, metadata_request) = serve_http_once(format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            metadata_body.len(),
+            metadata_body
+        ))
+        .await;
+        let mut config = Config::default();
+        config.upstreams.npm.registry_url = registry_url;
+        let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
+        let checker = Arc::new(CountingChecker {
+            checks: AtomicUsize::new(0),
+        });
+        let state = Arc::new(AppState::new(
+            config,
+            checker.clone(),
+            budgets,
+            RuntimeControl::default(),
+        ));
+
+        let first = registry_handler(
+            State(Arc::clone(&state)),
+            Method::GET,
+            Uri::from_static("/npm/demo"),
+            HeaderMap::new(),
+        )
+        .await;
+        let first_body = axum::body::to_bytes(first.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let request = metadata_request.await.unwrap();
+        assert!(request.starts_with("get /demo "));
+        assert_eq!(checker.checks.load(AtomicOrdering::SeqCst), 2);
+
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry_handler(
+                State(state),
+                Method::GET,
+                Uri::from_static("/npm/demo"),
+                HeaderMap::new(),
+            ),
+        )
+        .await
+        .expect("cache hit must not wait for a second upstream response");
+        let second_body = axum::body::to_bytes(second.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert_eq!(second_body, first_body);
+        assert_eq!(checker.checks.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn policy_failure_responses_are_not_retained_after_recovery() {
+        for behavior in [
+            crate::config::OsvErrorBehavior::Allow,
+            crate::config::OsvErrorBehavior::Block,
+        ] {
+            let metadata_body = npm_demo_metadata().to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                metadata_body.len(),
+                metadata_body
+            );
+            let (registry_url, requests, upstream) =
+                serve_http_repeated(response, Duration::ZERO).await;
+            let mut config = Config::default();
+            config.policy.osv.on_error = behavior;
+            config.upstreams.npm.registry_url = registry_url;
+            let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
+            let checker = Arc::new(RecoveringBatchChecker {
+                batch_calls: AtomicUsize::new(0),
+                revision_fails: false,
+            });
+            let state = Arc::new(AppState::new(
+                config,
+                checker.clone(),
+                budgets,
+                RuntimeControl::default(),
+            ));
+
+            let first = registry_handler(
+                State(Arc::clone(&state)),
+                Method::GET,
+                Uri::from_static("/npm/demo"),
+                HeaderMap::new(),
+            )
+            .await;
+            let first: Value = serde_json::from_slice(
+                &axum::body::to_bytes(first.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(state.metadata_cache.entry_count(), 0);
+
+            let second = registry_handler(
+                State(Arc::clone(&state)),
+                Method::GET,
+                Uri::from_static("/npm/demo"),
+                HeaderMap::new(),
+            )
+            .await;
+            let second: Value = serde_json::from_slice(
+                &axum::body::to_bytes(second.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+
+            assert_eq!(requests.load(AtomicOrdering::SeqCst), 2);
+            assert_eq!(checker.batch_calls.load(AtomicOrdering::SeqCst), 2);
+            assert_eq!(state.metadata_cache.entry_count(), 1);
+            assert_eq!(second["versions"].as_object().unwrap().len(), 2);
+            if behavior == crate::config::OsvErrorBehavior::Block {
+                assert_eq!(first["versions"].as_object().unwrap().len(), 0);
+            } else {
+                assert_eq!(first["versions"].as_object().unwrap().len(), 2);
+            }
+            upstream.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn revision_failures_still_singleflight_without_retention() {
+        let metadata_body = npm_demo_metadata().to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            metadata_body.len(),
+            metadata_body
+        );
+        let (registry_url, requests, upstream) =
+            serve_http_repeated(response, Duration::from_millis(30)).await;
+        let mut config = Config::default();
+        config.upstreams.npm.registry_url = registry_url;
+        let budgets = Arc::new(RuntimeBudgets::new(&config.limits));
+        let checker = Arc::new(RecoveringBatchChecker {
+            batch_calls: AtomicUsize::new(0),
+            revision_fails: true,
+        });
+        let state = Arc::new(AppState::new(
+            config,
+            checker.clone(),
+            budgets,
+            RuntimeControl::default(),
+        ));
+
+        let tasks = (0..8)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    let response = registry_handler(
+                        State(state),
+                        Method::GET,
+                        Uri::from_static("/npm/demo"),
+                        HeaderMap::new(),
+                    )
+                    .await;
+                    axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for task in tasks {
+            assert!(!task.await.unwrap().is_empty());
+        }
+
+        assert_eq!(requests.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(checker.batch_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(state.metadata_cache.entry_count(), 0);
+        upstream.abort();
+    }
+
     #[tokio::test]
     async fn router_streams_npm_artifact_proxy_response() {
         let (artifact_base_url, artifact_request) = serve_http_once(
@@ -3425,6 +3818,33 @@ INSERT INTO advisories (
             String::from_utf8_lossy(&buffer[..bytes]).to_ascii_lowercase()
         });
         (format!("http://{address}"), handle)
+    }
+
+    async fn serve_http_repeated(
+        response: String,
+        delay: Duration,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let captured = Arc::clone(&requests);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let response = response.clone();
+                let captured = Arc::clone(&captured);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 4096];
+                    stream.read(&mut buffer).await.unwrap();
+                    captured.fetch_add(1, AtomicOrdering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    stream.write_all(response.as_bytes()).await.unwrap();
+                });
+            }
+        });
+        (format!("http://{address}"), requests, handle)
     }
 
     async fn serve_maven_upstream() -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>)

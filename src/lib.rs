@@ -7,6 +7,7 @@ pub mod go;
 pub mod http_body;
 pub mod malicious;
 pub mod maven;
+pub mod metadata_cache;
 pub mod npm;
 pub mod nuget;
 pub mod policy;
